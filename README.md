@@ -47,13 +47,17 @@ On Fedora 45 (aarch64):
     sudo dnf install ./libfprint-1.94.100-1.fc45.aurora2.aarch64.rpm ./aurora-sep-*.noarch.rpm
     sudo dnf versionlock add libfprint
 
-Reboot afterwards. `apple_sep` can be loaded only once per boot, so never reload
-it on a running system, and never restart fprintd or the display manager in a
-running session. Read `tools/aurora-sep/XART-SAFETY.md` in the kernel tree
-before you enable Touch ID on a machine that also runs macOS. Give Linux its own
-SEP OS identity on the kernel command line (`apple_sep.os_uuid_hi=` and
-`apple_sep.os_uuid_lo=`). Otherwise the two systems' enrolments invalidate each
-other.
+Reboot afterwards to apply the package and unit changes. The SEP driver attaches
+to the enclave once per boot; follow the kernel loader's instructions and reboot
+rather than reloading `apple_sep` or restarting its loader. During an existing
+desktop session, defer the fprintd and display-manager switch until that reboot. Read `tools/aurora-sep/XART-SAFETY.md` in the kernel tree
+before you enable Touch ID on a machine that also runs macOS. Keep the SEP OS
+identity used for existing Linux enrolments on the kernel command line
+(`apple_sep.os_uuid_hi=` and `apple_sep.os_uuid_lo=`). Without an explicit identity,
+the kernel uses `/chosen/apfs-preboot-uuid` when available. On the current Aurora
+bootloader this selects the Aurora volume identity: changing to it can make
+existing Linux enrolments inaccessible. It does not select the macOS identity.
+Keep the existing identity throughout a userspace-only migration.
 
 A Fedora update to a newer libfprint release replaces this build. Rebuild on
 top of it, or keep the version lock.
