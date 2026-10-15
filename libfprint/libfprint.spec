@@ -12,8 +12,8 @@ Name:           libfprint
 
 Version:        1.94.100
 # Fedora's release plus a suffix, so this sorts above the Fedora build it
-# replaces (1.fc45 < 1.fc45.aurora2) and below the next Fedora release.
-Release:        1%{?dist}.aurora2
+# replaces (1.fc45 < 1.fc45.aurora3) and below the next Fedora release.
+Release:        1%{?dist}.aurora3
 Summary:        Toolkit for fingerprint scanner
 
 # Automatically converted from old format: LGPLv2+ - review is highly recommended.
@@ -26,6 +26,9 @@ Source0:        https://gitlab.freedesktop.org/libfprint/libfprint/-/archive/v%{
 # include/uapi/linux/apple-sep.h in https://github.com/aurora-silicon/linux.
 # Build-time only: distribution kernel-headers do not carry it yet.
 Source1000:     apple-sep.h
+# fprintd's sandbox allows only the devices it names; let it read the lid
+# switch that libfprint follows (Patch1002).
+Source1001:     fprintd-lid-switch.conf
 
 # Apple Touch ID through the apple_sep kernel driver: the aurora driver plus
 # the misc-device udev subtype it needs. Unchanged from
@@ -35,6 +38,10 @@ Patch1000:      libfprint-1.94.100-apple-sep.patch
 # Report unusable captures (kernel status RETRY) as libfprint retries and name
 # the reason for every failure status.
 Patch1001:      0002-aurora-report-unusable-captures-as-retries.patch
+# Drop a reader that a closed lid covers (the Touch ID sensor is in the power
+# button) and probe it again when the lid opens, so in clamshell mode sudo,
+# polkit and the lock screen go straight to the password.
+Patch1002:      0003-hide-lid-covered-readers-while-the-lid-is-closed.patch
 
 BuildRequires:  meson
 BuildRequires:  gcc
@@ -50,6 +57,7 @@ BuildRequires:  gtk-doc
 BuildRequires:  libgudev-devel
 # For the udev.pc to install the rules
 BuildRequires:  systemd
+BuildRequires:  systemd-rpm-macros
 BuildRequires:  gobject-introspection-devel
 # For internal CI tests; umockdev 0.13.2 has an important locking fix
 BuildRequires:  python3-cairo python3-gobject cairo-devel
@@ -91,6 +99,7 @@ export CFLAGS="%{build_cflags} -I$(pwd)/aurora-uapi"
 
 %install
 %meson_install
+install -Dpm0644 %{SOURCE1001} %{buildroot}%{_unitdir}/fprintd.service.d/50-libfprint-lid-switch.conf
 
 %ldconfig_scriptlets
 
@@ -105,6 +114,8 @@ export CFLAGS="%{build_cflags} -I$(pwd)/aurora-uapi"
 %{_udevhwdbdir}/60-autosuspend-libfprint-2.hwdb
 %{_udevrulesdir}/70-libfprint-2.rules
 %{_datadir}/metainfo/org.freedesktop.libfprint.metainfo.xml
+%dir %{_unitdir}/fprintd.service.d
+%{_unitdir}/fprintd.service.d/50-libfprint-lid-switch.conf
 
 %files devel
 %doc HACKING.md
@@ -119,6 +130,11 @@ export CFLAGS="%{build_cflags} -I$(pwd)/aurora-uapi"
 %{_datadir}/installed-tests/libfprint-2/
 
 %changelog
+* Thu Oct 15 2026 Ryan Murray <ryan@aurorasilicon.org> - 1.94.100-1.aurora3
+- Hide the Touch ID reader while the lid is closed, so sudo, polkit and the
+  lock screen use the password in clamshell mode; it returns when the lid opens
+- Let fprintd read the lid switch
+
 * Sun Oct 11 2026 Ryan Murray <ryan@aurorasilicon.org> - 1.94.100-1.aurora2
 - Add the aurora driver for Apple Touch ID (apple_sep, /dev/sep-bio)
 - Report unusable captures as retries during enrolment, verify and identify
