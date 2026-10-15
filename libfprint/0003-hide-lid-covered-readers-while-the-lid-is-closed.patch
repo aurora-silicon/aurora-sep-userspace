@@ -1,6 +1,6 @@
-From c5e1b20255e34278a9dd844f84f78324014c2e93 Mon Sep 17 00:00:00 2001
+From 3d4023932c5295f8e89ed047d7f8ee008b0a6bdf Mon Sep 17 00:00:00 2001
 From: Ryan Murray <ryan@aurorasilicon.org>
-Date: Thu, 15 Oct 2026 11:51:37 +1100
+Date: Thu, 15 Oct 2026 13:24:45 +1100
 Subject: [PATCH] Hide lid-covered readers while the lid is closed
 
 A reader built into a laptop's base -- in the palm rest, the keyboard or
@@ -31,18 +31,39 @@ and pam_fprintd moves on to the password.
 
 Also release the misc devices left over after udev matching.
 
+A reader can be removed while the system sleeps: the lid closes during
+sleep, and the machine wakes from an external keyboard with the lid
+still closed. fp_device_resume() then answered FP_DEVICE_ERROR_REMOVED
+but left the device suspended, so the close its user still had to do
+failed as busy. The context never dropped the device, fprintd kept
+listing a reader that fails everything, and no new one appeared when
+the lid opened. Resuming a removed device now ends its suspension.
+
+FpiLidSwitch dispatches in the thread-default main context it was made
+in, like the rest of libfprint.
+
+test-lid-switch follows real uinput lid switches (skipped without
+/dev/uinput and a running udev): one that appears late, bounces and goes
+away while closed, two at once, no leaked fds, and a thread-default
+context. test-fpi-device covers a device removed while suspended.
+
 Assisted-by: LLM
 Signed-off-by: Ryan Murray <ryan@aurorasilicon.org>
 ---
  libfprint/drivers/aurora/aurora.c |  56 +++++
- libfprint/fp-context.c            | 273 +++++++++++++++++++++++--
+ libfprint/fp-context.c            | 273 ++++++++++++++++++++++--
+ libfprint/fp-device.c             |   4 +
  libfprint/fpi-device.h            |   8 +
- libfprint/fpi-lid-switch.c        | 327 ++++++++++++++++++++++++++++++
+ libfprint/fpi-lid-switch.c        | 336 ++++++++++++++++++++++++++++++
  libfprint/fpi-lid-switch.h        |  29 +++
  libfprint/meson.build             |   8 +-
- 6 files changed, 683 insertions(+), 18 deletions(-)
+ tests/meson.build                 |   7 +
+ tests/test-fpi-device.c           |  38 ++++
+ tests/test-lid-switch.c           | 306 +++++++++++++++++++++++++++
+ 10 files changed, 1047 insertions(+), 18 deletions(-)
  create mode 100644 libfprint/fpi-lid-switch.c
  create mode 100644 libfprint/fpi-lid-switch.h
+ create mode 100644 tests/test-lid-switch.c
 
 diff --git a/libfprint/drivers/aurora/aurora.c b/libfprint/drivers/aurora/aurora.c
 index 2b44d579..51d05c29 100644
@@ -501,6 +522,21 @@ index 6fdf53b4..2c072053 100644
    }
  #endif
  
+diff --git a/libfprint/fp-device.c b/libfprint/fp-device.c
+index 70b10f1f..f488f71b 100644
+--- a/libfprint/fp-device.c
++++ b/libfprint/fp-device.c
+@@ -1092,6 +1092,10 @@ fp_device_resume (FpDevice           *device,
+ 
+   if (priv->is_removed)
+     {
++      /* There is nothing left to resume, but the device must not stay
++       * suspended: its user still has to close it, and a suspended device
++       * refuses that as busy, so it would never be released. */
++      priv->is_suspended = FALSE;
+       g_task_return_error (task,
+                            fpi_device_error_new (FP_DEVICE_ERROR_REMOVED));
+       return;
 diff --git a/libfprint/fpi-device.h b/libfprint/fpi-device.h
 index 7671ad6a..db872952 100644
 --- a/libfprint/fpi-device.h
@@ -529,10 +565,10 @@ index 7671ad6a..db872952 100644
    void (*probe)    (FpDevice *device);
 diff --git a/libfprint/fpi-lid-switch.c b/libfprint/fpi-lid-switch.c
 new file mode 100644
-index 00000000..6a6a4ee5
+index 00000000..cad71632
 --- /dev/null
 +++ b/libfprint/fpi-lid-switch.c
-@@ -0,0 +1,327 @@
+@@ -0,0 +1,336 @@
 +/*
 + * Laptop lid switch tracking
 + * Copyright (C) 2026 Ryan Murray <ryan@aurorasilicon.org>
@@ -581,18 +617,19 @@ index 00000000..6a6a4ee5
 +
 +typedef struct
 +{
-+  gchar *path;
-+  gint   fd;
-+  guint  watch_id;
++  gchar   *path;
++  gint     fd;
++  GSource *source;
 +} FpiLidInput;
 +
 +struct _FpiLidSwitch
 +{
 +  GObject      parent;
 +
-+  GUdevClient *udev_client;
-+  GHashTable  *inputs;   /* device file -> FpiLidInput */
-+  gboolean     closed;
++  GMainContext *context;    /* the thread-default context at creation */
++  GUdevClient  *udev_client;
++  GHashTable   *inputs;   /* device file -> FpiLidInput */
++  gboolean      closed;
 +};
 +
 +enum {
@@ -613,7 +650,11 @@ index 00000000..6a6a4ee5
 +static void
 +lid_input_free (FpiLidInput *input)
 +{
-+  g_clear_handle_id (&input->watch_id, g_source_remove);
++  if (input->source)
++    {
++      g_source_destroy (input->source);
++      g_clear_pointer (&input->source, g_source_unref);
++    }
 +  if (input->fd >= 0)
 +    close (input->fd);
 +  g_free (input->path);
@@ -685,7 +726,6 @@ index 00000000..6a6a4ee5
 +      if (input != NULL)
 +        {
 +          fp_dbg ("Lid switch %s went away", input->path);
-+          input->watch_id = 0;
 +          g_hash_table_remove (self->inputs, input->path);
 +          lid_switch_update (self);
 +        }
@@ -733,8 +773,11 @@ index 00000000..6a6a4ee5
 +  input = g_new0 (FpiLidInput, 1);
 +  input->path = g_strdup (path);
 +  input->fd = fd;
-+  input->watch_id = g_unix_fd_add (fd, G_IO_IN | G_IO_HUP | G_IO_ERR,
-+                                   lid_input_ready_cb, self);
++  /* Like the rest of libfprint, and like the GUdevClient above, dispatch in
++   * the thread-default main context of whoever created us. */
++  input->source = g_unix_fd_source_new (fd, G_IO_IN | G_IO_HUP | G_IO_ERR);
++  g_source_set_callback (input->source, G_SOURCE_FUNC (lid_input_ready_cb), self, NULL);
++  g_source_attach (input->source, self->context);
 +  g_hash_table_insert (self->inputs, input->path, input);
 +
 +  fp_dbg ("Following lid switch %s (%s)", path,
@@ -791,6 +834,7 @@ index 00000000..6a6a4ee5
 +    g_signal_handlers_disconnect_by_data (self->udev_client, self);
 +  g_clear_object (&self->udev_client);
 +  g_clear_pointer (&self->inputs, g_hash_table_unref);
++  g_clear_pointer (&self->context, g_main_context_unref);
 +
 +  G_OBJECT_CLASS (fpi_lid_switch_parent_class)->dispose (object);
 +}
@@ -819,6 +863,7 @@ index 00000000..6a6a4ee5
 +  const gchar * const subsystems[] = { "input", NULL };
 +  GList *devices, *l;
 +
++  self->context = g_main_context_ref_thread_default ();
 +  self->inputs = g_hash_table_new_full (g_str_hash, g_str_equal, NULL,
 +                                        (GDestroyNotify) lid_input_free);
 +
@@ -921,6 +966,392 @@ index 400c5b74..e0dc170b 100644
  
  libfprint_public_headers = [
      'fp-context.h',
+diff --git a/tests/meson.build b/tests/meson.build
+index 2147ef3c..39c6fc48 100644
+--- a/tests/meson.build
++++ b/tests/meson.build
+@@ -321,6 +321,13 @@ if 'virtual_image' in drivers
+     ]
+ endif
+ 
++# Makes uinput lid switches: skipped without /dev/uinput access and udev
++if libfprint_conf.has('HAVE_UDEV')
++    unit_tests += [
++        'lid-switch',
++    ]
++endif
++
+ unit_tests_deps = { 'fpi-assembling' : [cairo_dep] }
+ 
+ foreach test_name: unit_tests
+diff --git a/tests/test-fpi-device.c b/tests/test-fpi-device.c
+index 165532d7..0b9b3b9e 100644
+--- a/tests/test-fpi-device.c
++++ b/tests/test-fpi-device.c
+@@ -2834,6 +2834,43 @@ test_driver_identify_suspend_while_idle (void)
+   g_assert_no_error (error);
+ }
+ 
++static void
++on_removed_set_flag (gboolean *flag)
++{
++  *flag = TRUE;
++}
++
++/* A device removed while the system sleeps, such as a reader that a closed
++ * lid covers, must still be closable after resume. */
++static void
++test_driver_removed_while_suspended (void)
++{
++  g_autoptr(FpAutoResetClass) dev_class = auto_reset_device_class ();
++  g_autoptr(FpDevice) device = NULL;
++  g_autoptr(GError) error = NULL;
++  gboolean removed_emitted = FALSE;
++
++  device = g_object_new (FPI_TYPE_DEVICE_FAKE, NULL);
++  g_signal_connect_swapped (device, "removed", G_CALLBACK (on_removed_set_flag), &removed_emitted);
++  g_assert_true (fp_device_open_sync (device, NULL, NULL));
++
++  g_assert_true (fp_device_suspend_sync (device, NULL, &error));
++  g_assert_no_error (error);
++
++  fpi_device_remove (device);
++  g_assert_true (removed_emitted);
++
++  fp_device_resume_sync (device, NULL, &error);
++  g_assert_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_REMOVED);
++  g_clear_error (&error);
++
++  /* Closing reports the removal, but must close the device rather than
++   * refuse as busy. */
++  fp_device_close_sync (device, NULL, &error);
++  g_assert_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_REMOVED);
++  g_assert_false (fp_device_is_open (device));
++}
++
+ static void
+ test_driver_identify_warmup_cooldown (void)
+ {
+@@ -4155,6 +4192,7 @@ main (int argc, char *argv[])
+   g_test_add_func ("/driver/identify/suspend_succeeds", test_driver_identify_suspend_succeeds);
+   g_test_add_func ("/driver/identify/suspend_busy_error", test_driver_identify_suspend_busy_error);
+   g_test_add_func ("/driver/identify/suspend_while_idle", test_driver_identify_suspend_while_idle);
++  g_test_add_func ("/driver/removed_while_suspended", test_driver_removed_while_suspended);
+ 
+   g_test_add_func ("/driver/identify/warmup_cooldown", test_driver_identify_warmup_cooldown);
+ 
+diff --git a/tests/test-lid-switch.c b/tests/test-lid-switch.c
+new file mode 100644
+index 00000000..ef3f6d36
+--- /dev/null
++++ b/tests/test-lid-switch.c
+@@ -0,0 +1,306 @@
++/*
++ * FpiLidSwitch tests, with uinput lid switches
++ * Copyright (C) 2026 Ryan Murray <ryan@aurorasilicon.org>
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++/*
++ * These tests make real lid switches with uinput, so they need write access
++ * to /dev/uinput and a running udev; without either they are skipped. They
++ * also need a system whose own lid, if it has one, is open.
++ */
++
++#include <errno.h>
++#include <fcntl.h>
++#include <linux/uinput.h>
++#include <string.h>
++#include <sys/ioctl.h>
++#include <unistd.h>
++
++#include <glib.h>
++
++#include "fpi-lid-switch.h"
++
++#define LID_TIMEOUT_US (5 * G_USEC_PER_SEC)
++
++typedef struct
++{
++  gint fd;
++} TestLid;
++
++static TestLid *
++test_lid_new (const gchar *name)
++{
++  struct uinput_setup setup = { 0 };
++  TestLid *lid;
++  gint fd;
++
++  fd = open ("/dev/uinput", O_WRONLY | O_NONBLOCK | O_CLOEXEC);
++  if (fd < 0)
++    return NULL;
++
++  setup.id.bustype = BUS_VIRTUAL;
++  g_strlcpy (setup.name, name, sizeof (setup.name));
++
++  if (ioctl (fd, UI_SET_EVBIT, EV_SW) < 0 ||
++      ioctl (fd, UI_SET_SWBIT, SW_LID) < 0 ||
++      ioctl (fd, UI_DEV_SETUP, &setup) < 0 ||
++      ioctl (fd, UI_DEV_CREATE) < 0)
++    {
++      close (fd);
++      return NULL;
++    }
++
++  lid = g_new0 (TestLid, 1);
++  lid->fd = fd;
++  return lid;
++}
++
++static void
++test_lid_emit (TestLid *lid, guint16 type, guint16 code, gint32 value)
++{
++  struct input_event ev = { 0 };
++
++  ev.type = type;
++  ev.code = code;
++  ev.value = value;
++  g_assert_cmpint (write (lid->fd, &ev, sizeof (ev)), ==, sizeof (ev));
++}
++
++static void
++test_lid_set_closed (TestLid *lid, gboolean closed)
++{
++  test_lid_emit (lid, EV_SW, SW_LID, closed);
++  test_lid_emit (lid, EV_SYN, SYN_REPORT, 0);
++}
++
++static void
++test_lid_free (TestLid *lid)
++{
++  ioctl (lid->fd, UI_DEV_DESTROY);
++  close (lid->fd);
++  g_free (lid);
++}
++
++G_DEFINE_AUTOPTR_CLEANUP_FUNC (TestLid, test_lid_free)
++
++/* Iterate @context until @self says @closed, for at most LID_TIMEOUT_US. */
++static gboolean
++wait_for_closed (GMainContext *context, FpiLidSwitch *self, gboolean closed)
++{
++  gint64 deadline = g_get_monotonic_time () + LID_TIMEOUT_US;
++
++  while (fpi_lid_switch_get_closed (self) != closed)
++    {
++      if (g_get_monotonic_time () > deadline)
++        return FALSE;
++      if (!g_main_context_iteration (context, FALSE))
++        g_usleep (10000);
++    }
++
++  return TRUE;
++}
++
++/* Settle for a while and check @self never says anything but @closed. */
++static gboolean
++stays_closed (GMainContext *context, FpiLidSwitch *self, gboolean closed)
++{
++  gint64 deadline = g_get_monotonic_time () + G_USEC_PER_SEC / 2;
++
++  while (g_get_monotonic_time () < deadline)
++    {
++      if (fpi_lid_switch_get_closed (self) != closed)
++        return FALSE;
++      if (!g_main_context_iteration (context, FALSE))
++        g_usleep (10000);
++    }
++
++  return fpi_lid_switch_get_closed (self) == closed;
++}
++
++static guint
++count_open_fds (void)
++{
++  g_autoptr(GDir) dir = g_dir_open ("/proc/self/fd", 0, NULL);
++  guint n = 0;
++
++  g_assert_nonnull (dir);
++  while (g_dir_read_name (dir))
++    n++;
++  return n;
++}
++
++static gboolean
++skip_unless_usable (void)
++{
++  g_autoptr(FpiLidSwitch) lid = NULL;
++
++  if (access ("/dev/uinput", W_OK) != 0)
++    {
++      g_test_skip ("needs write access to /dev/uinput");
++      return TRUE;
++    }
++
++  if (access ("/run/udev/control", F_OK) != 0)
++    {
++      g_test_skip ("needs a running udev");
++      return TRUE;
++    }
++
++  lid = fpi_lid_switch_new ();
++  if (fpi_lid_switch_get_closed (lid))
++    {
++      g_test_skip ("this system's own lid is closed");
++      return TRUE;
++    }
++
++  return FALSE;
++}
++
++/* A switch that appears after we started, bounces, and goes away again. */
++static void
++test_lid_switch_hotplug (void)
++{
++  g_autoptr(FpiLidSwitch) self = NULL;
++  g_autoptr(TestLid) lid = NULL;
++  guint fds_before;
++
++  if (skip_unless_usable ())
++    return;
++
++  fds_before = count_open_fds ();
++  self = fpi_lid_switch_new ();
++  g_assert_false (fpi_lid_switch_get_closed (self));
++
++  lid = test_lid_new ("libfprint test lid");
++  g_assert_nonnull (lid);
++
++  test_lid_set_closed (lid, TRUE);
++  g_assert_true (wait_for_closed (NULL, self, TRUE));
++
++  /* Bounce */
++  test_lid_set_closed (lid, FALSE);
++  test_lid_set_closed (lid, TRUE);
++  test_lid_set_closed (lid, FALSE);
++  g_assert_true (wait_for_closed (NULL, self, FALSE));
++  g_assert_true (stays_closed (NULL, self, FALSE));
++
++  /* A switch that goes away while closed no longer counts */
++  test_lid_set_closed (lid, TRUE);
++  g_assert_true (wait_for_closed (NULL, self, TRUE));
++  g_clear_pointer (&lid, test_lid_free);
++  g_assert_true (wait_for_closed (NULL, self, FALSE));
++
++  g_clear_object (&self);
++  while (g_main_context_iteration (NULL, FALSE))
++    continue;
++  g_assert_cmpuint (count_open_fds (), ==, fds_before);
++}
++
++/* Any closed lid counts, as for logind. */
++static void
++test_lid_switch_two_lids (void)
++{
++  g_autoptr(FpiLidSwitch) self = NULL;
++  g_autoptr(TestLid) a = NULL;
++  g_autoptr(TestLid) b = NULL;
++
++  if (skip_unless_usable ())
++    return;
++
++  a = test_lid_new ("libfprint test lid A");
++  b = test_lid_new ("libfprint test lid B");
++  g_assert_nonnull (a);
++  g_assert_nonnull (b);
++
++  self = fpi_lid_switch_new ();
++
++  /* Both must be followed before we go on */
++  test_lid_set_closed (a, TRUE);
++  g_assert_true (wait_for_closed (NULL, self, TRUE));
++  test_lid_set_closed (a, FALSE);
++  g_assert_true (wait_for_closed (NULL, self, FALSE));
++  test_lid_set_closed (b, TRUE);
++  g_assert_true (wait_for_closed (NULL, self, TRUE));
++
++  test_lid_set_closed (a, TRUE);
++  test_lid_set_closed (b, FALSE);
++  g_assert_true (stays_closed (NULL, self, TRUE));
++
++  test_lid_set_closed (a, FALSE);
++  g_assert_true (wait_for_closed (NULL, self, FALSE));
++}
++
++static gpointer
++lid_thread_func (gpointer user_data)
++{
++  TestLid *lid = user_data;
++  g_autoptr(GMainContext) context = g_main_context_new ();
++  g_autoptr(FpiLidSwitch) self = NULL;
++  gboolean ok;
++
++  g_main_context_push_thread_default (context);
++
++  self = fpi_lid_switch_new ();
++  g_assert_false (fpi_lid_switch_get_closed (self));
++
++  test_lid_set_closed (lid, TRUE);
++  ok = wait_for_closed (context, self, TRUE);
++
++  g_clear_object (&self);
++  g_main_context_pop_thread_default (context);
++
++  return GINT_TO_POINTER (ok);
++}
++
++/* Like the rest of libfprint, the switch must dispatch in the thread-default
++ * main context of the thread that made it, not in the global default one. */
++static void
++test_lid_switch_thread_default_context (void)
++{
++  g_autoptr(TestLid) lid = NULL;
++  g_autoptr(FpiLidSwitch) settle = NULL;
++  GThread *thread;
++
++  if (skip_unless_usable ())
++    return;
++
++  lid = test_lid_new ("libfprint test lid");
++  g_assert_nonnull (lid);
++
++  /* Wait until udev knows the switch, so the thread finds it at once. */
++  settle = fpi_lid_switch_new ();
++  test_lid_set_closed (lid, TRUE);
++  g_assert_true (wait_for_closed (NULL, settle, TRUE));
++  test_lid_set_closed (lid, FALSE);
++  g_assert_true (wait_for_closed (NULL, settle, FALSE));
++  g_clear_object (&settle);
++
++  thread = g_thread_new ("lid", lid_thread_func, lid);
++  g_assert_true (GPOINTER_TO_INT (g_thread_join (thread)));
++}
++
++int
++main (int argc, char *argv[])
++{
++  g_test_init (&argc, &argv, NULL);
++
++  g_test_add_func ("/lid-switch/hotplug", test_lid_switch_hotplug);
++  g_test_add_func ("/lid-switch/two-lids", test_lid_switch_two_lids);
++  g_test_add_func ("/lid-switch/thread-default-context", test_lid_switch_thread_default_context);
++
++  return g_test_run ();
++}
 -- 
 2.50.1 (Apple Git-155)
 

@@ -14,7 +14,7 @@ It is developed on the MacBook Neo (J700, A18 Pro).
 ## What is here
 
 `libfprint/` holds Fedora's `libfprint-1.94.100-1.fc45` spec, rebuilt as
-`libfprint-1.94.100-1.fc45.aurora3` with the `aurora` driver. The build replaces
+`libfprint-1.94.100-1.fc45.aurora4` with the `aurora` driver. The build replaces
 Fedora's libfprint in place, so fprintd needs no `LD_LIBRARY_PATH` and nothing is
 installed under `/usr/local`. The package provides `libfprint(aurora-sep) = 4`.
 
@@ -69,7 +69,7 @@ On Fedora 45 (aarch64):
 
 ## Install
 
-    sudo dnf install ./libfprint-1.94.100-1.fc45.aurora3.aarch64.rpm ./aurora-sep-*.noarch.rpm
+    sudo dnf install ./libfprint-1.94.100-1.fc45.aurora4.aarch64.rpm ./aurora-sep-*.noarch.rpm
     sudo dnf versionlock add libfprint
 
 Reboot afterwards to apply the package and unit changes. The SEP driver attaches

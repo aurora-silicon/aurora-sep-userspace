@@ -12,8 +12,8 @@ Name:           libfprint
 
 Version:        1.94.100
 # Fedora's release plus a suffix, so this sorts above the Fedora build it
-# replaces (1.fc45 < 1.fc45.aurora3) and below the next Fedora release.
-Release:        1%{?dist}.aurora3
+# replaces (1.fc45 < 1.fc45.aurora4) and below the next Fedora release.
+Release:        1%{?dist}.aurora4
 Summary:        Toolkit for fingerprint scanner
 
 # Automatically converted from old format: LGPLv2+ - review is highly recommended.
@@ -130,6 +130,12 @@ install -Dpm0644 %{SOURCE1001} %{buildroot}%{_unitdir}/fprintd.service.d/50-libf
 %{_datadir}/installed-tests/libfprint-2/
 
 %changelog
+* Thu Oct 15 2026 Ryan Murray <ryan@aurorasilicon.org> - 1.94.100-1.aurora4
+- Let a reader the lid removed while the system slept be released after
+  resume, so it comes back when the lid opens
+- Follow the lid switch in the thread-default main context
+- Test the lid switch with uinput, and a device removed while suspended
+
 * Thu Oct 15 2026 Ryan Murray <ryan@aurorasilicon.org> - 1.94.100-1.aurora3
 - Hide the Touch ID reader while the lid is closed, so sudo, polkit and the
   lock screen use the password in clamshell mode; it returns when the lid opens
