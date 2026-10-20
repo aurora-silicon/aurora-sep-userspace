@@ -14,7 +14,7 @@ It is developed on the MacBook Neo (J700, A18 Pro).
 ## What is here
 
 `libfprint/` holds Fedora's `libfprint-1.94.100-1.fc45` spec, rebuilt as
-`libfprint-1.94.100-1.fc45.aurora4` with the `aurora` driver. The build replaces
+`libfprint-1.94.100-1.fc45.aurora5` with the `aurora` driver. The build replaces
 Fedora's libfprint in place, so fprintd needs no `LD_LIBRARY_PATH` and nothing is
 installed under `/usr/local`. The package provides `libfprint(aurora-sep) = 4`.
 
@@ -24,7 +24,7 @@ installed under `/usr/local`. The package provides `libfprint(aurora-sep) = 4`.
 | `libfprint-1.94.100-apple-sep.patch` | the `aurora` driver and the misc-device udev subtype it needs, unchanged from `tools/aurora-sep/patches/` in aurora-silicon/linux at commit `3b2bd35a8591` (blob `bdb15bb1`); this repository maintains it from now on |
 | `0002-aurora-report-unusable-captures-as-retries.patch` | reports unusable captures (kernel status RETRY) as libfprint retries during enrolment, verify and identify, so fprintd asks for another touch; fails a rejected enrolment with a reason |
 | `0003-hide-lid-covered-readers-while-the-lid-is-closed.patch` | the Touch ID sensor is in the power button, which a closed lid covers: libfprint drops the reader while the lid is closed and probes it again when it opens (details below) |
-| `fprintd-lid-switch.conf` | fprintd drop-in, `DeviceAllow=char-input r`: fprintd's sandbox must let libfprint read the lid switch |
+| `fprintd-aurora-touchid.conf` | fprintd drop-in: `DeviceAllow=/dev/sep-bio rw` for the reader, and `DeviceAllow=char-input r` so libfprint can read the lid switch (a deliberate widening: fprintd can read every input device) |
 | `apple-sep.h` | a build-time copy of the kernel UAPI header, because distribution kernel headers do not ship it yet |
 
 The system integration lives next to the kernel driver in aurora-silicon/linux,
@@ -69,7 +69,7 @@ On Fedora 45 (aarch64):
 
 ## Install
 
-    sudo dnf install ./libfprint-1.94.100-1.fc45.aurora4.aarch64.rpm ./aurora-sep-*.noarch.rpm
+    sudo dnf install ./libfprint-1.94.100-1.fc45.aurora5.aarch64.rpm ./aurora-sep-*.noarch.rpm
     sudo dnf versionlock add libfprint
 
 Reboot afterwards to apply the package and unit changes. The SEP driver attaches
