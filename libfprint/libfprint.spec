@@ -12,8 +12,8 @@ Name:           libfprint
 
 Version:        1.94.100
 # Fedora's release plus a suffix, so this sorts above the Fedora build it
-# replaces (1.fc45 < 1.fc45.aurora4) and below the next Fedora release.
-Release:        1%{?dist}.aurora4
+# replaces (1.fc45 < 1.fc45.aurora5) and below the next Fedora release.
+Release:        1%{?dist}.aurora5
 Summary:        Toolkit for fingerprint scanner
 
 # Automatically converted from old format: LGPLv2+ - review is highly recommended.
@@ -26,9 +26,10 @@ Source0:        https://gitlab.freedesktop.org/libfprint/libfprint/-/archive/v%{
 # include/uapi/linux/apple-sep.h in https://github.com/aurora-silicon/linux.
 # Build-time only: distribution kernel-headers do not carry it yet.
 Source1000:     apple-sep.h
-# fprintd's sandbox allows only the devices it names; let it read the lid
-# switch that libfprint follows (Patch1002).
-Source1001:     fprintd-lid-switch.conf
+# fprintd's sandbox allows only the devices it names; let it open
+# /dev/sep-bio (Patch1000) and read the lid switch that libfprint follows
+# (Patch1002).
+Source1001:     fprintd-aurora-touchid.conf
 
 # Apple Touch ID through the apple_sep kernel driver: the aurora driver plus
 # the misc-device udev subtype it needs. Unchanged from
@@ -99,7 +100,7 @@ export CFLAGS="%{build_cflags} -I$(pwd)/aurora-uapi"
 
 %install
 %meson_install
-install -Dpm0644 %{SOURCE1001} %{buildroot}%{_unitdir}/fprintd.service.d/50-libfprint-lid-switch.conf
+install -Dpm0644 %{SOURCE1001} %{buildroot}%{_unitdir}/fprintd.service.d/50-libfprint-aurora-touchid.conf
 
 %ldconfig_scriptlets
 
@@ -115,7 +116,7 @@ install -Dpm0644 %{SOURCE1001} %{buildroot}%{_unitdir}/fprintd.service.d/50-libf
 %{_udevrulesdir}/70-libfprint-2.rules
 %{_datadir}/metainfo/org.freedesktop.libfprint.metainfo.xml
 %dir %{_unitdir}/fprintd.service.d
-%{_unitdir}/fprintd.service.d/50-libfprint-lid-switch.conf
+%{_unitdir}/fprintd.service.d/50-libfprint-aurora-touchid.conf
 
 %files devel
 %doc HACKING.md
@@ -130,6 +131,13 @@ install -Dpm0644 %{SOURCE1001} %{buildroot}%{_unitdir}/fprintd.service.d/50-libf
 %{_datadir}/installed-tests/libfprint-2/
 
 %changelog
+* Tue Oct 20 2026 Ryan Murray <ryan@aurorasilicon.org> - 1.94.100-1.aurora5
+- Let fprintd open /dev/sep-bio; the drop-in is now
+  50-libfprint-aurora-touchid.conf
+- Document why fprintd may read all input devices
+- Look a lid switch up by its fd when it reports
+- Test FpContext hiding and probing again a lid-covered reader
+
 * Thu Oct 15 2026 Ryan Murray <ryan@aurorasilicon.org> - 1.94.100-1.aurora4
 - Let a reader the lid removed while the system slept be released after
   resume, so it comes back when the lid opens
