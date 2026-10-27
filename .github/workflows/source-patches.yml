@@ -40,3 +40,4 @@ jobs:
           git init -q
           git apply ../fprintd/0001-preserve-print-on-device-delete-failure.patch
           python3 -m py_compile tests/fprintd.py
+          python3 ../fprintd/tests/test_account_gate.py src/device.c

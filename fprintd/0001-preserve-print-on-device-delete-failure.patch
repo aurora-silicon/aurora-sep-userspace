@@ -8,10 +8,41 @@ Keep the host record whenever device deletion fails, with regression tests.
 Assisted-by: LLM
 ---
 diff --git a/src/device.c b/src/device.c
-index 4de4a10..55470dc 100644
+index 4de4a10..757c30a 100644
 --- a/src/device.c
 +++ b/src/device.c
-@@ -2185,6 +2185,7 @@ fprint_device_enroll_start (FprintDBusDevice      *dbus_dev,
+@@ -28,6 +28,8 @@
+ #include <sys/types.h>
+ #include <pwd.h>
+ #include <errno.h>
++#include <stdbool.h>
++#include <string.h>
+ 
+ #include "fprintd-dbus.h"
+ #include "fprintd.h"
+@@ -2174,6 +2176,21 @@ is_first_enrollment (FprintDevice * rdev)
+   return host_prints->len == 0;
+ }
+ 
++static gboolean
++aurora_account_resolves (const char *username)
++{
++  struct passwd account;
++  struct passwd *found = NULL;
++  char buffer[16384];
++
++  if (!username || !*username)
++    return false;
++
++  return getpwnam_r (username, &account, buffer, sizeof (buffer), &found) == 0 &&
++         found && found->pw_name && strcmp (found->pw_name, username) == 0 &&
++         found->pw_uid != (uid_t) -1;
++}
++
+ static gboolean
+ fprint_device_enroll_start (FprintDBusDevice      *dbus_dev,
+                             GDBusMethodInvocation *invocation,
+@@ -2185,6 +2202,7 @@ fprint_device_enroll_start (FprintDBusDevice      *dbus_dev,
    FprintDevice *rdev = FPRINT_DEVICE (dbus_dev);
    FprintDevicePrivate *priv = fprint_device_get_instance_private (rdev);
    FpFinger finger = finger_name_to_fp_finger (finger_name);
@@ -19,22 +50,16 @@ index 4de4a10..55470dc 100644
  
    if (!_fprint_device_check_claimed (rdev, invocation, &error))
      {
-@@ -2201,6 +2202,26 @@ fprint_device_enroll_start (FprintDBusDevice      *dbus_dev,
+@@ -2201,6 +2219,20 @@ fprint_device_enroll_start (FprintDBusDevice      *dbus_dev,
      }
  
    session = session_data_get (priv);
 +  if (aurora)
 +    {
-+      struct passwd passwd_entry;
-+      struct passwd *found = NULL;
-+      char buffer[16384];
-+
 +      /* fprintd normally identifies (and may delete) a device print before
 +       * invoking the driver's enrol method. Resolve the account here so an
 +       * invalid target causes no SEP match, save or deletion at all. */
-+      if (!session->username ||
-+          getpwnam_r (session->username, &passwd_entry, buffer, sizeof (buffer), &found) != 0 ||
-+          !found || g_strcmp0 (found->pw_name, session->username) != 0)
++      if (!aurora_account_resolves (session->username))
 +        {
 +          g_set_error (&error, FPRINT_ERROR, FPRINT_ERROR_INTERNAL,
 +                       "Unix account '%s' has no passwd entry or uid; no biometric operation was started",
@@ -46,7 +71,7 @@ index 4de4a10..55470dc 100644
    store.print_data_load (priv->dev, finger,
                           session->username, &existing_print);
  
-@@ -2212,6 +2233,13 @@ fprint_device_enroll_start (FprintDBusDevice      *dbus_dev,
+@@ -2212,6 +2244,13 @@ fprint_device_enroll_start (FprintDBusDevice      *dbus_dev,
  
    if (existing_print)
      {
@@ -60,7 +85,7 @@ index 4de4a10..55470dc 100644
        if (!delete_enrolled_fingers (rdev, session->username, finger, &error))
          {
            g_dbus_method_invocation_return_gerror (invocation, error);
-@@ -2225,7 +2253,7 @@ fprint_device_enroll_start (FprintDBusDevice      *dbus_dev,
+@@ -2225,7 +2264,7 @@ fprint_device_enroll_start (FprintDBusDevice      *dbus_dev,
    priv->enroll_data = finger;
    priv->current_action = ACTION_ENROLL;
  
@@ -69,7 +94,7 @@ index 4de4a10..55470dc 100644
        !fp_device_has_feature (priv->dev, FP_DEVICE_FEATURE_STORAGE_LIST) &&
        is_first_enrollment (rdev))
      {
-@@ -2236,7 +2264,7 @@ fprint_device_enroll_start (FprintDBusDevice      *dbus_dev,
+@@ -2236,7 +2275,7 @@ fprint_device_enroll_start (FprintDBusDevice      *dbus_dev,
                     clear_err->message);
      }
  
@@ -78,7 +103,7 @@ index 4de4a10..55470dc 100644
      {
        g_autoptr(GPtrArray) all_prints = load_all_prints (rdev);
  
-@@ -2390,8 +2418,8 @@ delete_enrolled_fingers (FprintDevice *rdev,
+@@ -2390,8 +2429,8 @@ delete_enrolled_fingers (FprintDevice *rdev,
        return FALSE;
      }
  
@@ -89,7 +114,7 @@ index 4de4a10..55470dc 100644
    if (fp_device_has_feature (priv->dev, FP_DEVICE_FEATURE_STORAGE))
      {
        g_autoptr(GSList) prints = NULL;
-@@ -2432,6 +2460,12 @@ delete_enrolled_fingers (FprintDevice *rdev,
+@@ -2432,6 +2471,12 @@ delete_enrolled_fingers (FprintDevice *rdev,
          }
      }
  
@@ -102,7 +127,7 @@ index 4de4a10..55470dc 100644
    if (finger != FP_FINGER_UNKNOWN)
      {
        if ((r = store.print_data_delete (priv->dev, finger, user)) != 0)
-@@ -2473,13 +2507,6 @@ delete_enrolled_fingers (FprintDevice *rdev,
+@@ -2473,13 +2518,6 @@ delete_enrolled_fingers (FprintDevice *rdev,
          }
      }
  

@@ -42,6 +42,9 @@ virtual-device regression tests. This is a required companion package:
 libfprint reports the device error, but stock fprintd 1.94.5 still deletes its
 own file. Build the patched fprintd RPM after the aurora libfprint RPM, then
 install both before relying on failed-delete recovery.
+`fprintd/tests/test_account_gate.py` compiles the patched account gate with a
+fake passwd lookup and covers missing entries, lookup errors, invalid uid and
+name mismatch without a device operation.
 The spec is based on [Fedora's f45 fprintd spec](https://src.fedoraproject.org/rpms/fprintd/blob/f45/f/fprintd.spec);
 the patch targets [fprintd v1.94.5](https://gitlab.freedesktop.org/libfprint/fprintd/-/tags/v1.94.5).
 
