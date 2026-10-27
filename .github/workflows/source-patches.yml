@@ -21,6 +21,17 @@ jobs:
           git apply ../libfprint/0003-hide-lid-covered-readers-while-the-lid-is-closed.patch
           git apply ../libfprint/0004-aurora-refuse-unbound-enrollment.patch
           grep -q '^#define SEP_BIO_IFACE_VERSION  5' ../libfprint/apple-sep.h
+      - name: Check biometric ioctl ABI sizes
+        run: |
+          cat > abi.c <<'EOF'
+          #include "libfprint/apple-sep.h"
+          _Static_assert(sizeof(struct sep_bio_enrol_start) == 144, "enrol ABI");
+          _Static_assert(sizeof(struct sep_bio_enclave_list) == 520, "list ABI");
+          _Static_assert(sizeof(struct sep_bio_delete) == 16, "delete ABI");
+          int main(void) { return 0; }
+          EOF
+          cc -Wall -Werror -I. abi.c -o abi
+          ./abi
       - name: Apply fprintd patch to the packaged release
         run: |
           curl -fsSL https://gitlab.freedesktop.org/libfprint/fprintd/-/archive/v1.94.5/fprintd-v1.94.5.tar.gz -o fprintd.tar.gz
