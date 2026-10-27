@@ -24,7 +24,7 @@ installed under `/usr/local`. The package provides `libfprint(aurora-sep) = 5`.
 | `libfprint-1.94.100-apple-sep.patch` | the `aurora` driver and the misc-device udev subtype it needs, unchanged from `tools/aurora-sep/patches/` in aurora-silicon/linux at commit `3b2bd35a8591` (blob `bdb15bb1`); this repository maintains it from now on |
 | `0002-aurora-report-unusable-captures-as-retries.patch` | reports unusable captures (kernel status RETRY) as libfprint retries during enrolment, verify and identify, so fprintd asks for another touch; fails a rejected enrolment with a reason |
 | `0003-hide-lid-covered-readers-while-the-lid-is-closed.patch` | the Touch ID sensor is in the power button, which a closed lid covers: libfprint drops the reader while the lid is closed and probes it again when it opens (details below) |
-| `0004-aurora-refuse-unbound-enrollment.patch` | resolves the Unix account and finger, prepares an empty Linux owner context, maps persistence refusals, avoids full-slot garbage collection, and logs mismatched enclave IDs |
+| `0004-aurora-refuse-unbound-enrollment.patch` | resolves the Unix account and finger, prepares an empty Linux owner context, maps persistence refusals, avoids full-slot garbage collection, and logs single-verify and identify-gallery UUID mismatches |
 | `fprintd-aurora-touchid.conf` | fprintd drop-in: `DeviceAllow=/dev/sep-bio rw` for the reader, and `DeviceAllow=char-input r` so libfprint can read the lid switch (a deliberate widening: fprintd can read every input device) |
 | `apple-sep.h` | a build-time copy of the kernel UAPI header, because distribution kernel headers do not ship it yet |
 

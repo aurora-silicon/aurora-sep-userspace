@@ -2,13 +2,13 @@ Subject: [PATCH] aurora: admit only bound enrolments and report match identity
 
 Resolve the Unix account and finger before any SEP write, prepare the empty
 Linux owner context, then start enrolment under kernel persistence checks.
-Report matched and requested identity UUIDs when they differ. Avoid the
-DATA_FULL error that makes fprintd garbage-collect another device print.
+Report the SEP identity when single verify or identify lacks the requested
+print. Avoid DATA_FULL, which makes fprintd garbage-collect another print.
 
 Assisted-by: LLM
 ---
 diff --git a/libfprint/drivers/aurora/aurora.c b/libfprint/drivers/aurora/aurora.c
-index 51d05c2..f091d36 100644
+index 51d05c2..5fb44fe 100644
 --- a/libfprint/drivers/aurora/aurora.c
 +++ b/libfprint/drivers/aurora/aurora.c
 @@ -84,8 +84,29 @@ aurora_ioctl (FpiDeviceAurora *self, unsigned long req, void *arg, GError **erro
@@ -160,3 +160,22 @@ index 51d05c2..f091d36 100644
        else
          {
            fpi_device_verify_report (device, FPI_MATCH_FAIL, matched, NULL);
+@@ -761,6 +855,18 @@ aurora_verify_ready (gint fd, GIOCondition condition, gpointer user_data)
+             }
+         }
+ 
++      if (matched != NULL)
++        {
++          gchar actual_hex[SEP_BIO_UUID_LEN * 2 + 1];
++
++          aurora_uuid_hex (res.uuid, actual_hex);
++          if (hit == NULL)
++            g_warning ("SEP matched enclave identity %s, but no fprintd gallery print has that identity",
++                       actual_hex);
++          else
++            fp_dbg ("SEP identified gallery identity %s", actual_hex);
++        }
++
+       if (retry != NULL)
+         {
+           fpi_device_identify_report (device, NULL, NULL, retry);
