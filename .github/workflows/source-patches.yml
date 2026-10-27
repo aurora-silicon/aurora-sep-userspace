@@ -63,7 +63,7 @@ jobs:
           git apply ../libfprint/0003-hide-lid-covered-readers-while-the-lid-is-closed.patch
           git apply ../libfprint/0004-aurora-refuse-unbound-enrollment.patch
           install -Dm644 ../libfprint/apple-sep.h aurora-uapi/linux/apple-sep.h
-          CFLAGS="-I$(pwd)/aurora-uapi" meson setup build -Ddrivers=aurora,virtual_device_storage -Dintrospection=true -Ddoc=false -Dinstalled-tests=false -Dudev_rules=disabled -Dudev_hwdb=disabled
+          CFLAGS="-I$(pwd)/aurora-uapi" meson setup build -Ddrivers=aurora,virtual_device,virtual_device_storage -Dintrospection=true -Ddoc=false -Dinstalled-tests=false -Dudev_rules=disabled -Dudev_hwdb=disabled
           meson compile -C build
           meson install -C build
       - name: Build patched fprintd
