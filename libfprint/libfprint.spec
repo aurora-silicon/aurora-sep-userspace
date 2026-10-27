@@ -12,8 +12,8 @@ Name:           libfprint
 
 Version:        1.94.100
 # Fedora's release plus a suffix, so this sorts above the Fedora build it
-# replaces (1.fc45 < 1.fc45.aurora5) and below the next Fedora release.
-Release:        1%{?dist}.aurora5
+# replaces (1.fc45 < 1.fc45.aurora6) and below the next Fedora release.
+Release:        1%{?dist}.aurora6
 Summary:        Toolkit for fingerprint scanner
 
 # Automatically converted from old format: LGPLv2+ - review is highly recommended.
@@ -22,7 +22,7 @@ Summary:        Toolkit for fingerprint scanner
 License:        LGPL-2.1-or-later AND NIST-PD
 URL:            http://www.freedesktop.org/wiki/Software/fprint/libfprint
 Source0:        https://gitlab.freedesktop.org/libfprint/libfprint/-/archive/v%{version}/libfprint-v%{version}.tar.gz
-# The kernel's biometric ioctl ABI (/dev/sep-bio, interface version 4), from
+# The kernel's biometric ioctl ABI (/dev/sep-bio, interface version 5), from
 # include/uapi/linux/apple-sep.h in https://github.com/aurora-silicon/linux.
 # Build-time only: distribution kernel-headers do not carry it yet.
 Source1000:     apple-sep.h
@@ -43,6 +43,9 @@ Patch1001:      0002-aurora-report-unusable-captures-as-retries.patch
 # button) and probe it again when the lid opens, so in clamshell mode sudo,
 # polkit and the lock screen go straight to the password.
 Patch1002:      0003-hide-lid-covered-readers-while-the-lid-is-closed.patch
+# Refuse unbound users and unknown fingers before any enclave capture,
+# prepare an empty owner context and report mismatched SEP identities.
+Patch1003:      0004-aurora-refuse-unbound-enrollment.patch
 
 BuildRequires:  meson
 BuildRequires:  gcc
@@ -64,7 +67,7 @@ BuildRequires:  gobject-introspection-devel
 BuildRequires:  python3-cairo python3-gobject cairo-devel
 BuildRequires:  umockdev >= 0.13.2
 
-Provides:       libfprint(aurora-sep) = 4
+Provides:       libfprint(aurora-sep) = 5
 
 %description
 libfprint offers support for consumer fingerprint reader devices.
@@ -131,6 +134,9 @@ install -Dpm0644 %{SOURCE1001} %{buildroot}%{_unitdir}/fprintd.service.d/50-libf
 %{_datadir}/installed-tests/libfprint-2/
 
 %changelog
+* Tue Oct 27 2026 Aurora Silicon contributors - 1.94.100-1.aurora6
+- Refuse unbound enrolment and prevent full-slot garbage collection
+
 * Tue Oct 20 2026 Ryan Murray <ryan@aurorasilicon.org> - 1.94.100-1.aurora5
 - Let fprintd open /dev/sep-bio; the drop-in is now
   50-libfprint-aurora-touchid.conf

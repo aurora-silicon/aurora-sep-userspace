@@ -1,0 +1,31 @@
+name: Source patches
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply libfprint patches to the packaged release
+        run: |
+          curl -fsSL https://gitlab.freedesktop.org/libfprint/libfprint/-/archive/v1.94.100/libfprint-v1.94.100.tar.gz -o libfprint.tar.gz
+          tar -xzf libfprint.tar.gz
+          cd libfprint-v1.94.100
+          git init -q
+          git apply ../libfprint/libfprint-1.94.100-apple-sep.patch
+          git apply ../libfprint/0002-aurora-report-unusable-captures-as-retries.patch
+          git apply ../libfprint/0003-hide-lid-covered-readers-while-the-lid-is-closed.patch
+          git apply ../libfprint/0004-aurora-refuse-unbound-enrollment.patch
+          grep -q '^#define SEP_BIO_IFACE_VERSION  5' ../libfprint/apple-sep.h
+      - name: Apply fprintd patch to the packaged release
+        run: |
+          curl -fsSL https://gitlab.freedesktop.org/libfprint/fprintd/-/archive/v1.94.5/fprintd-v1.94.5.tar.gz -o fprintd.tar.gz
+          tar -xzf fprintd.tar.gz
+          cd fprintd-v1.94.5
+          git init -q
+          git apply ../fprintd/0001-preserve-print-on-device-delete-failure.patch
+          python3 -m py_compile tests/fprintd.py
