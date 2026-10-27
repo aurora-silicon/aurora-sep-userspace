@@ -50,7 +50,8 @@ jobs:
       - name: Install build dependencies
         run: |
           dnf -y install curl tar git gcc gcc-c++ meson ninja-build pkgconf-pkg-config \
-            glib2-devel libgusb-devel libgudev-devel polkit-devel gettext
+            glib2-devel libgusb-devel libgudev-devel polkit-devel gettext \
+            gobject-introspection-devel python3-gobject python3-dbusmock python3-cairo
       - name: Build packaged Aurora libfprint driver
         run: |
           curl -fsSL https://gitlab.freedesktop.org/libfprint/libfprint/-/archive/v1.94.100/libfprint-v1.94.100.tar.gz -o libfprint.tar.gz
@@ -62,7 +63,7 @@ jobs:
           git apply ../libfprint/0003-hide-lid-covered-readers-while-the-lid-is-closed.patch
           git apply ../libfprint/0004-aurora-refuse-unbound-enrollment.patch
           install -Dm644 ../libfprint/apple-sep.h aurora-uapi/linux/apple-sep.h
-          CFLAGS="-I$(pwd)/aurora-uapi" meson setup build -Ddrivers=aurora -Dintrospection=false -Ddoc=false -Dinstalled-tests=false -Dudev_rules=disabled -Dudev_hwdb=disabled
+          CFLAGS="-I$(pwd)/aurora-uapi" meson setup build -Ddrivers=aurora,virtual_device_storage -Dintrospection=true -Ddoc=false -Dinstalled-tests=false -Dudev_rules=disabled -Dudev_hwdb=disabled
           meson compile -C build
           meson install -C build
       - name: Build patched fprintd
@@ -74,3 +75,14 @@ jobs:
           git apply ../fprintd/0001-preserve-print-on-device-delete-failure.patch
           PKG_CONFIG_PATH=/usr/local/lib64/pkgconfig meson setup build -Dpam=false -Dman=false -Dsystemd=false -Dgtk_doc=false
           meson compile -C build
+      - name: Run failed-delete fprintd regression cases
+        env:
+          GI_TYPELIB_PATH: /usr/local/lib64/girepository-1.0
+          LD_LIBRARY_PATH: /usr/local/lib64
+        run: |
+          cd fprintd-v1.94.5
+          export FPRINT_BUILD_DIR="$PWD/build/src" TOPSRCDIR="$PWD"
+          python3 tests/fprintd.py \
+            FPrintdVirtualDeviceStorageClaimedTest.test_delete_enrolled_fingers_device_error \
+            FPrintdVirtualDeviceStorageClaimedTest.test_delete_enrolled_fingers2_device_error \
+            FPrintdVirtualDeviceStorageClaimedTest.test_delete_enrolled_finger_device_error
