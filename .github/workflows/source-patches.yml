@@ -41,3 +41,36 @@ jobs:
           git apply ../fprintd/0001-preserve-print-on-device-delete-failure.patch
           python3 -m py_compile tests/fprintd.py
           python3 ../fprintd/tests/test_account_gate.py src/device.c
+
+  build:
+    runs-on: ubuntu-latest
+    container: fedora:45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          dnf -y install curl tar git gcc gcc-c++ meson ninja-build pkgconf-pkg-config \
+            glib2-devel libgusb-devel libgudev-devel polkit-devel gettext
+      - name: Build packaged Aurora libfprint driver
+        run: |
+          curl -fsSL https://gitlab.freedesktop.org/libfprint/libfprint/-/archive/v1.94.100/libfprint-v1.94.100.tar.gz -o libfprint.tar.gz
+          tar -xzf libfprint.tar.gz
+          cd libfprint-v1.94.100
+          git init -q
+          git apply ../libfprint/libfprint-1.94.100-apple-sep.patch
+          git apply ../libfprint/0002-aurora-report-unusable-captures-as-retries.patch
+          git apply ../libfprint/0003-hide-lid-covered-readers-while-the-lid-is-closed.patch
+          git apply ../libfprint/0004-aurora-refuse-unbound-enrollment.patch
+          install -Dm644 ../libfprint/apple-sep.h aurora-uapi/linux/apple-sep.h
+          CFLAGS="-I$(pwd)/aurora-uapi" meson setup build -Ddrivers=aurora -Dintrospection=false -Ddoc=false -Dinstalled-tests=false -Dudev_rules=disabled -Dudev_hwdb=disabled
+          meson compile -C build
+          meson install -C build
+      - name: Build patched fprintd
+        run: |
+          curl -fsSL https://gitlab.freedesktop.org/libfprint/fprintd/-/archive/v1.94.5/fprintd-v1.94.5.tar.gz -o fprintd.tar.gz
+          tar -xzf fprintd.tar.gz
+          cd fprintd-v1.94.5
+          git init -q
+          git apply ../fprintd/0001-preserve-print-on-device-delete-failure.patch
+          PKG_CONFIG_PATH=/usr/local/lib64/pkgconfig meson setup build -Dpam=false -Dman=false -Dsystemd=false -Dgtk_doc=false
+          meson compile -C build
