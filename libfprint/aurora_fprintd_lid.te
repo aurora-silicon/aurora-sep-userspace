@@ -1,0 +1,20 @@
+policy_module(aurora_fprintd_lid, 1.0)
+
+########################################
+#
+# Let fprintd read the lid switch.
+#
+# libfprint drops a fingerprint reader that a closed laptop lid covers (the
+# Touch ID sensor is in the power button) and follows the lid switches for
+# that: it opens the input devices udev reports as switches, read-only, and
+# reads their state with EVIOCGBIT and EVIOCGSW. The targeted policy gives
+# fprintd_t no access to event_device_t, so on an enforcing system libfprint
+# never saw the lid and kept offering the reader in clamshell mode.
+#
+# This matches the char-input r allowance of fprintd's systemd drop-in.
+
+gen_require(`
+	type fprintd_t;
+')
+
+dev_read_input(fprintd_t)
