@@ -21,7 +21,7 @@ jobs:
           git apply ../libfprint/0003-hide-lid-covered-readers-while-the-lid-is-closed.patch
           git apply ../libfprint/0004-aurora-refuse-unbound-enrollment.patch
           git apply ../libfprint/0005-aurora-support-v4-and-v5.patch
-          python3 ../libfprint/tests/test_interface.py libfprint/drivers/aurora/aurora.c ../libfprint/apple-sep.h
+          python3 ../libfprint/test_interface.py libfprint/drivers/aurora/aurora.c ../libfprint/apple-sep.h
           grep -q '^#define SEP_BIO_IFACE_VERSION  5' ../libfprint/apple-sep.h
       - name: Check biometric ioctl ABI sizes
         run: |

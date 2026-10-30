@@ -33,6 +33,7 @@ Source1001:     fprintd-aurora-touchid.conf
 # SELinux: let fprintd_t read the lid switch (event_device_t) that libfprint
 # follows (Patch1002). The drop-in above covers the systemd sandbox only.
 Source1002:     aurora_fprintd_lid.te
+Source1003:     test_interface.py
 
 # Apple Touch ID through the apple_sep kernel driver: the aurora driver plus
 # the misc-device udev subtype it needs. Unchanged from
@@ -146,8 +147,9 @@ fi
 
 %ldconfig_scriptlets
 
-# TODO: The test can't run with the recent pygobject3.52.
-# So, skip the test until the issue of pygobject is fixed.
+%check
+# Independent of the upstream PyGObject test-suite compatibility issue.
+python3 %{SOURCE1003} libfprint/drivers/aurora/aurora.c %{SOURCE1000}
 
 %files
 %license COPYING
