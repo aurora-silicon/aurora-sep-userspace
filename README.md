@@ -5,7 +5,7 @@ Fedora packaging of libfprint for Apple Touch ID on Aurora Silicon kernels.
 The kernel side is the `apple_sep` driver in
 [aurora-silicon/linux](https://github.com/aurora-silicon/linux) (`aurora-wip`).
 It exposes the fingerprint sensor as the `/dev/sep-bio` misc device, and its ioctl
-ABI is `include/uapi/linux/apple-sep.h` (interface version 5). The enclave does all
+ABI is `include/uapi/linux/apple-sep.h` (interface versions 4 and 5). The enclave does all
 of the matching, so no image, template or key material ever reaches userspace.
 
 Hardware: Apple silicon Macs with Touch ID that the `apple_sep` driver supports.
@@ -14,9 +14,9 @@ It is developed on the MacBook Neo (J700, A18 Pro).
 ## What is here
 
 `libfprint/` holds Fedora's `libfprint-1.94.100-1.fc45` spec, rebuilt as
-`libfprint-1.94.100-1.fc45.aurora6` with the `aurora` driver. The build replaces
+`libfprint-1.94.100-1.fc45.aurora7` with the `aurora` driver. The build replaces
 Fedora's libfprint in place, so fprintd needs no `LD_LIBRARY_PATH` and nothing is
-installed under `/usr/local`. The package provides `libfprint(aurora-sep) = 5`.
+installed under `/usr/local`. The package provides both `libfprint(aurora-sep) = 4` and `= 5`.
 
 | file | what it is |
 | --- | --- |
@@ -25,6 +25,8 @@ installed under `/usr/local`. The package provides `libfprint(aurora-sep) = 5`.
 | `0002-aurora-report-unusable-captures-as-retries.patch` | reports unusable captures (kernel status RETRY) as libfprint retries during enrolment, verify and identify, so fprintd asks for another touch; fails a rejected enrolment with a reason |
 | `0003-hide-lid-covered-readers-while-the-lid-is-closed.patch` | the Touch ID sensor is in the power button, which a closed lid covers: libfprint drops the reader while the lid is closed and probes it again when it opens (details below) |
 | `0004-aurora-refuse-unbound-enrollment.patch` | resolves the Unix account and finger, prepares an empty Linux owner context, maps persistence refusals, avoids full-slot garbage collection, and logs single-verify and identify-gallery UUID mismatches |
+| `0005-aurora-support-v4-and-v5.patch` | accepts only v4 and v5, uses the 136-byte legacy enrol request on v4 and the 144-byte account-bound request plus PREPARE_ENROL on v5; v5 errors never fall back to v4 |
+| `aurora_fprintd_lid.te` | SELinux policy permitting fprintd to read the lid switch |
 | `fprintd-aurora-touchid.conf` | fprintd drop-in: `DeviceAllow=/dev/sep-bio rw` for the reader, and `DeviceAllow=char-input r` so libfprint can read the lid switch (a deliberate widening: fprintd can read every input device) |
 | `apple-sep.h` | a build-time copy of the kernel UAPI header, because distribution kernel headers do not ship it yet |
 
@@ -93,7 +95,7 @@ package in the Fedora build environment, then:
 
 ## Install
 
-    sudo dnf install ./libfprint-1.94.100-1.fc45.aurora6.aarch64.rpm ./fprintd-1.94.5-99.fc45.aurora1.aarch64.rpm ./fprintd-pam-1.94.5-99.fc45.aurora1.aarch64.rpm ./aurora-sep-*.noarch.rpm
+    sudo dnf install ./libfprint-1.94.100-1.fc45.aurora7.aarch64.rpm ./fprintd-1.94.5-99.fc45.aurora1.aarch64.rpm ./fprintd-pam-1.94.5-99.fc45.aurora1.aarch64.rpm ./aurora-sep-*.noarch.rpm
     sudo dnf versionlock add libfprint
 
 Reboot afterwards to apply the package and unit changes. The SEP driver attaches

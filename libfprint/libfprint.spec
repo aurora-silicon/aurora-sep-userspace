@@ -12,8 +12,8 @@ Name:           libfprint
 
 Version:        1.94.100
 # Fedora's release plus a suffix, so this sorts above the Fedora build it
-# replaces (1.fc45 < 1.fc45.aurora6) and below the next Fedora release.
-Release:        1%{?dist}.aurora6
+# replaces (1.fc45 < 1.fc45.aurora5) and below the next Fedora release.
+Release:        1%{?dist}.aurora7
 Summary:        Toolkit for fingerprint scanner
 
 # Automatically converted from old format: LGPLv2+ - review is highly recommended.
@@ -22,7 +22,7 @@ Summary:        Toolkit for fingerprint scanner
 License:        LGPL-2.1-or-later AND NIST-PD
 URL:            http://www.freedesktop.org/wiki/Software/fprint/libfprint
 Source0:        https://gitlab.freedesktop.org/libfprint/libfprint/-/archive/v%{version}/libfprint-v%{version}.tar.gz
-# The kernel's biometric ioctl ABI (/dev/sep-bio, interface version 5), from
+# The kernel's biometric ioctl ABI (/dev/sep-bio, interface versions 4 and 5), from
 # include/uapi/linux/apple-sep.h in https://github.com/aurora-silicon/linux.
 # Build-time only: distribution kernel-headers do not carry it yet.
 Source1000:     apple-sep.h
@@ -30,6 +30,9 @@ Source1000:     apple-sep.h
 # /dev/sep-bio (Patch1000) and read the lid switch that libfprint follows
 # (Patch1002).
 Source1001:     fprintd-aurora-touchid.conf
+# SELinux: let fprintd_t read the lid switch (event_device_t) that libfprint
+# follows (Patch1002). The drop-in above covers the systemd sandbox only.
+Source1002:     aurora_fprintd_lid.te
 
 # Apple Touch ID through the apple_sep kernel driver: the aurora driver plus
 # the misc-device udev subtype it needs. Unchanged from
@@ -43,9 +46,9 @@ Patch1001:      0002-aurora-report-unusable-captures-as-retries.patch
 # button) and probe it again when the lid opens, so in clamshell mode sudo,
 # polkit and the lock screen go straight to the password.
 Patch1002:      0003-hide-lid-covered-readers-while-the-lid-is-closed.patch
-# Refuse unbound users and unknown fingers before any enclave capture,
-# prepare an empty owner context and report mismatched SEP identities.
+# Validate enrolment bindings and use the ioctl layout for the running kernel.
 Patch1003:      0004-aurora-refuse-unbound-enrollment.patch
+Patch1004:      0005-aurora-support-v4-and-v5.patch
 
 BuildRequires:  meson
 BuildRequires:  gcc
@@ -66,14 +69,31 @@ BuildRequires:  gobject-introspection-devel
 # For internal CI tests; umockdev 0.13.2 has an important locking fix
 BuildRequires:  python3-cairo python3-gobject cairo-devel
 BuildRequires:  umockdev >= 0.13.2
+BuildRequires:  selinux-policy-devel
+BuildRequires:  bzip2
 
+Provides:       libfprint(aurora-sep) = 4
 Provides:       libfprint(aurora-sep) = 5
+# Pull in the SELinux module wherever the targeted policy is installed.
+Requires:       (%{name}-selinux = %{version}-%{release} if selinux-policy-targeted)
 
 %description
 libfprint offers support for consumer fingerprint reader devices.
 
 This build adds the aurora driver for Apple Touch ID, which talks to the
 apple_sep kernel driver through /dev/sep-bio.
+
+%package        selinux
+Summary:        SELinux policy module letting fprintd follow the lid switch
+BuildArch:      noarch
+Requires:       selinux-policy-targeted
+%{?selinux_requires}
+
+%description    selinux
+libfprint hides a fingerprint reader that a closed laptop lid covers, which
+needs fprintd to read the lid switch. The targeted policy does not allow
+fprintd to read input devices; this module allows read-only access, so the
+reader is hidden in clamshell mode on systems with SELinux enforcing.
 
 %package        devel
 Summary:        Development files for %{name}
@@ -100,10 +120,29 @@ install -Dpm0644 %{SOURCE1000} aurora-uapi/linux/apple-sep.h
 export CFLAGS="%{build_cflags} -I$(pwd)/aurora-uapi"
 %meson -Ddrivers=all
 %meson_build
+mkdir -p selinux
+cp -p %{SOURCE1002} selinux/
+make -C selinux -f %{_datadir}/selinux/devel/Makefile aurora_fprintd_lid.pp
+bzip2 -9 selinux/aurora_fprintd_lid.pp
 
 %install
 %meson_install
 install -Dpm0644 %{SOURCE1001} %{buildroot}%{_unitdir}/fprintd.service.d/50-libfprint-aurora-touchid.conf
+install -Dpm0644 selinux/aurora_fprintd_lid.pp.bz2 %{buildroot}%{_datadir}/selinux/packages/targeted/aurora_fprintd_lid.pp.bz2
+
+%pre selinux
+%selinux_relabel_pre -s targeted
+
+%post selinux
+%selinux_modules_install -s targeted %{_datadir}/selinux/packages/targeted/aurora_fprintd_lid.pp.bz2
+
+%postun selinux
+if [ $1 -eq 0 ]; then
+    %selinux_modules_uninstall -s targeted aurora_fprintd_lid
+fi
+
+%posttrans selinux
+%selinux_relabel_post -s targeted
 
 %ldconfig_scriptlets
 
@@ -121,6 +160,9 @@ install -Dpm0644 %{SOURCE1001} %{buildroot}%{_unitdir}/fprintd.service.d/50-libf
 %dir %{_unitdir}/fprintd.service.d
 %{_unitdir}/fprintd.service.d/50-libfprint-aurora-touchid.conf
 
+%files selinux
+%{_datadir}/selinux/packages/targeted/aurora_fprintd_lid.pp.bz2
+
 %files devel
 %doc HACKING.md
 %{_includedir}/*
@@ -134,8 +176,13 @@ install -Dpm0644 %{SOURCE1001} %{buildroot}%{_unitdir}/fprintd.service.d/50-libf
 %{_datadir}/installed-tests/libfprint-2/
 
 %changelog
-* Tue Oct 27 2026 Aurora Silicon contributors - 1.94.100-1.aurora6
-- Refuse unbound enrolment and prevent full-slot garbage collection
+* Sat Oct 31 2026 Ryan Murray <ryan@aurorasilicon.org> - 1.94.100-1.aurora7
+- Support SEP interfaces v4 and v5 with versioned enrolment ioctls
+- Validate enrolment accounts and preserve persistence errors
+
+* Wed Oct 28 2026 Ryan Murray <ryan@aurorasilicon.org> - 1.94.100-1.aurora7
+- Add a libfprint-selinux subpackage that lets fprintd read the lid switch,
+  so the Touch ID reader is hidden in clamshell mode with SELinux enforcing
 
 * Tue Oct 20 2026 Ryan Murray <ryan@aurorasilicon.org> - 1.94.100-1.aurora5
 - Let fprintd open /dev/sep-bio; the drop-in is now
