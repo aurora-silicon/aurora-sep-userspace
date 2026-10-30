@@ -20,6 +20,8 @@ jobs:
           git apply ../libfprint/0002-aurora-report-unusable-captures-as-retries.patch
           git apply ../libfprint/0003-hide-lid-covered-readers-while-the-lid-is-closed.patch
           git apply ../libfprint/0004-aurora-refuse-unbound-enrollment.patch
+          git apply ../libfprint/0005-aurora-support-v4-and-v5.patch
+          python3 ../libfprint/tests/test_interface.py libfprint/drivers/aurora/aurora.c ../libfprint/apple-sep.h
           grep -q '^#define SEP_BIO_IFACE_VERSION  5' ../libfprint/apple-sep.h
       - name: Check biometric ioctl ABI sizes
         run: |
@@ -66,6 +68,7 @@ jobs:
           git apply ../libfprint/0002-aurora-report-unusable-captures-as-retries.patch
           git apply ../libfprint/0003-hide-lid-covered-readers-while-the-lid-is-closed.patch
           git apply ../libfprint/0004-aurora-refuse-unbound-enrollment.patch
+          git apply ../libfprint/0005-aurora-support-v4-and-v5.patch
           install -Dm644 ../libfprint/apple-sep.h aurora-uapi/linux/apple-sep.h
           CFLAGS="-I$(pwd)/aurora-uapi" meson setup build -Ddrivers=aurora,virtual_device,virtual_device_storage -Dintrospection=true -Ddoc=false -Dinstalled-tests=false -Dudev_rules=disabled -Dudev_hwdb=disabled
           meson compile -C build
