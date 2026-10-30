@@ -25,6 +25,7 @@ BuildRequires:	pkgconfig(systemd)
 BuildRequires:	python3
 BuildRequires:	python3-dbusmock
 BuildRequires:	python3-libpamtest
+Provides:	fprintd(aurora-sep) = 1
 Requires:	libfprint(aurora-sep) >= 5
 
 

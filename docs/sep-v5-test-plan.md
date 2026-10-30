@@ -44,7 +44,15 @@ The policy engine may classify a device-open/readiness or fprintd operation as
 state-changing. Request exclusive mode and wait for approval where required.
 Use `/usr/libexec/aurora-sep-sensor-present` on Fedora/Arch; on NixOS resolve
 `pkgs.aurora-sep`'s `libexec/aurora/sensor-present` from the system closure.
-The sensor gate must return zero on both ABIs. Readiness must reach its normal
+The sensor gate must return zero on both ABIs. For an explicit, non-identifying
+GET_INFO capture, submit the following exclusive request and wait for policy
+approval (opening the device may activate SEP):
+
+```sh
+aurora-ctl hw request execute --device neo --task "$TASK" --run "$RUN" --mode exclusive --wait -- python3 -c 'import os,fcntl,struct; fd=os.open("/dev/sep-bio",os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW); b=bytearray(32); fcntl.ioctl(fd,(2<<30)|(32<<16)|(0xB1<<8)|1,b,True); os.close(fd); print("version=%d sensor_present=%d" % struct.unpack_from("=II",b))'
+```
+
+Readiness must reach its normal
 restored/usable result, without a skipped ExecCondition or a new guard refusal.
 Check GET_INFO's first two u32 fields using the installed sensor helper's
 32-byte GET_INFO request; require `(4, 1)` or `(5, 1)` as appropriate.
