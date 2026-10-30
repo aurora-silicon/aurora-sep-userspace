@@ -44,7 +44,7 @@ virtual-device regression tests. This is a required companion package:
 libfprint reports the device error, but stock fprintd 1.94.5 still deletes its
 own file. Build the patched fprintd RPM after the aurora libfprint RPM, then
 install both before relying on failed-delete recovery.
-`fprintd/tests/test_account_gate.py` compiles the patched account gate with a
+`fprintd/test_account_gate.py` compiles the patched account gate with a
 fake passwd lookup and covers missing entries, lookup errors, invalid uid and
 name mismatch without a device operation.
 The spec is based on [Fedora's f45 fprintd spec](https://src.fedoraproject.org/rpms/fprintd/blob/f45/f/fprintd.spec);
@@ -127,3 +127,8 @@ top of it, or keep the version lock.
   `GPL-2.0 WITH Linux-syscall-note OR MIT` (`LICENSES/GPL-2.0-only.txt`,
   `LICENSES/Linux-syscall-note.txt`, `LICENSES/MIT.txt`).
 - Everything else here is MIT.
+
+## Qualification
+
+The [v4/v5 hardware test plan](docs/sep-v5-test-plan.md) covers existing enrolments,
+new enrolment persistence, verification and rollback before the kernel hold is removed.

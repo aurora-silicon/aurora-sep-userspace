@@ -7,6 +7,7 @@ Summary:	D-Bus service for Fingerprint reader access
 License:	GPL-2.0-or-later AND GFDL-1.1-or-later
 Source0:	https://gitlab.freedesktop.org/libfprint/fprintd/-/archive/v%{version}/fprintd-v%{version}.tar.gz
 Patch0:	0001-preserve-print-on-device-delete-failure.patch
+Source1:	test_account_gate.py
 Url:		http://www.freedesktop.org/wiki/Software/fprint/fprintd
 
 BuildRequires:	meson
@@ -15,13 +16,13 @@ BuildRequires:	gcc-c++
 BuildRequires:	git
 BuildRequires:	pam-devel
 BuildRequires:	libfprint-devel >= 1.94.0
-BuildRequires:	libfprint(aurora-sep) >= 5
 BuildRequires:	polkit-devel
 BuildRequires:	gtk-doc
 BuildRequires:	gettext
 BuildRequires:	perl-podlators
 BuildRequires:	pkgconfig(libsystemd)
 BuildRequires:	pkgconfig(systemd)
+BuildRequires:	python3
 BuildRequires:	python3-dbusmock
 BuildRequires:	python3-libpamtest
 Requires:	libfprint(aurora-sep) >= 5
@@ -70,6 +71,9 @@ fingerprint readers access.
 mkdir -p $RPM_BUILD_ROOT/%{_localstatedir}/lib/fprint
 
 %find_lang %{name}
+
+%check
+python3 %{SOURCE1} src/device.c
 
 %postun pam
 if [ $1 -eq 0 ]; then
