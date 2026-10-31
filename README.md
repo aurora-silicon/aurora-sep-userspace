@@ -14,7 +14,7 @@ It is developed on the MacBook Neo (J700, A18 Pro).
 ## What is here
 
 `libfprint/` holds Fedora's `libfprint-1.94.100-1.fc45` spec, rebuilt as
-`libfprint-1.94.100-1.fc45.aurora7` with the `aurora` driver. The build replaces
+`libfprint-1.94.100-1.fc45.aurora8` with the `aurora` driver. The build replaces
 Fedora's libfprint in place, so fprintd needs no `LD_LIBRARY_PATH` and nothing is
 installed under `/usr/local`. The package provides both `libfprint(aurora-sep) = 4` and `= 5`.
 
@@ -26,6 +26,7 @@ installed under `/usr/local`. The package provides both `libfprint(aurora-sep) =
 | `0003-hide-lid-covered-readers-while-the-lid-is-closed.patch` | the Touch ID sensor is in the power button, which a closed lid covers: libfprint drops the reader while the lid is closed and probes it again when it opens (details below) |
 | `0004-aurora-refuse-unbound-enrollment.patch` | resolves the Unix account and finger, prepares an empty Linux owner context, maps persistence refusals, avoids full-slot garbage collection, and logs single-verify and identify-gallery UUID mismatches |
 | `0005-aurora-support-v4-and-v5.patch` | accepts only v4 and v5, uses the 136-byte legacy enrol request on v4 and the 144-byte account-bound request plus PREPARE_ENROL on v5; v5 errors never fall back to v4 |
+| `0006-aurora-require-lift-and-place.patch` | maps stale contacts to remove-and-retry for verify/identify, and removal guidance to enrolment retries without advancing stages |
 | `aurora_fprintd_lid.te` | SELinux policy permitting fprintd to read the lid switch |
 | `fprintd-aurora-touchid.conf` | fprintd drop-in: `DeviceAllow=/dev/sep-bio rw` for the reader, and `DeviceAllow=char-input r` so libfprint can read the lid switch (a deliberate widening: fprintd can read every input device) |
 | `apple-sep.h` | a build-time copy of the kernel UAPI header, because distribution kernel headers do not ship it yet |
@@ -95,7 +96,7 @@ package in the Fedora build environment, then:
 
 ## Install
 
-    sudo dnf install ./libfprint-1.94.100-1.fc45.aurora7.aarch64.rpm ./fprintd-1.94.5-99.fc45.aurora1.aarch64.rpm ./fprintd-pam-1.94.5-99.fc45.aurora1.aarch64.rpm ./aurora-sep-*.noarch.rpm
+    sudo dnf install ./libfprint-1.94.100-1.fc45.aurora8.aarch64.rpm ./fprintd-1.94.5-99.fc45.aurora1.aarch64.rpm ./fprintd-pam-1.94.5-99.fc45.aurora1.aarch64.rpm ./aurora-sep-*.noarch.rpm
     sudo dnf versionlock add libfprint
 
 Reboot afterwards to apply the package and unit changes. The SEP driver attaches
@@ -132,3 +133,16 @@ top of it, or keep the version lock.
 
 The [v4/v5 hardware test plan](docs/sep-v5-test-plan.md) covers existing enrolments,
 new enrolment persistence, verification and rollback before the kernel hold is removed.
+
+## Fresh contacts
+
+The companion kernel change rejects a capture already reading before it was
+observed waiting for a finger. This build maps its removal status to
+`verify-remove-and-retry` (including identify), which fprintd automatically
+restarts, and maps removal guidance to `enroll-remove-and-retry` once per
+transition. Enrolment keeps its accepted stages. The existing finger-present
+and finger-needed properties describe removal and placement. No fprintd patch
+is needed for these status codes. Old v4/v5 kernels continue to work.
+
+See [the attended lift-and-place plan](docs/fresh-contact-test-plan.md) before
+qualifying a kernel/userspace pair on a sensor.
