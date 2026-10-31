@@ -1,0 +1,95 @@
+name: Source patches
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply libfprint patches to the packaged release
+        run: |
+          curl -fsSL https://gitlab.freedesktop.org/libfprint/libfprint/-/archive/v1.94.100/libfprint-v1.94.100.tar.gz -o libfprint.tar.gz
+          tar -xzf libfprint.tar.gz
+          cd libfprint-v1.94.100
+          git init -q
+          git apply ../libfprint/libfprint-1.94.100-apple-sep.patch
+          git apply ../libfprint/0002-aurora-report-unusable-captures-as-retries.patch
+          git apply ../libfprint/0003-hide-lid-covered-readers-while-the-lid-is-closed.patch
+          git apply ../libfprint/0004-aurora-refuse-unbound-enrollment.patch
+          git apply ../libfprint/0005-aurora-support-v4-and-v5.patch
+          python3 ../libfprint/test_interface.py libfprint/drivers/aurora/aurora.c ../libfprint/apple-sep.h
+          grep -q '^#define SEP_BIO_IFACE_VERSION  5' ../libfprint/apple-sep.h
+      - name: Check biometric ioctl ABI sizes
+        run: |
+          cat > abi.c <<'EOF'
+          #include "libfprint/apple-sep.h"
+          _Static_assert(sizeof(struct sep_bio_enrol_start) == 144, "enrol ABI");
+          _Static_assert(sizeof(struct sep_bio_enclave_list) == 520, "list ABI");
+          _Static_assert(sizeof(struct sep_bio_delete) == 16, "delete ABI");
+          int main(void) { return 0; }
+          EOF
+          cc -Wall -Werror -I. abi.c -o abi
+          ./abi
+      - name: Apply fprintd patch to the packaged release
+        run: |
+          curl -fsSL https://gitlab.freedesktop.org/libfprint/fprintd/-/archive/v1.94.5/fprintd-v1.94.5.tar.gz -o fprintd.tar.gz
+          tar -xzf fprintd.tar.gz
+          cd fprintd-v1.94.5
+          git init -q
+          git apply ../fprintd/0001-preserve-print-on-device-delete-failure.patch
+          python3 -m py_compile tests/fprintd.py
+          python3 ../fprintd/test_account_gate.py src/device.c
+
+  build:
+    runs-on: ubuntu-latest
+    container: fedora:45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          dnf -y install curl tar git gcc gcc-c++ meson ninja-build rpm-build pkgconf-pkg-config \
+            glib2-devel libgusb-devel libgudev-devel polkit-devel gettext \
+            gobject-introspection-devel python3-gobject python3-dbusmock python3-cairo
+      - name: Parse package specs
+        run: |
+          rpmspec -P libfprint/libfprint.spec >/dev/null
+          rpmspec -P fprintd/fprintd.spec >/dev/null
+      - name: Build packaged Aurora libfprint driver
+        run: |
+          curl -fsSL https://gitlab.freedesktop.org/libfprint/libfprint/-/archive/v1.94.100/libfprint-v1.94.100.tar.gz -o libfprint.tar.gz
+          tar -xzf libfprint.tar.gz
+          cd libfprint-v1.94.100
+          git init -q
+          git apply ../libfprint/libfprint-1.94.100-apple-sep.patch
+          git apply ../libfprint/0002-aurora-report-unusable-captures-as-retries.patch
+          git apply ../libfprint/0003-hide-lid-covered-readers-while-the-lid-is-closed.patch
+          git apply ../libfprint/0004-aurora-refuse-unbound-enrollment.patch
+          git apply ../libfprint/0005-aurora-support-v4-and-v5.patch
+          install -Dm644 ../libfprint/apple-sep.h aurora-uapi/linux/apple-sep.h
+          CFLAGS="-I$(pwd)/aurora-uapi" meson setup build -Ddrivers=aurora,virtual_device,virtual_device_storage -Dintrospection=true -Ddoc=false -Dinstalled-tests=false -Dudev_rules=disabled -Dudev_hwdb=disabled
+          meson compile -C build
+          meson install -C build
+      - name: Build patched fprintd
+        run: |
+          curl -fsSL https://gitlab.freedesktop.org/libfprint/fprintd/-/archive/v1.94.5/fprintd-v1.94.5.tar.gz -o fprintd.tar.gz
+          tar -xzf fprintd.tar.gz
+          cd fprintd-v1.94.5
+          git init -q
+          git apply ../fprintd/0001-preserve-print-on-device-delete-failure.patch
+          PKG_CONFIG_PATH=/usr/local/lib64/pkgconfig meson setup build -Dpam=false -Dman=false -Dsystemd=false -Dgtk_doc=false
+          meson compile -C build
+      - name: Run failed-delete fprintd regression cases
+        env:
+          GI_TYPELIB_PATH: /usr/local/lib64/girepository-1.0
+          LD_LIBRARY_PATH: /usr/local/lib64
+        run: |
+          cd fprintd-v1.94.5
+          export FPRINT_BUILD_DIR="$PWD/build/src" TOPSRCDIR="$PWD"
+          python3 tests/fprintd.py \
+            FPrintdVirtualDeviceStorageClaimedTest.test_delete_enrolled_fingers_device_error \
+            FPrintdVirtualDeviceStorageClaimedTest.test_delete_enrolled_fingers2_device_error \
+            FPrintdVirtualDeviceStorageClaimedTest.test_delete_enrolled_finger_device_error

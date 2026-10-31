@@ -5,7 +5,7 @@ Fedora packaging of libfprint for Apple Touch ID on Aurora Silicon kernels.
 The kernel side is the `apple_sep` driver in
 [aurora-silicon/linux](https://github.com/aurora-silicon/linux) (`aurora-wip`).
 It exposes the fingerprint sensor as the `/dev/sep-bio` misc device, and its ioctl
-ABI is `include/uapi/linux/apple-sep.h` (interface version 4). The enclave does all
+ABI is `include/uapi/linux/apple-sep.h` (interface versions 4 and 5). The enclave does all
 of the matching, so no image, template or key material ever reaches userspace.
 
 Hardware: Apple silicon Macs with Touch ID that the `apple_sep` driver supports.
@@ -14,9 +14,9 @@ It is developed on the MacBook Neo (J700, A18 Pro).
 ## What is here
 
 `libfprint/` holds Fedora's `libfprint-1.94.100-1.fc45` spec, rebuilt as
-`libfprint-1.94.100-1.fc45.aurora6` with the `aurora` driver. The build replaces
+`libfprint-1.94.100-1.fc45.aurora7` with the `aurora` driver. The build replaces
 Fedora's libfprint in place, so fprintd needs no `LD_LIBRARY_PATH` and nothing is
-installed under `/usr/local`. The package provides `libfprint(aurora-sep) = 4`.
+installed under `/usr/local`. The package provides both `libfprint(aurora-sep) = 4` and `= 5`.
 
 | file | what it is |
 | --- | --- |
@@ -24,8 +24,10 @@ installed under `/usr/local`. The package provides `libfprint(aurora-sep) = 4`.
 | `libfprint-1.94.100-apple-sep.patch` | the `aurora` driver and the misc-device udev subtype it needs, unchanged from `tools/aurora-sep/patches/` in aurora-silicon/linux at commit `3b2bd35a8591` (blob `bdb15bb1`); this repository maintains it from now on |
 | `0002-aurora-report-unusable-captures-as-retries.patch` | reports unusable captures (kernel status RETRY) as libfprint retries during enrolment, verify and identify, so fprintd asks for another touch; fails a rejected enrolment with a reason |
 | `0003-hide-lid-covered-readers-while-the-lid-is-closed.patch` | the Touch ID sensor is in the power button, which a closed lid covers: libfprint drops the reader while the lid is closed and probes it again when it opens (details below) |
+| `0004-aurora-refuse-unbound-enrollment.patch` | resolves the Unix account and finger, prepares an empty Linux owner context, maps persistence refusals, avoids full-slot garbage collection, and logs single-verify and identify-gallery UUID mismatches |
+| `0005-aurora-support-v4-and-v5.patch` | accepts only v4 and v5, uses the 136-byte legacy enrol request on v4 and the 144-byte account-bound request plus PREPARE_ENROL on v5; v5 errors never fall back to v4 |
+| `aurora_fprintd_lid.te` | SELinux policy permitting fprintd to read the lid switch |
 | `fprintd-aurora-touchid.conf` | fprintd drop-in: `DeviceAllow=/dev/sep-bio rw` for the reader, and `DeviceAllow=char-input r` so libfprint can read the lid switch (a deliberate widening: fprintd can read every input device) |
-| `aurora_fprintd_lid.te` | SELinux module for the `libfprint-selinux` subpackage: lets `fprintd_t` read input devices (`dev_read_input`), so libfprint can follow the lid switch on systems with SELinux enforcing. Without it the targeted policy denies the read and the reader stays offered in clamshell mode |
 | `apple-sep.h` | a build-time copy of the kernel UAPI header, because distribution kernel headers do not ship it yet |
 
 The system integration lives next to the kernel driver in aurora-silicon/linux,
@@ -33,6 +35,20 @@ The system integration lives next to the kernel driver in aurora-silicon/linux,
 device policy, Touch ID activation at boot, the power-button setting and the
 optional GNOME login-screen fingerprint. It is packaged there as `aurora-sep`.
 Install both packages together.
+
+`fprintd/` contains a Fedora 45 fprintd 1.94.5 spec and patch. The patch
+rejects an unknown Aurora target account before fprintd's duplicate check,
+requires an explicit delete before re-enrolling the same finger, and makes all
+three delete methods keep the host record when device deletion fails, with
+virtual-device regression tests. This is a required companion package:
+libfprint reports the device error, but stock fprintd 1.94.5 still deletes its
+own file. Build the patched fprintd RPM after the aurora libfprint RPM, then
+install both before relying on failed-delete recovery.
+`fprintd/test_account_gate.py` compiles the patched account gate with a
+fake passwd lookup and covers missing entries, lookup errors, invalid uid and
+name mismatch without a device operation.
+The spec is based on [Fedora's f45 fprintd spec](https://src.fedoraproject.org/rpms/fprintd/blob/f45/f/fprintd.spec);
+the patch targets [fprintd v1.94.5](https://gitlab.freedesktop.org/libfprint/fprintd/-/tags/v1.94.5).
 
 ## Clamshell mode
 
@@ -68,9 +84,18 @@ On Fedora 45 (aarch64):
     dnf builddep ~/rpmbuild/SPECS/libfprint.spec
     rpmbuild -ba ~/rpmbuild/SPECS/libfprint.spec
 
+For the patched fprintd, install the aurora libfprint build and its devel
+package in the Fedora build environment, then:
+
+    rpm -i fprintd-1.94.5-*.src.rpm
+    cp fprintd/* ~/rpmbuild/SOURCES/
+    cp fprintd/fprintd.spec ~/rpmbuild/SPECS/
+    dnf builddep ~/rpmbuild/SPECS/fprintd.spec
+    rpmbuild -ba ~/rpmbuild/SPECS/fprintd.spec
+
 ## Install
 
-    sudo dnf install ./libfprint-1.94.100-1.fc45.aurora6.aarch64.rpm ./aurora-sep-*.noarch.rpm
+    sudo dnf install ./libfprint-1.94.100-1.fc45.aurora7.aarch64.rpm ./fprintd-1.94.5-99.fc45.aurora1.aarch64.rpm ./fprintd-pam-1.94.5-99.fc45.aurora1.aarch64.rpm ./aurora-sep-*.noarch.rpm
     sudo dnf versionlock add libfprint
 
 Reboot afterwards to apply the package and unit changes. The SEP driver attaches
@@ -92,9 +117,18 @@ top of it, or keep the version lock.
 
 - The libfprint patches are LGPL-2.1-or-later, like libfprint itself
   (`LICENSES/LGPL-2.1-or-later.txt`).
+- The fprintd patch is GPL-2.0-or-later, like fprintd
+  (`LICENSES/GPL-2.0-or-later.txt`).
+- `fprintd/fprintd.spec` is derived from Fedora's MIT-licensed package spec
+  (`LICENSES/MIT.txt`).
 - `libfprint/libfprint.spec` is derived from Fedora's spec for libfprint. Fedora
   package specs are MIT (`LICENSES/MIT.txt`), and so are our changes to it.
 - `libfprint/apple-sep.h` is the kernel UAPI header,
   `GPL-2.0 WITH Linux-syscall-note OR MIT` (`LICENSES/GPL-2.0-only.txt`,
   `LICENSES/Linux-syscall-note.txt`, `LICENSES/MIT.txt`).
 - Everything else here is MIT.
+
+## Qualification
+
+The [v4/v5 hardware test plan](docs/sep-v5-test-plan.md) covers existing enrolments,
+new enrolment persistence, verification and rollback before the kernel hold is removed.
