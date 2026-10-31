@@ -13,7 +13,7 @@ Name:           libfprint
 Version:        1.94.100
 # Fedora's release plus a suffix, so this sorts above the Fedora build it
 # replaces (1.fc45 < 1.fc45.aurora5) and below the next Fedora release.
-Release:        1%{?dist}.aurora7
+Release:        1%{?dist}.aurora8
 Summary:        Toolkit for fingerprint scanner
 
 # Automatically converted from old format: LGPLv2+ - review is highly recommended.
@@ -34,6 +34,7 @@ Source1001:     fprintd-aurora-touchid.conf
 # follows (Patch1002). The drop-in above covers the systemd sandbox only.
 Source1002:     aurora_fprintd_lid.te
 Source1003:     test_interface.py
+Source1004:     test_fresh_contact.py
 
 # Apple Touch ID through the apple_sep kernel driver: the aurora driver plus
 # the misc-device udev subtype it needs. Unchanged from
@@ -50,6 +51,8 @@ Patch1002:      0003-hide-lid-covered-readers-while-the-lid-is-closed.patch
 # Validate enrolment bindings and use the ioctl layout for the running kernel.
 Patch1003:      0004-aurora-refuse-unbound-enrollment.patch
 Patch1004:      0005-aurora-support-v4-and-v5.patch
+# Ask for removal of contacts already under way when capture starts.
+Patch1005:      0006-aurora-require-lift-and-place.patch
 
 BuildRequires:  meson
 BuildRequires:  gcc
@@ -150,6 +153,7 @@ fi
 %check
 # Independent of the upstream PyGObject test-suite compatibility issue.
 python3 %{SOURCE1003} libfprint/drivers/aurora/aurora.c %{SOURCE1000}
+python3 %{SOURCE1004} libfprint/drivers/aurora/aurora.c %{SOURCE1000}
 
 %files
 %license COPYING
