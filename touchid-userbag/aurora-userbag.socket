@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# DESIGN DRAFT
+[Unit]
+Description=Open a user's Touch ID key bag after a password login
+
+[Socket]
+# Lock screens that run PAM as the user connect too; the helper accepts a
+# request only from root or the user it names.
+ListenStream=/run/aurora-userbag.sock
+SocketMode=0666
+Accept=yes
+MaxConnections=8
+
+[Install]
+WantedBy=sockets.target

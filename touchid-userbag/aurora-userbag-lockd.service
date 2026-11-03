@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# DESIGN DRAFT
+[Unit]
+Description=Lock Touch ID key bags on screen lock, sleep and logout
+After=systemd-logind.service
+
+[Service]
+ExecStart=/usr/libexec/aurora-userbag-lockd
+Restart=on-failure
+DeviceAllow=/dev/sep-bio-rearm rw
+DevicePolicy=closed
+PrivateNetwork=yes
+ProtectSystem=strict
+ProtectHome=yes
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target
