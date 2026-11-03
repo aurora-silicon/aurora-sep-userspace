@@ -26,7 +26,7 @@ USER = pwd.getpwuid(os.getuid()).pw_name
 
 
 def system_module(name):
-    for d in ('/usr/lib64/security', '/usr/lib/security',
+    for d in (os.environ.get('AURORA_TEST_PAM_DIR', '/nonexistent'), '/usr/lib64/security', '/usr/lib/security',
               '/usr/lib/x86_64-linux-gnu/security', '/usr/lib/aarch64-linux-gnu/security'):
         if (Path(d) / name).exists():
             return f'{d}/{name}'
