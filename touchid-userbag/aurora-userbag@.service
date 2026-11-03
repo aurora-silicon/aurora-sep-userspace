@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# DESIGN DRAFT
+[Unit]
+Description=Touch ID key-bag request
+
+[Service]
+ExecStart=/usr/libexec/aurora-userbag-helper
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+DeviceAllow=/dev/sep-bio-rearm rw
+DevicePolicy=closed
+PrivateNetwork=yes
+ProtectSystem=strict
+ProtectHome=yes
+NoNewPrivileges=yes
+# Keeps the password out of core files; mlockall keeps it out of swap.
+LimitCORE=0
+LimitMEMLOCK=16M
