@@ -26,6 +26,7 @@ installed under `/usr/local`. The package provides both `libfprint(aurora-sep) =
 | `0003-hide-lid-covered-readers-while-the-lid-is-closed.patch` | the Touch ID sensor is in the power button, which a closed lid covers: libfprint drops the reader while the lid is closed and probes it again when it opens (details below) |
 | `0004-aurora-refuse-unbound-enrollment.patch` | resolves the Unix account and finger, prepares an empty Linux owner context, maps persistence refusals, avoids full-slot garbage collection, and logs single-verify and identify-gallery UUID mismatches |
 | `0005-aurora-support-v4-and-v5.patch` | accepts only v4 and v5, uses the 136-byte legacy enrol request on v4 and the 144-byte account-bound request plus PREPARE_ENROL on v5; v5 errors never fall back to v4 |
+| `0006-aurora-report-the-touch-id-lockout.patch` | adds `FP_DEVICE_ERROR_LOCKED_OUT` and reports the kernel's Touch ID lockout (status LOCKOUT) with it, so fprintd sends the user to the password instead of retrying |
 | `aurora_fprintd_lid.te` | SELinux policy permitting fprintd to read the lid switch |
 | `fprintd-aurora-touchid.conf` | fprintd drop-in: `DeviceAllow=/dev/sep-bio rw` for the reader, and `DeviceAllow=char-input r` so libfprint can read the lid switch (a deliberate widening: fprintd can read every input device) |
 | `apple-sep.h` | a build-time copy of the kernel UAPI header, because distribution kernel headers do not ship it yet |
@@ -44,11 +45,22 @@ virtual-device regression tests. This is a required companion package:
 libfprint reports the device error, but stock fprintd 1.94.5 still deletes its
 own file. Build the patched fprintd RPM after the aurora libfprint RPM, then
 install both before relying on failed-delete recovery.
+`fprintd/0002-report-lockout-and-fall-back-to-the-password.patch` reports
+`FP_DEVICE_ERROR_LOCKED_OUT` as the new verify result `verify-lockout`; pam_fprintd
+then tells the user to use the password and returns at once.
 `fprintd/test_account_gate.py` compiles the patched account gate with a
 fake passwd lookup and covers missing entries, lookup errors, invalid uid and
 name mismatch without a device operation.
 The spec is based on [Fedora's f45 fprintd spec](https://src.fedoraproject.org/rpms/fprintd/blob/f45/f/fprintd.spec);
 the patch targets [fprintd v1.94.5](https://gitlab.freedesktop.org/libfprint/fprintd/-/tags/v1.94.5).
+
+## Touch ID lockout
+
+`touchid-rearm/` ends a Touch ID lockout after a password authentication, as
+macOS does: a PAM module straight after pam_unix and a root service that checks
+the password again before it asks the driver to re-arm. See
+[touchid-rearm/README.md](touchid-rearm/README.md). `make -C touchid-rearm check`
+tests it against real libpam stacks.
 
 ## Clamshell mode
 
