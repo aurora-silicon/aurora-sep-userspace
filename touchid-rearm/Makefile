@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: GPL-2.0-only
 CC ?= cc
-CFLAGS ?= -O2 -g
-CFLAGS += -std=gnu11 -Wall -Wextra -Werror -D_FORTIFY_SOURCE=2 -fstack-protector-strong
+CFLAGS ?= -O2 -g -D_FORTIFY_SOURCE=2 -fstack-protector-strong
+# Distribution builds pass their own flags and WARN="-Wall -Wextra".
+WARN ?= -Wall -Wextra -Werror
+CFLAGS += -std=gnu11 $(WARN)
 PREFIX ?= /usr
 LIBEXECDIR ?= $(PREFIX)/libexec
 PAMDIR ?= $(PREFIX)/lib64/security
