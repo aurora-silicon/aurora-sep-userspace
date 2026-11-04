@@ -47,8 +47,21 @@ struct sep_bio_lockout {
 	__u32 reserved[2];
 };
 #define SEP_BIO_LOCKOUT_STATE _IOR(0xB1, 0x0e, struct sep_bio_lockout)
-#define SEP_BIO_REARM         _IO(0xB1, 0x0f)
 #endif
+
+#ifndef SEP_BIO_REARM_SECRET_MAX
+#define SEP_BIO_REARM_SECRET_MAX 1024
+struct sep_bio_rearm {
+	__u32 secret_len;
+	__u32 reserved;
+	__u8 secret[SEP_BIO_REARM_SECRET_MAX];
+};
+#endif
+
+#ifdef SEP_BIO_REARM
+#undef SEP_BIO_REARM
+#endif
+#define SEP_BIO_REARM _IOW(0xB1, 0x0f, struct sep_bio_rearm)
 
 #define SERVICE        "aurora-touchid-rearm"
 #define REARM_DEVICE   "/dev/sep-bio-rearm"
@@ -83,10 +96,11 @@ static enum lock_state lockout_state(unsigned *failures)
 	return strncmp(buf, "locked", 6) == 0 ? LOCKED : NOT_LOCKED;
 }
 
-static int rearm(void)
+static int rearm(const char *password)
 {
 	FILE *f = fopen(test_env("AURORA_REARM_TEST_DEVICE", REARM_DEVICE), "w");
 
+	(void)password;
 	if (!f)
 		return -1;
 	fputs("rearmed\n", f);
@@ -118,16 +132,28 @@ static enum lock_state lockout_state(unsigned *failures)
 	return st.locked ? LOCKED : NOT_LOCKED;
 }
 
-static int rearm(void)
+static int rearm(const char *password)
 {
-	int fd = open(REARM_DEVICE, O_RDONLY | O_CLOEXEC);
+	struct sep_bio_rearm request = { 0 };
+	size_t len = strlen(password);
+	int fd;
 	int ret, saved;
 
-	if (fd < 0)
+	if (len == 0 || len > sizeof(request.secret)) {
+		errno = EINVAL;
 		return -1;
-	ret = ioctl(fd, SEP_BIO_REARM);
+	}
+	request.secret_len = (__u32)len;
+	memcpy(request.secret, password, len);
+	fd = open(REARM_DEVICE, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		ret = -1;
+	else
+		ret = ioctl(fd, SEP_BIO_REARM, &request);
 	saved = errno;
-	close(fd);
+	if (fd >= 0)
+		close(fd);
+	explicit_bzero(&request, sizeof(request));
 	errno = saved;
 	return ret;
 }
@@ -291,7 +317,7 @@ static int serve(char *req, size_t len, uid_t peer)
 		answer("refused password\n");
 		return 1;
 	}
-	if (rearm() < 0) {
+	if (rearm(password) < 0) {
 		syslog(LOG_ERR, "the driver did not re-arm Touch ID for %s: %m", user);
 		answer("error the driver did not re-arm\n");
 		return 1;

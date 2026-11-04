@@ -19,11 +19,29 @@ asks for the password, and the password ends the lockout. With the
    locked. If it is not, it answers at once and checks nothing. If it is,
    it checks that the caller is root or that user, that the user has
    enrolled fingerprints, and that the password verifies through its own
-   PAM service (pam_unix alone). Only then does it call `SEP_BIO_REARM` on
-   `/dev/sep-bio-rearm`.
-5. The driver shows the enclave the stored keybag secret again (a new SCRD
-   match credential), as macOS does with the passcode, and matching works
-   again.
+   PAM service (pam_unix alone). Only then does it pass that password in a
+   `SEP_BIO_REARM` call on `/dev/sep-bio-rearm`; both userspace and the kernel
+   wipe their temporary copies after the request.
+
+5. On the first password re-arm, the driver creates a Linux-owned
+   FileVault-style KEK/VEK record pair bound to the submitted password and the
+   stored Linux identity-bag secret. It proves the pair with an option-2 FV
+   unwrap before committing it atomically to the existing Linux host-state
+   store. Later re-arms reuse the pair. The returned opaque key is wiped
+   without leaving the driver.
+6. After the successful unwrap, the driver shows the enclave the stored keybag
+   secret again to create a new SCRD match credential, then saves the enclave's
+   lockout record. Matching works again only when the unwrap and SCRD steps
+   both succeed.
+
+Before installing a build which can provision this pair, back up all Linux SEP
+and fingerprint state while the SEP driver and fprintd are stopped. Preserve
+`/var/lib/aurora-sep*`, `/var/lib/apple-sep-*`, and `/var/lib/fprint` with
+ownership, modes, xattrs and SELinux labels. Store the archive outside those
+paths, record its SHA-256, restart the services, and keep the archive until the
+new re-arm has passed its finger test. Restoring requires booting the previous
+kernel, stopping the same services, restoring the complete set together, and
+rebooting with the same `apple_sep.os_uuid_hi/lo` identity.
 
 A fingerprint never re-arms Touch ID: pam_fprintd sets no password, so the
 module does nothing. The module always returns `PAM_IGNORE`, so it never
