@@ -24,11 +24,11 @@ asks for the password, and the password ends the lockout. With the
    wipe their temporary copies after the request.
 
 5. On the first password re-arm, the driver creates a Linux-owned
-   FileVault-style KEK/VEK record pair bound to the submitted password and the
-   stored Linux identity-bag secret. It proves the pair with an option-2 FV
-   unwrap before committing it atomically to the existing Linux host-state
-   store. Later re-arms reuse the pair. The returned opaque key is wiped
-   without leaving the driver.
+   FileVault-style KEK/VEK record pair bound to the stable stored Linux
+   identity-bag secret and a private Linux FV domain identifier. It proves the
+   pair with an option-2 FV unwrap before committing it atomically to the
+   existing Linux host-state store. Later re-arms reuse the pair. The returned
+   opaque key is wiped without leaving the driver.
 6. After the successful unwrap, the driver shows the enclave the stored keybag
    secret again to create a new SCRD match credential, then saves the enclave's
    lockout record. Matching works again only when the unwrap and SCRD steps
@@ -82,3 +82,9 @@ record labels) is in the `aurora_sep` module the distribution packages ship.
 
     journalctl -k | grep -E 'locked|re-armed'
     journalctl -t aurora-touchid-rearm
+
+Neo install bundles must be built for AArch64. `make bundle` checks the ELF
+machine of both the helper and PAM module before installing them into the
+archive, and refuses a stale staging directory or archive. Cross builds should
+pass their AArch64 compiler and matching `READELF`; the expected machine name
+defaults to `AArch64`.
