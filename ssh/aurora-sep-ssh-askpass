@@ -1,0 +1,92 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+#
+# SSH_ASKPASS for aurora-sep-ssh. OpenSSH runs it in three ways:
+#
+#   passphrase prompt (ssh-add, ssh-keygen; SSH_ASKPASS_PROMPT unset):
+#       print the passphrase that the Secure Enclave unseals from
+#       $AURORA_SEP_SSH_RECORD. Unsealing needs root, so it goes through
+#       sudo, which asks for Touch ID (pam_fprintd) or the password.
+#   confirm prompt (ssh-agent, key added with -c; SSH_ASKPASS_PROMPT=confirm):
+#       the user-presence check before each signature. Exit 0 = allow.
+#       AURORA_SEP_SSH_PRESENCE: fprintd (default) runs fprintd-verify for
+#       the calling user; none allows without asking (unattended tests);
+#       deny refuses.
+#   notice (SSH_ASKPASS_PROMPT=none): nothing to answer.
+#
+# Two private modes for aurora-sep-ssh itself: --seal-new prints a new
+# record, --open-check unseals $AURORA_SEP_SSH_RECORD to stdout.
+set -uo pipefail
+
+LIBEXEC=${AURORA_SEP_SSH_LIBEXEC:-/usr/libexec/aurora-sep-ssh}
+SEAL=${AURORA_SEP_SSH_SEAL:-$LIBEXEC/aurora-sep-ssh-seal}
+PRESENCE=${AURORA_SEP_SSH_PRESENCE:-fprintd}
+VERIFY_TIMEOUT=${AURORA_SEP_SSH_VERIFY_TIMEOUT:-30}
+
+log() {
+	echo "aurora-sep-ssh: $*" >&2
+	logger -t aurora-sep-ssh -- "$*" 2>/dev/null || true
+}
+
+priv() {
+	if [ "$(id -u)" = 0 ]; then
+		"$SEAL" "$@"
+	else
+		sudo -p "[aurora-sep-ssh] password for %u (or touch Touch ID): " -- "$SEAL" "$@"
+	fi
+}
+
+unseal() {
+	local rec=${AURORA_SEP_SSH_RECORD:-}
+	if [ -z "$rec" ] || [ ! -r "$rec" ]; then
+		log "no sealed record for this prompt: ${1:-}"
+		return 1
+	fi
+	priv unseal <"$rec"
+}
+
+presence() {
+	local what=${1:-use of an SSH key}
+	case $PRESENCE in
+	none)
+		log "user presence STUBBED (AURORA_SEP_SSH_PRESENCE=none), allowing: $what"
+		return 0
+		;;
+	deny)
+		log "user presence denied (AURORA_SEP_SSH_PRESENCE=deny): $what"
+		return 1
+		;;
+	fprintd)
+		;;
+	*)
+		log "unknown AURORA_SEP_SSH_PRESENCE=$PRESENCE, denying"
+		return 1
+		;;
+	esac
+	command -v fprintd-verify >/dev/null || { log "fprintd-verify is not installed, denying"; return 1; }
+	if command -v notify-send >/dev/null && [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
+		notify-send -a "SSH" -i auth-fingerprint-symbolic -t $((VERIFY_TIMEOUT * 1000)) \
+			"Touch ID to allow SSH" "$what" 2>/dev/null || true
+	fi
+	log "touch Touch ID to allow: $what"
+	local out rc
+	out=$(timeout "$VERIFY_TIMEOUT" fprintd-verify 2>&1)
+	rc=$?
+	if [ $rc -eq 0 ] && grep -q "verify-match" <<<"$out"; then
+		log "Touch ID matched, allowing"
+		return 0
+	fi
+	log "Touch ID did not match (rc $rc), denying"
+	return 1
+}
+
+case ${1:-} in
+--seal-new) priv new; exit $? ;;
+--open-check) unseal "check"; exit $? ;;
+esac
+
+case ${SSH_ASKPASS_PROMPT:-} in
+confirm) presence "${1:-}"; exit $? ;;
+none) exit 0 ;;
+*) unseal "${1:-}"; exit $? ;;
+esac

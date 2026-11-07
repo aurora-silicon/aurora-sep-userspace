@@ -64,6 +64,8 @@ jobs:
           sudo python3 -c "import socket; s=socket.socket(socket.AF_ALG, socket.SOCK_SEQPACKET); s.bind(('aead','ccm(aes)')); print('AF_ALG ccm(aes) bind ok')"
           make -C luks
           sudo make -C luks check
+          make -C ssh
+          sudo make -C ssh check
       - name: AF_ALG diagnostics
         if: failure()
         run: |
@@ -73,7 +75,9 @@ jobs:
           sudo python3 -c "import socket; s=socket.socket(socket.AF_ALG, socket.SOCK_SEQPACKET); s.bind(('aead','ccm(aes)')); print('ccm bind ok')" || true
           sudo modprobe ccm && echo "ccm module loaded" || true
       - name: Shell syntax
-        run: sh -n luks/tests/hw-loop-test.sh && sh -n luks/tests/test-luks.sh
+        run: |
+          sh -n luks/tests/hw-loop-test.sh && sh -n luks/tests/test-luks.sh
+          bash -n ssh/aurora-sep-ssh && bash -n ssh/aurora-sep-ssh-askpass && bash -n ssh/tests/test-ssh.sh
 
   luks-token-fedora:
     runs-on: ubuntu-latest
@@ -87,6 +91,10 @@ jobs:
           make -C luks install DESTDIR=$PWD/dest
           test -x dest/usr/bin/aurora-sep-cryptenroll
           test -f dest/usr/lib64/cryptsetup/libcryptsetup-token-aurora-sep.so
+          make -C ssh
+          make -C ssh install DESTDIR=$PWD/dest
+          test -x dest/usr/bin/aurora-sep-ssh
+          test -x dest/usr/libexec/aurora-sep-ssh/aurora-sep-ssh-seal
 
   build:
     runs-on: ubuntu-latest
