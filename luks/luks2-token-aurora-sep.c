@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 /*
  * libcryptsetup external LUKS2 token "aurora-sep": the keyslot secret is
- * AES-256-GCM wrapped by a key that only this Mac's Secure Enclave can unseal.
+ * AES-256-CCM wrapped by a key that only this Mac's Secure Enclave can unseal.
  * cryptsetup and systemd-cryptsetup load it as
  * <token plugin dir>/libcryptsetup-token-aurora-sep.so.
  */
@@ -134,6 +134,6 @@ void cryptsetup_token_dump(struct crypt_device *cd, const char *json)
 	}
 	crypt_logf(cd, CRYPT_LOG_NORMAL, "\tSealed by:   Apple Secure Enclave (trusted key)\n");
 	crypt_logf(cd, CRYPT_LOG_NORMAL, "\tSEP blob:    %zu bytes\n", strlen(s.blob_hex) / 2);
-	crypt_logf(cd, CRYPT_LOG_NORMAL, "\tWrap:        aes-256-gcm\n");
+	crypt_logf(cd, CRYPT_LOG_NORMAL, "\tWrap:        aes-256-ccm\n");
 	sep_sealed_free(&s);
 }

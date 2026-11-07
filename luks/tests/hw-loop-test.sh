@@ -135,7 +135,7 @@ unseal() {
 
 	# Blobs the SEP must not turn into this volume's secret, on a same-UUID copy:
 	#  tampered: the enclave's own ECIES check refuses the blob (kernel EBADMSG);
-	#  foreign:  a valid blob of another sealed key unseals, then AES-GCM refuses it.
+	#  foreign:  a valid blob of another sealed key unseals, then AES-CCM refuses it.
 	for kind in tampered foreign; do
 		cp "$IMG" "$D/swap.img"
 		tok=$(cryptsetup luksDump "$D/swap.img" | awk '/aurora-sep/{sub(":","",$1); print $1; exit}')

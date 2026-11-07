@@ -59,7 +59,7 @@ the patch targets [fprintd v1.94.5](https://gitlab.freedesktop.org/libfprint/fpr
 `libcryptsetup-token-aurora-sep.so`. Together they unlock a LUKS2 volume with
 this Mac's Secure Enclave, the way `systemd-cryptenroll --tpm2-device=auto`
 does with a TPM, and keep the passphrase keyslot for recovery. The keyslot
-secret is wrapped with AES-256-GCM by a kernel `trusted` key that the
+secret is wrapped with AES-256-CCM by a kernel `trusted` key that the
 `apple_sep` driver seals, and the AES key stays in the kernel (AF_ALG by key
 serial). Nothing is enrolled by default. See [docs/luks-sep.md](docs/luks-sep.md).
 

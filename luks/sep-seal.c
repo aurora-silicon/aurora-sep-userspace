@@ -286,12 +286,16 @@ int sep_aead(int32_t serial, int encrypt, const uint8_t iv[SEP_SEAL_IV_BYTES],
 	struct sockaddr_alg sa = {
 		.salg_family = AF_ALG,
 		.salg_type = "aead",
-		.salg_name = "gcm(aes)",
+		/*
+		 * CCM, not GCM: since af_alg_restrict (default 1) the kernel's AEAD
+		 * allowlist holds only ccm(aes), for CAP_SYS_ADMIN/CAP_NET_ADMIN.
+		 */
+		.salg_name = "ccm(aes)",
 	};
 	size_t res_len, buf_len, io_len;
 	uint8_t *buf = NULL;
 	char cbuf[CMSG_SPACE(sizeof(uint32_t)) * 2 +
-		  CMSG_SPACE(sizeof(struct af_alg_iv) + SEP_SEAL_IV_BYTES)] = { 0 };
+		  CMSG_SPACE(sizeof(struct af_alg_iv) + 16)] = { 0 };
 	struct msghdr msg = { 0 };
 	struct cmsghdr *c;
 	struct iovec iov;
@@ -339,10 +343,16 @@ int sep_aead(int32_t serial, int encrypt, const uint8_t iv[SEP_SEAL_IV_BYTES],
 	c = CMSG_NXTHDR(&msg, c);
 	c->cmsg_level = SOL_ALG;
 	c->cmsg_type = ALG_SET_IV;
-	c->cmsg_len = CMSG_LEN(sizeof(struct af_alg_iv) + SEP_SEAL_IV_BYTES);
+	c->cmsg_len = CMSG_LEN(sizeof(struct af_alg_iv) + 16);
 	aiv = (struct af_alg_iv *)CMSG_DATA(c);
-	aiv->ivlen = SEP_SEAL_IV_BYTES;
-	memcpy(aiv->iv, iv, SEP_SEAL_IV_BYTES);
+	/*
+	 * ccm(aes) takes the 16-byte counter block: flags byte L' = L - 1 for a
+	 * 15 - L byte nonce (12 bytes, L = 3), the nonce, then a zero counter.
+	 */
+	aiv->ivlen = 16;
+	memset(aiv->iv, 0, 16);
+	aiv->iv[0] = 15 - SEP_SEAL_IV_BYTES - 1;
+	memcpy(aiv->iv + 1, iv, SEP_SEAL_IV_BYTES);
 	c = CMSG_NXTHDR(&msg, c);
 	c->cmsg_level = SOL_ALG;
 	c->cmsg_type = ALG_SET_AEAD_ASSOCLEN;
@@ -449,7 +459,7 @@ int sep_token_parse(const char *json, struct sep_sealed *out)
 {
 	const size_t ct_hex = 2 * (SEP_SEAL_SECRET_BYTES + SEP_SEAL_TAG_BYTES);
 	struct json_object *o, *v;
-	const char *type, *blob, *iv, *ct;
+	const char *type, *cipher, *blob, *iv, *ct;
 	int r = -EINVAL;
 
 	memset(out, 0, sizeof(*out));
@@ -457,6 +467,7 @@ int sep_token_parse(const char *json, struct sep_sealed *out)
 	if (!o)
 		return -EINVAL;
 	type = jstr(o, "type");
+	cipher = jstr(o, "cipher");
 	blob = jstr(o, "sep-blob");
 	iv = jstr(o, "iv");
 	ct = jstr(o, "sealed-secret");
@@ -465,6 +476,10 @@ int sep_token_parse(const char *json, struct sep_sealed *out)
 	if (!json_object_object_get_ex(o, "aurora-sep-version", &v) ||
 	    !json_object_is_type(v, json_type_int) ||
 	    json_object_get_int(v) != SEP_SEAL_VERSION) {
+		r = -EPROTONOSUPPORT;
+		goto out;
+	}
+	if (!cipher || strcmp(cipher, SEP_SEAL_CIPHER)) {
 		r = -EPROTONOSUPPORT;
 		goto out;
 	}
@@ -505,6 +520,7 @@ char *sep_token_build(const struct sep_sealed *s)
 		json_object_object_add(o, "type", json_object_new_string(SEP_SEAL_TOKEN_TYPE));
 		json_object_object_add(o, "keyslots", json_object_new_array());
 		json_object_object_add(o, "aurora-sep-version", json_object_new_int(SEP_SEAL_VERSION));
+		json_object_object_add(o, "cipher", json_object_new_string(SEP_SEAL_CIPHER));
 		json_object_object_add(o, "sep-blob", json_object_new_string(s->blob_hex));
 		json_object_object_add(o, "iv", json_object_new_string(iv));
 		json_object_object_add(o, "sealed-secret", json_object_new_string(ct));

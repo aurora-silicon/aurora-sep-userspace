@@ -5,7 +5,7 @@
  * The kernel's "trusted" key type, backed by the apple_sep driver's 'applesep'
  * source, holds a 32-byte AES key that only this Mac's SEP can unseal. The key
  * never reaches userspace: AF_ALG uses it by keyring serial
- * (ALG_SET_KEY_BY_KEY_SERIAL) to AES-256-GCM encrypt or decrypt the keyslot
+ * (ALG_SET_KEY_BY_KEY_SERIAL) to AES-256-CCM encrypt or decrypt the keyslot
  * secret.
  */
 #ifndef AURORA_SEP_SEAL_H
@@ -16,6 +16,7 @@
 
 #define SEP_SEAL_TOKEN_TYPE	"aurora-sep"
 #define SEP_SEAL_VERSION	1
+#define SEP_SEAL_CIPHER		"aes-256-ccm"
 #define SEP_SEAL_KEY_BYTES	32
 #define SEP_SEAL_IV_BYTES	12
 #define SEP_SEAL_TAG_BYTES	16
@@ -65,7 +66,7 @@ int sep_key_new(int32_t *serial, char **blob_hex);
 int sep_key_load(const char *blob_hex, int wait_s, int32_t *serial);
 void sep_key_drop(int32_t serial);
 
-/* AES-256-GCM through AF_ALG with the key referenced by serial. */
+/* AES-256-CCM through AF_ALG with the key referenced by serial. */
 int sep_aead(int32_t serial, int encrypt, const uint8_t iv[SEP_SEAL_IV_BYTES],
 	     const uint8_t *aad, size_t aad_len, const uint8_t *in, size_t in_len,
 	     uint8_t *out, size_t out_size, size_t *out_len);

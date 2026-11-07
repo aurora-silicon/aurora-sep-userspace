@@ -43,7 +43,7 @@ int main(void)
 	CHECK(sep_seal_aad("", hex, sizeof(hex)) == -EINVAL, "aad needs a LUKS UUID");
 
 	r = sep_seal_secret(aad, secret, sizeof(secret), &s);
-	CHECK(r == 0, "seal (AF_ALG gcm(aes) by key serial)");
+	CHECK(r == 0, "seal (AF_ALG ccm(aes) by key serial)");
 	if (r) {
 		printf("seal failed: %s\n", strerror(-r));
 		return 1;
@@ -100,6 +100,10 @@ int main(void)
 		bad = strdup(json);
 		strstr(bad, "\"sealed-secret\":\"")[17] = 'g';
 		CHECK(sep_token_parse(bad, &p) == -EINVAL, "non-hex ciphertext rejected");
+		free(bad);
+		bad = strdup(json);
+		memcpy(strstr(bad, "aes-256-ccm"), "aes-256-gcm", 11);
+		CHECK(sep_token_parse(bad, &p) == -EPROTONOSUPPORT, "unknown cipher rejected");
 		free(bad);
 		free(json);
 	}

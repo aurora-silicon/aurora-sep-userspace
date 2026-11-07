@@ -4,7 +4,7 @@
 
 ## How it works
 
-Enrolling adds one keyslot with a random 64-byte secret. That secret is stored in an `aurora-sep` LUKS2 token, encrypted with AES-256-GCM. The AES key is a kernel `trusted` key sealed by the SEP through the `apple_sep` driver, so the token only holds a blob that this Mac's SEP can open. The AES key itself never reaches userspace: the kernel uses it by keyring reference through AF_ALG.
+Enrolling adds one keyslot with a random 64-byte secret. That secret is stored in an `aurora-sep` LUKS2 token, encrypted with AES-256-CCM. The AES key is a kernel `trusted` key sealed by the SEP through the `apple_sep` driver, so the token only holds a blob that this Mac's SEP can open. The AES key itself never reaches userspace: the kernel uses it by keyring reference through AF_ALG.
 
 At unlock, `cryptsetup` and `systemd-cryptsetup` load `libcryptsetup-token-aurora-sep.so`, which asks the SEP to unseal the blob and hands the secret to libcryptsetup. If the SEP refuses, you get the normal passphrase prompt.
 
@@ -15,6 +15,7 @@ Your passphrase keyslot stays. The tool refuses to remove the last keyslot that 
 - An Aurora kernel with `apple_sep` and its trusted-key source (the kernel log shows `trusted-keys: registering "trusted" key type backed by the SEP ref-key seal`).
 - The SEP key store set up on this Linux install: `/var/lib/aurora-sep-keybag.bin` and `/var/lib/aurora-sep-refkey.bin`, which the `apple_sep` driver creates and keeps. Don't delete or move them.
 - cryptsetup 2.4 or newer with external token support (`cryptsetup --help` lists a token plugin path).
+- The kernel's AF_ALG interface for root with `ccm(aes)`: `/proc/sys/crypto/af_alg_restrict` at 0 or 1 (1 is the default). Setting it to 2 turns this off.
 
 Check with:
 
