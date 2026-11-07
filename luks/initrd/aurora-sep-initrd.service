@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: MIT
+# Initrd only: load apple_sep in its key-store-only phase so systemd-cryptsetup
+# can open volumes sealed by the Secure Enclave before the root is mounted.
+# aurora-sep.service on the real root finishes the attach.
+[Unit]
+Description=Secure Enclave key store for LUKS2 unlock
+Documentation=man:aurora-sep-cryptenroll(8)
+DefaultDependencies=no
+ConditionPathExists=/etc/initrd-release
+ConditionPathExists=/var/lib/aurora-sep-keybag.bin
+After=systemd-modules-load.service
+Before=cryptsetup-pre.target
+Wants=cryptsetup-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/lib/aurora-sep/aurora-sep-initrd-load

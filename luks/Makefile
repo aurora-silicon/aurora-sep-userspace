@@ -15,6 +15,14 @@ MANDIR ?= $(PREFIX)/share/man
 # Must match `cryptsetup --help` "LUKS2 external token plugin path".
 TOKENDIR ?= $(shell $(PKG_CONFIG) --variable=libdir libcryptsetup)/cryptsetup
 
+# Initrd integration (docs/luks-sep-initrd.md).
+LIBDIR_SEP ?= $(PREFIX)/lib/aurora-sep
+INITRDDIR ?= $(LIBDIR_SEP)/initrd
+UNITDIR ?= $(PREFIX)/lib/systemd/system
+LIBEXECDIR ?= $(PREFIX)/libexec
+DRACUTDIR ?= $(PREFIX)/lib/dracut/modules.d/90aurora-sep
+INITCPIODIR ?= $(PREFIX)/lib/initcpio/install
+
 PLUGIN := libcryptsetup-token-aurora-sep.so
 TOOL := aurora-sep-cryptenroll
 
@@ -49,6 +57,7 @@ test/test-seal: tests/test-seal.c sep-seal.c sep-seal.h
 check: test/test-seal test/$(PLUGIN) test/$(TOOL) $(PLUGIN) $(TOOL)
 	./test/test-seal
 	sh tests/test-luks.sh test
+	bash tests/test-initrd.sh
 	@nm -D --defined-only $(PLUGIN) | grep -q 'cryptsetup_token_open@@CRYPTSETUP_TOKEN_1.0' \
 		&& echo "PASS plugin exports the CRYPTSETUP_TOKEN_1.0 ABI"
 
@@ -57,7 +66,25 @@ install: all
 	install -Dm755 $(PLUGIN) $(DESTDIR)$(TOKENDIR)/$(PLUGIN)
 	install -Dm644 aurora-sep-cryptenroll.8 $(DESTDIR)$(MANDIR)/man8/aurora-sep-cryptenroll.8
 
+# Shared by the dracut module, the mkinitcpio hook and the NixOS module.
+install-initrd:
+	install -Dm644 initrd/aurora-sep-initrd.service $(DESTDIR)$(INITRDDIR)/aurora-sep-initrd.service
+	install -Dm755 initrd/aurora-sep-initrd-load $(DESTDIR)$(INITRDDIR)/aurora-sep-initrd-load
+	install -Dm644 initrd/aurora-sep-cryptsetup.conf $(DESTDIR)$(INITRDDIR)/aurora-sep-cryptsetup.conf
+	install -Dm755 initrd/aurora-sep-initrd-check $(DESTDIR)$(LIBEXECDIR)/aurora-sep-initrd-check
+	install -d $(DESTDIR)$(UNITDIR)
+	sed 's|@LIBEXECDIR@|$(LIBEXECDIR)|' initrd/aurora-sep-initrd-check.service.in \
+		>$(DESTDIR)$(UNITDIR)/aurora-sep-initrd-check.service
+	install -d $(DESTDIR)$(UNITDIR)/multi-user.target.wants
+	ln -sf ../aurora-sep-initrd-check.service $(DESTDIR)$(UNITDIR)/multi-user.target.wants/aurora-sep-initrd-check.service
+
+install-dracut: install-initrd
+	install -Dm644 initrd/dracut/module-setup.sh $(DESTDIR)$(DRACUTDIR)/module-setup.sh
+
+install-mkinitcpio: install-initrd
+	install -Dm644 initrd/mkinitcpio/aurora-sep $(DESTDIR)$(INITCPIODIR)/aurora-sep
+
 clean:
 	rm -rf $(PLUGIN) $(TOOL) test
 
-.PHONY: all check install clean
+.PHONY: all check install install-initrd install-dracut install-mkinitcpio clean

@@ -1,0 +1,44 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Load apple_sep in the initrd in its key-store-only phase. The driver then
+# registers the trusted-key source and reads the key store copies this image
+# carries, and leaves Touch ID and the host-state store alone until the real
+# root's aurora-sep.service writes complete_attach. The SEP OS identity pin
+# (apple_sep.os_uuid_hi/_lo) comes from the kernel command line as usual.
+# Never fails the boot: without the SEP every volume asks for its passphrase.
+set -u
+
+log() {
+    echo "aurora-sep-initrd: $*" >&2
+}
+
+if [ -e /sys/module/apple_sep ]; then
+    log "apple_sep is already loaded"
+    exit 0
+fi
+
+# Only a driver with the key-store-only phase may load here: the SEP takes one
+# attach per boot, and a driver loaded without it could not finish that
+# attach on the real root (Touch ID would stay off). The image builders check
+# this too; this covers images assembled elsewhere.
+case "$(modinfo -F parm apple_sep 2>/dev/null)" in
+*keystore_only:*) ;;
+*)
+    log "apple_sep has no key-store-only phase; volumes sealed by the Secure Enclave will ask for their passphrase"
+    exit 0
+    ;;
+esac
+
+if ! modprobe apple_sep keystore_only=1; then
+    log "could not load apple_sep; volumes sealed by the Secure Enclave will ask for their passphrase"
+    exit 0
+fi
+
+# Which key store copy this initrd used. /run survives the switch to the real
+# root, where aurora-sep-initrd-check compares it with /var/lib.
+if mkdir -p /run/aurora-sep; then
+    while IFS= read -r line; do
+        printf '%s\n' "$line"
+    done </usr/lib/aurora-sep/initrd-keystore.sha256 >/run/aurora-sep/initrd-keystore.sha256 || :
+fi
+log "apple_sep loaded for the key store"
