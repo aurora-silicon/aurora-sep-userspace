@@ -27,11 +27,14 @@ Check with:
 
 It asks for an existing passphrase (or takes `--unlock-key-file=` or `$PASSWORD`), seals a new secret, adds the keyslot and token, and proves the token opens the volume before it finishes.
 
-For a volume opened at boot, add it to `/etc/crypttab` as usual:
+systemd-cryptsetup tries the token first. The SEP driver starts once `/var/lib` is mounted (aurora-sep.service runs after local-fs.target), so a volume that local-fs.target itself waits for would get the passphrase prompt. Open SEP volumes on first use instead:
 
-    data UUID=<LUKS UUID> none luks
+    # /etc/crypttab
+    data UUID=<LUKS UUID> none luks,noauto
+    # /etc/fstab
+    /dev/mapper/data /data ext4 noauto,x-systemd.automount,nofail 0 2
 
-systemd-cryptsetup tries the token first. The plugin waits up to 60 seconds for the SEP key store at boot (`AURORA_SEP_WAIT` changes that).
+The plugin waits up to 60 seconds for the SEP key store (`AURORA_SEP_WAIT` changes that).
 
 To open by hand: `sudo cryptsetup open /dev/... data`.
 
