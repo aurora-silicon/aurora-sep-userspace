@@ -244,6 +244,14 @@ int main(int argc, char **argv)
 		usage();
 		return 2;
 	}
+	/* Unprivileged, the restricted AF_ALG ccm(aes) bind fails with ENOENT. */
+	if (r == -ENOENT && geteuid() != 0)
+		r = -EPERM;
+	if (r < 0 && !strcmp(argv[1], "check")) {
+		fprintf(stderr, "aurora-sep-ssh-seal check: SEP sealing does not work here: %s (%d)\n",
+			r == -EPERM ? explain(r) : strerror(-r), r);
+		return 1;
+	}
 	if (r < 0) {
 		fprintf(stderr, "aurora-sep-ssh-seal %s: %s (%d)\n", argv[1],
 			explain(r), r);

@@ -7,7 +7,7 @@
 # 512-bit passphrase that this Mac's Secure Enclave seals (KEY.sep next to
 # it). Copied to any other machine, or to another Linux install on this one,
 # the key file cannot be opened. Loading the key unseals the passphrase
-# through sudo (Touch ID, or your password), and the key goes into a
+# through sudo after a Touch ID match, and the key goes into a
 # dedicated ssh-agent with the confirm constraint: every signature asks
 # Touch ID (fprintd-verify) first. Plain OpenSSH throughout: ssh, git,
 # ssh-keygen -Y sign all use it through SSH_AUTH_SOCK.
@@ -29,15 +29,16 @@ usage: aurora-sep-ssh COMMAND [options]
                                  (default KEY: ~/.ssh/id_ed25519_sep)
   agent                          start (or find) the Touch ID agent; use as
                                  eval "\$(aurora-sep-ssh agent)"
-  add [-t LIFE] [KEY]            unseal (sudo: Touch ID) and load KEY into the
-                                 agent; every use then asks for Touch ID
+  add [-t LIFE] [KEY]            Touch ID, then unseal (sudo) and load KEY into
+                                 the agent; every use then asks for Touch ID
   remove [KEY]                   drop KEY from the agent
   status [KEY]                   key, record, agent, Secure Enclave check
   stop                           stop the agent (all keys forgotten)
 
 Environment: AURORA_SEP_SSH_PRESENCE=fprintd (default), or none to skip the
-per-use Touch ID check (unattended tests only; the agent then signs without
-asking), or deny to refuse every use.
+Touch ID checks (unattended tests only; add and the agent then go ahead
+without asking), or deny to refuse. The agent keeps the value it was
+started with.
 EOF
 }
 
@@ -115,7 +116,11 @@ cmd_add() {
 	if [ "${SSH_AUTH_SOCK:-}" != "$SOCK" ]; then
 		echo "aurora-sep-ssh: note: SSH_AUTH_SOCK is not the Touch ID agent; loading into $SOCK" >&2
 	fi
-	echo "Unsealing $key with the Secure Enclave (sudo: Touch ID or password)..." >&2
+	# Touch ID before the key is unsealed, whatever sudo's own policy is
+	# (a NOPASSWD sudoers rule would otherwise load it without a touch).
+	SSH_ASKPASS_PROMPT=confirm "$ASKPASS" "load $(basename "$key") into the SSH agent" ||
+		die "Touch ID did not match; key not loaded"
+	echo "Unsealing $key with the Secure Enclave..." >&2
 	SSH_AUTH_SOCK=$SOCK AURORA_SEP_SSH_RECORD=$key.sep SSH_ASKPASS=$ASKPASS SSH_ASKPASS_REQUIRE=force \
 		ssh-add -c ${life:+-t "$life"} "$key" </dev/null
 	echo "Loaded. Every use asks for Touch ID." >&2

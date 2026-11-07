@@ -1,4 +1,5 @@
 #!/bin/bash
+# shellcheck disable=SC2015 # ok/no always succeed
 # SPDX-License-Identifier: MIT
 # aurora-sep-ssh end to end with kernel "user" keys standing in for the SEP:
 # keygen, agent, add, a confirm-gated signature (presence stubbed), a
@@ -6,7 +7,6 @@
 # key, and the key file on its own. Run as root where AF_ALG ccm(aes) is
 # restricted. Usage: tests/test-ssh.sh BUILD_DIR_WITH_aurora-sep-ssh-seal
 set -uo pipefail
-# shellcheck disable=SC2015 # ok/no always succeed
 here=$(cd "$(dirname "$0")/.." && pwd)
 build=$(cd "${1:-$here/test}" && pwd)
 work=$(mktemp -d "${TMPDIR:-/var/tmp}/aurora-sep-ssh-test.XXXXXX")
@@ -59,7 +59,12 @@ fi
 
 # Agent with presence stubbed: add, sign, verify.
 eval "$(AURORA_SEP_SSH_PRESENCE=none "$tool" agent 2>/dev/null)"
-"$tool" add "$key" 2>"$work/add.err" && ok "add" || no "add: $(cat "$work/add.err")"
+if AURORA_SEP_SSH_PRESENCE=deny "$tool" add "$key" 2>/dev/null; then
+	no "add went ahead although presence was denied"
+else
+	ssh-add -l >/dev/null 2>&1 && no "key loaded after a denied add" || ok "add refused when presence is denied"
+fi
+AURORA_SEP_SSH_PRESENCE=none "$tool" add "$key" 2>"$work/add.err" && ok "add" || no "add: $(cat "$work/add.err")"
 ssh-add -l | grep -q "ED25519" && ok "agent holds the key" || no "agent list"
 echo "hello from the Secure Enclave" >"$work/msg"
 if ssh-keygen -Y sign -f "$key.pub" -n file "$work/msg" >/dev/null 2>"$work/sign.err"; then
@@ -74,7 +79,7 @@ ssh-keygen -Y verify -f "$work/allowed" -I test -n file -s "$work/msg.sig" <"$wo
 
 # Agent with presence denied: the key loads, but signing is refused.
 eval "$(AURORA_SEP_SSH_PRESENCE=deny "$tool" agent 2>/dev/null)"
-"$tool" add "$key" 2>/dev/null
+AURORA_SEP_SSH_PRESENCE=none "$tool" add "$key" 2>/dev/null
 rm -f "$work/msg.sig"
 if ssh-keygen -Y sign -f "$key.pub" -n file "$work/msg" >/dev/null 2>&1; then
 	no "signed although presence was denied"
