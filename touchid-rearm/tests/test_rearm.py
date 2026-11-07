@@ -133,6 +133,16 @@ class RearmTest(unittest.TestCase):
         self.assertEqual(self.rig.authenticate('client', 'right'), PAM_SUCCESS)
         self.assertEqual(self.rig.state(), 'unlocked')
 
+    def test_password_clears_pending_failures(self):
+        self.rig.lock('unlocked 2')
+        self.assertEqual(self.rig.direct(USER, 'right'), 'ok rearmed')
+        self.assertEqual(self.rig.state(), 'rearmed')
+
+    def test_pending_failures_need_the_right_password(self):
+        self.rig.lock('unlocked 2')
+        self.assertNotEqual(self.rig.direct(USER, 'wrong'), 'ok rearmed')
+        self.assertEqual(self.rig.state(), 'unlocked 2')
+
     def test_service_rechecks_the_password(self):
         self.rig.lock('locked')
         self.assertEqual(self.rig.direct(USER, 'wrong'), 'refused password')

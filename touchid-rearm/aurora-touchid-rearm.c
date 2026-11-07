@@ -8,8 +8,10 @@
  * pam_aurora_touchid connects after pam_unix has accepted a password and sends
  * the user and that password (rearm-proto.h). This program trusts neither:
  *
- *  - Touch ID must be locked; otherwise it answers at once and checks nothing,
- *    so the socket is no password oracle while Touch ID works.
+ *  - Touch ID must be locked or have failed matches pending; otherwise it
+ *    answers at once and checks nothing, so the socket is no password oracle
+ *    while Touch ID works. A password clears pending failed matches, as a
+ *    password does on macOS.
  *  - The caller must be root or the user named.
  *  - The user must have enrolled fingerprints with fprintd.
  *  - The password must verify through the "aurora-touchid-rearm" PAM service,
@@ -72,7 +74,8 @@ enum lock_state { NOT_LOCKED, LOCKED, NO_DEVICE, STATE_ERROR };
 #ifdef AURORA_REARM_TEST
 /*
  * Test build only: the device is a state file holding "locked" or
- * "unlocked", re-arming writes "rearmed", and PAM reads its stacks from
+ * "unlocked", optionally followed by the failed-match count ("unlocked 2"),
+ * re-arming writes "rearmed", and PAM reads its stacks from
  * $AURORA_REARM_TEST_CONFDIR. The installed program has none of this.
  */
 static const char *test_env(const char *name, const char *fallback)
@@ -93,6 +96,8 @@ static enum lock_state lockout_state(unsigned *failures)
 	if (!fgets(buf, sizeof(buf), f))
 		buf[0] = '\0';
 	fclose(f);
+	if (strncmp(buf, "unlocked ", 9) == 0)
+		*failures = (unsigned)strtoul(buf + 9, NULL, 10);
 	return strncmp(buf, "locked", 6) == 0 ? LOCKED : NOT_LOCKED;
 }
 
@@ -285,6 +290,8 @@ static int serve(char *req, size_t len, uid_t peer)
 
 	switch (lockout_state(&failures)) {
 	case NOT_LOCKED:
+		if (failures > 0)
+			break;
 		answer("ok not-locked\n");
 		return 0;
 	case NO_DEVICE:
@@ -322,7 +329,7 @@ static int serve(char *req, size_t len, uid_t peer)
 		answer("error the driver did not re-arm\n");
 		return 1;
 	}
-	syslog(LOG_NOTICE, "Touch ID re-armed after the password of %s (%u failed matches before the lockout)",
+	syslog(LOG_NOTICE, "Touch ID re-armed after the password of %s (%u failed matches before it)",
 	       user, failures);
 	answer("ok rearmed\n");
 	return 0;
