@@ -15,7 +15,7 @@ Your passphrase keyslot stays. The tool refuses to remove the last keyslot that 
 - An Aurora kernel with `apple_sep` and its trusted-key source (the kernel log shows `trusted-keys: registering "trusted" key type backed by the SEP ref-key seal`).
 - The SEP key store set up on this Linux install: `/var/lib/aurora-sep-keybag.bin` and `/var/lib/aurora-sep-refkey.bin`, which the `apple_sep` driver creates and keeps. Don't delete or move them.
 - cryptsetup 2.4 or newer with external token support (`cryptsetup --help` lists a token plugin path).
-- The kernel's AF_ALG interface for root with `ccm(aes)`: `/proc/sys/crypto/af_alg_restrict` at 0 or 1 (1 is the default). Setting it to 2 turns this off.
+- The kernel's AF_ALG AEAD interface for root with `ccm(aes)`: `algif_aead` built in or loadable (some distributions disable it with a modprobe `install /bin/false` rule), and `/proc/sys/crypto/af_alg_restrict` at 0 or 1 where it exists (1 is the default). Setting it to 2 turns this off.
 
 Check with:
 
