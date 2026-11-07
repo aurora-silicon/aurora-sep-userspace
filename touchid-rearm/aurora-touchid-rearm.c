@@ -8,10 +8,13 @@
  * pam_aurora_touchid connects after pam_unix has accepted a password and sends
  * the user and that password (rearm-proto.h). This program trusts neither:
  *
- *  - Touch ID must be locked or have failed matches pending; otherwise it
- *    answers at once and checks nothing, so the socket is no password oracle
- *    while Touch ID works. A password clears pending failed matches, as a
- *    password does on macOS.
+ *  - Touch ID must be locked, or the driver must ask for every password
+ *    (SEP_BIO_LOCKOUT_FLAG_EVERY_PASSWORD) and either failed matches are
+ *    pending or the caller is root; otherwise it answers at once and checks
+ *    nothing, so the socket is no new password oracle for users while Touch
+ *    ID works. A password clears pending failed matches and restarts the
+ *    driver's password clock (Touch ID asks for the password again after 156
+ *    hours without one), as a password does on macOS.
  *  - The caller must be root or the user named.
  *  - The user must have enrolled fingerprints with fprintd.
  *  - The password must verify through the "aurora-touchid-rearm" PAM service,
@@ -46,9 +49,13 @@
 struct sep_bio_lockout {
 	__u32 locked;
 	__u32 failures;
-	__u32 reserved[2];
+	__u32 reason;
+	__u32 flags;
 };
 #define SEP_BIO_LOCKOUT_STATE _IOR(0xB1, 0x0e, struct sep_bio_lockout)
+#endif
+#ifndef SEP_BIO_LOCKOUT_FLAG_EVERY_PASSWORD
+#define SEP_BIO_LOCKOUT_FLAG_EVERY_PASSWORD 1
 #endif
 
 #ifndef SEP_BIO_REARM_SECRET_MAX
@@ -74,9 +81,10 @@ enum lock_state { NOT_LOCKED, LOCKED, NO_DEVICE, STATE_ERROR };
 #ifdef AURORA_REARM_TEST
 /*
  * Test build only: the device is a state file holding "locked" or
- * "unlocked", optionally followed by the failed-match count ("unlocked 2"),
- * re-arming writes "rearmed", and PAM reads its stacks from
- * $AURORA_REARM_TEST_CONFDIR. The installed program has none of this.
+ * "unlocked", optionally followed by the failed-match count and the driver's
+ * flags ("unlocked 2 1"), re-arming writes "rearmed", PAM reads its stacks
+ * from $AURORA_REARM_TEST_CONFDIR, and $AURORA_REARM_TEST_PEER stands in for
+ * the caller's uid. The installed program has none of this.
  */
 static const char *test_env(const char *name, const char *fallback)
 {
@@ -85,20 +93,32 @@ static const char *test_env(const char *name, const char *fallback)
 	return v && *v ? v : fallback;
 }
 
-static enum lock_state lockout_state(unsigned *failures)
+static enum lock_state lockout_state(unsigned *failures, unsigned *flags)
 {
-	char buf[16] = "";
+	char buf[32] = "";
 	FILE *f = fopen(test_env("AURORA_REARM_TEST_DEVICE", REARM_DEVICE), "r");
 
 	*failures = 0;
+	*flags = 0;
 	if (!f)
 		return NO_DEVICE;
 	if (!fgets(buf, sizeof(buf), f))
 		buf[0] = '\0';
 	fclose(f);
-	if (strncmp(buf, "unlocked ", 9) == 0)
-		*failures = (unsigned)strtoul(buf + 9, NULL, 10);
+	if (strncmp(buf, "unlocked ", 9) == 0) {
+		char *end;
+
+		*failures = (unsigned)strtoul(buf + 9, &end, 10);
+		*flags = (unsigned)strtoul(end, NULL, 10);
+	}
 	return strncmp(buf, "locked", 6) == 0 ? LOCKED : NOT_LOCKED;
+}
+
+static uid_t peer_uid(uid_t peer)
+{
+	const char *v = getenv("AURORA_REARM_TEST_PEER");
+
+	return v && *v ? (uid_t)strtoul(v, NULL, 10) : peer;
 }
 
 static int rearm(const char *password)
@@ -120,13 +140,14 @@ static int pam_open(const char *user, const struct pam_conv *conv, pam_handle_t 
 
 #define fprint_dir() test_env("AURORA_REARM_TEST_FPRINT_DIR", FPRINT_DIR)
 #else
-static enum lock_state lockout_state(unsigned *failures)
+static enum lock_state lockout_state(unsigned *failures, unsigned *flags)
 {
 	struct sep_bio_lockout st = { 0 };
 	int fd = open(REARM_DEVICE, O_RDONLY | O_CLOEXEC);
 	int ret;
 
 	*failures = 0;
+	*flags = 0;
 	if (fd < 0)
 		return errno == ENOENT ? NO_DEVICE : STATE_ERROR;
 	ret = ioctl(fd, SEP_BIO_LOCKOUT_STATE, &st);
@@ -134,8 +155,11 @@ static enum lock_state lockout_state(unsigned *failures)
 	if (ret < 0)
 		return STATE_ERROR;
 	*failures = st.failures;
+	*flags = st.flags;
 	return st.locked ? LOCKED : NOT_LOCKED;
 }
+
+#define peer_uid(peer) (peer)
 
 static int rearm(const char *password)
 {
@@ -270,7 +294,8 @@ static int serve(char *req, size_t len, uid_t peer)
 	const char *user;
 	char *password, *end;
 	struct passwd *pw;
-	unsigned failures;
+	unsigned failures, flags;
+	int locked = 0;
 
 	if (len < magic || memcmp(req, AURORA_REARM_MAGIC, magic) != 0) {
 		answer("refused malformed request\n");
@@ -288,9 +313,17 @@ static int serve(char *req, size_t len, uid_t peer)
 		return 1;
 	}
 
-	switch (lockout_state(&failures)) {
+	peer = peer_uid(peer);
+	switch (lockout_state(&failures, &flags)) {
 	case NOT_LOCKED:
-		if (failures > 0)
+		/*
+		 * An older driver's re-arm waits for a running capture, so call
+		 * it only for a lockout there. A user's own lock screen gets no
+		 * password check while nothing is pending: that would let any
+		 * of the user's programs test passwords here without the
+		 * stack's delays.
+		 */
+		if ((flags & SEP_BIO_LOCKOUT_FLAG_EVERY_PASSWORD) && (failures > 0 || peer == 0))
 			break;
 		answer("ok not-locked\n");
 		return 0;
@@ -302,6 +335,7 @@ static int serve(char *req, size_t len, uid_t peer)
 		answer("error the lockout is unreadable\n");
 		return 1;
 	case LOCKED:
+		locked = 1;
 		break;
 	}
 
@@ -329,9 +363,17 @@ static int serve(char *req, size_t len, uid_t peer)
 		answer("error the driver did not re-arm\n");
 		return 1;
 	}
-	syslog(LOG_NOTICE, "Touch ID re-armed after the password of %s (%u failed matches before it)",
-	       user, failures);
-	answer("ok rearmed\n");
+	if (locked) {
+		syslog(LOG_NOTICE, "Touch ID re-armed after the password of %s (%u failed matches before it)",
+		       user, failures);
+		answer("ok rearmed\n");
+	} else if (failures > 0) {
+		syslog(LOG_NOTICE, "the password of %s cleared %u failed Touch ID matches", user, failures);
+		answer("ok cleared\n");
+	} else {
+		syslog(LOG_DEBUG, "noted a password authentication of %s for Touch ID", user);
+		answer("ok noted\n");
+	}
 	return 0;
 }
 

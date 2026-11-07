@@ -16,12 +16,21 @@ asks for the password, and the password ends the lockout. With the
    after pam_unix, hands the user and password to `aurora-touchid-rearm`.
 4. `aurora-touchid-rearm` (root, started per connection by
    `aurora-touchid-rearm.socket`) asks the driver whether Touch ID is
-   locked. If it is not, it answers at once and checks nothing. If it is,
-   it checks that the caller is root or that user, that the user has
-   enrolled fingerprints, and that the password verifies through its own
-   PAM service (pam_unix alone). Only then does it pass that password in a
-   `SEP_BIO_REARM` call on `/dev/sep-bio-rearm`; both userspace and the kernel
-   wipe their temporary copies after the request.
+   locked. It goes on when Touch ID is locked, or when the driver sets
+   `SEP_BIO_LOCKOUT_FLAG_EVERY_PASSWORD` and either failed matches are
+   pending or the caller is root (sudo, gdm, polkit, login). Otherwise it
+   answers at once and checks nothing, so a user's own programs get no
+   password oracle here. When it goes on, it checks that the caller is root
+   or that user, that the user has enrolled prints, and that the password
+   verifies through its own PAM service (pam_unix alone). Only then does it
+   pass that password in a `SEP_BIO_REARM` call on `/dev/sep-bio-rearm`;
+   both userspace and the kernel wipe their temporary copies after the
+   request. Without a lockout the call clears pending failed matches, as a
+   password does on macOS, and restarts the driver's password clock: Touch
+   ID asks for the password again when it has not been used for 156 hours
+   and Touch ID has not unlocked for 4 hours, or when nothing has unlocked
+   for 48 hours. Drivers without the flag wait for a running capture in
+   that call, so the helper calls them only for a lockout.
 
 5. On the first password re-arm, the driver creates a Linux-owned
    FileVault-style KEK/VEK record pair bound to the stable stored Linux

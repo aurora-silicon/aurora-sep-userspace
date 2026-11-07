@@ -134,14 +134,39 @@ class RearmTest(unittest.TestCase):
         self.assertEqual(self.rig.state(), 'unlocked')
 
     def test_password_clears_pending_failures(self):
-        self.rig.lock('unlocked 2')
-        self.assertEqual(self.rig.direct(USER, 'right'), 'ok rearmed')
+        self.rig.lock('unlocked 2 1')
+        self.assertEqual(self.rig.direct(USER, 'right'), 'ok cleared')
         self.assertEqual(self.rig.state(), 'rearmed')
 
     def test_pending_failures_need_the_right_password(self):
+        self.rig.lock('unlocked 2 1')
+        self.assertNotEqual(self.rig.direct(USER, 'wrong'), 'ok cleared')
+        self.assertEqual(self.rig.state(), 'unlocked 2 1')
+
+    def test_older_driver_is_called_only_for_a_lockout(self):
+        # Its re-arm waits for a running capture: never call it otherwise.
         self.rig.lock('unlocked 2')
-        self.assertNotEqual(self.rig.direct(USER, 'wrong'), 'ok rearmed')
+        self.assertEqual(self.rig.direct(USER, 'right'), 'ok not-locked')
         self.assertEqual(self.rig.state(), 'unlocked 2')
+
+    def test_root_password_restarts_the_password_clock(self):
+        self.rig.env['AURORA_REARM_TEST_PEER'] = '0'
+        self.rig.lock('unlocked 0 1')
+        self.assertEqual(self.rig.direct(USER, 'right'), 'ok noted')
+        self.assertEqual(self.rig.state(), 'rearmed')
+
+    def test_root_password_is_still_checked(self):
+        self.rig.env['AURORA_REARM_TEST_PEER'] = '0'
+        self.rig.lock('unlocked 0 1')
+        self.assertEqual(self.rig.direct(USER, 'wrong'), 'refused password')
+        self.assertEqual(self.rig.state(), 'unlocked 0 1')
+
+    def test_user_lock_screen_is_no_password_oracle(self):
+        # Nothing pending, a user's own caller: no password check at all.
+        self.rig.env['AURORA_REARM_TEST_PEER'] = str(os.getuid() or 1000)
+        self.rig.lock('unlocked 0 1')
+        self.assertEqual(self.rig.direct(USER, 'wrong'), 'ok not-locked')
+        self.assertEqual(self.rig.state(), 'unlocked 0 1')
 
     def test_service_rechecks_the_password(self):
         self.rig.lock('locked')
