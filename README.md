@@ -1,6 +1,7 @@
 # aurora-sep-userspace
 
-Fedora packaging of libfprint for Apple Touch ID on Aurora Silicon kernels.
+Fedora packaging of libfprint for Apple Touch ID on Aurora Silicon kernels, and
+SEP-sealed LUKS2 unlock (`luks/`).
 
 The kernel side is the `apple_sep` driver in
 [aurora-silicon/linux](https://github.com/aurora-silicon/linux) (`aurora-wip`).
@@ -51,6 +52,24 @@ fake passwd lookup and covers missing entries, lookup errors, invalid uid and
 name mismatch without a device operation.
 The spec is based on [Fedora's f45 fprintd spec](https://src.fedoraproject.org/rpms/fprintd/blob/f45/f/fprintd.spec);
 the patch targets [fprintd v1.94.5](https://gitlab.freedesktop.org/libfprint/fprintd/-/tags/v1.94.5).
+
+## SEP-sealed LUKS2 unlock
+
+`luks/` holds `aurora-sep-cryptenroll` and the libcryptsetup token plugin
+`libcryptsetup-token-aurora-sep.so`. Together they unlock a LUKS2 volume with
+this Mac's Secure Enclave, the way `systemd-cryptenroll --tpm2-device=auto`
+does with a TPM, and keep the passphrase keyslot for recovery. The keyslot
+secret is wrapped with AES-256-CCM by a kernel `trusted` key that the
+`apple_sep` driver seals, and the AES key stays in the kernel (AF_ALG by key
+serial). Nothing is enrolled by default. See [docs/luks-sep.md](docs/luks-sep.md).
+
+    make -C luks && sudo make -C luks install
+    make -C luks check      # kernel user keys stand in for the SEP
+
+It needs libcryptsetup (2.4 or newer, with external tokens) and json-c. The
+checks need root on kernels with `af_alg_restrict`, which let only
+CAP_SYS_ADMIN or CAP_NET_ADMIN bind `ccm(aes)` through AF_ALG.
+`luks/tests/hw-loop-test.sh` is the hardware test on a loop file.
 
 ## Clamshell mode
 
@@ -128,6 +147,7 @@ top of it, or keep the version lock.
 - `libfprint/apple-sep.h` is the kernel UAPI header,
   `GPL-2.0 WITH Linux-syscall-note OR MIT` (`LICENSES/GPL-2.0-only.txt`,
   `LICENSES/Linux-syscall-note.txt`, `LICENSES/MIT.txt`).
+- `luks/` is MIT.
 - Everything else here is MIT.
 
 ## Qualification
