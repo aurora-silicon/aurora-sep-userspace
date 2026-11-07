@@ -54,7 +54,11 @@ jobs:
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y libcryptsetup-dev libjson-c-dev cryptsetup-bin pkgconf
       - name: Build, unit and LUKS2 file-image tests (kernel user keys stand in for the SEP)
-        run: make -C luks check
+        # As root: kernels with af_alg_restrict let only CAP_SYS_ADMIN or
+        # CAP_NET_ADMIN bind ccm(aes) through AF_ALG.
+        run: |
+          make -C luks
+          sudo make -C luks check
       - name: Shell syntax
         run: sh -n luks/tests/hw-loop-test.sh && sh -n luks/tests/test-luks.sh
 

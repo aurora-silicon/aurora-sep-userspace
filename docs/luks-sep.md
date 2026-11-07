@@ -63,4 +63,4 @@ Kernel updates do not change it. Unlike a TPM PCR policy, it does not measure th
 
 ## Testing
 
-`make -C luks check` runs unit tests and LUKS2 file-image tests without root, with kernel `user` keys standing in for the SEP. `luks/tests/hw-loop-test.sh` is the hardware test: it works on one 64 MiB file under `/var/tmp`, enrolls it, unlocks it with cryptsetup and systemd-cryptsetup, and after a reboot checks unlock again, the recovery passphrase, refused tampered and foreign blobs, and SELinux denials.
+`make -C luks check` runs unit tests and LUKS2 file-image tests with kernel `user` keys standing in for the SEP (as root where the kernel restricts AF_ALG). `luks/tests/hw-loop-test.sh` is the hardware test: it works on one 64 MiB file under `/var/tmp`, enrolls it, unlocks it with cryptsetup and systemd-cryptsetup, and after a reboot checks unlock again, the recovery passphrase, refused tampered and foreign blobs, and SELinux denials.

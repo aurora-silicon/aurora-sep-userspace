@@ -64,9 +64,11 @@ secret is wrapped with AES-256-CCM by a kernel `trusted` key that the
 serial). Nothing is enrolled by default. See [docs/luks-sep.md](docs/luks-sep.md).
 
     make -C luks && sudo make -C luks install
-    make -C luks check      # no root; kernel user keys stand in for the SEP
+    make -C luks check      # kernel user keys stand in for the SEP
 
-It needs libcryptsetup (2.4 or newer, with external tokens) and json-c.
+It needs libcryptsetup (2.4 or newer, with external tokens) and json-c. The
+checks need root on kernels with `af_alg_restrict`, which let only
+CAP_SYS_ADMIN or CAP_NET_ADMIN bind `ccm(aes)` through AF_ALG.
 `luks/tests/hw-loop-test.sh` is the hardware test on a loop file.
 
 ## Clamshell mode

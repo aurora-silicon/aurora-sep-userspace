@@ -29,7 +29,8 @@ $(TOOL): aurora-sep-cryptenroll.c sep-seal.c sep-seal.h
 		aurora-sep-cryptenroll.c sep-seal.c $(LDFLAGS) $(DEPS_LIBS)
 
 # Test builds swap the SEP trusted key for a kernel "user" key, so the AF_ALG,
-# token and LUKS2 paths run on any Linux >= 6.2 without root.
+# token and LUKS2 paths run on any Linux >= 6.2. Kernels with af_alg_restrict
+# need root (CAP_SYS_ADMIN or CAP_NET_ADMIN) to bind ccm(aes).
 test/$(PLUGIN): luks2-token-aurora-sep.c sep-seal.c sep-seal.h token.sym
 	mkdir -p test
 	$(CC) $(CFLAGS) -DSEP_SEAL_TEST_USER_KEYS $(DEPS_CFLAGS) -shared \
