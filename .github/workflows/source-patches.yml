@@ -59,6 +59,14 @@ jobs:
         run: |
           make -C luks
           sudo make -C luks check
+      - name: AF_ALG diagnostics
+        if: failure()
+        run: |
+          uname -r
+          cat /proc/sys/crypto/af_alg_restrict || true
+          grep -A3 -E '^name +: ccm\(aes\)' /proc/crypto || echo "no ccm(aes) instance yet"
+          sudo python3 -c "import socket; s=socket.socket(socket.AF_ALG, socket.SOCK_SEQPACKET); s.bind(('aead','ccm(aes)')); print('ccm bind ok')" || true
+          sudo modprobe ccm && echo "ccm module loaded" || true
       - name: Shell syntax
         run: sh -n luks/tests/hw-loop-test.sh && sh -n luks/tests/test-luks.sh
 
