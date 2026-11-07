@@ -56,10 +56,11 @@ jobs:
       - name: Build, unit and LUKS2 file-image tests (kernel user keys stand in for the SEP)
         # As root: kernels with af_alg_restrict let only CAP_SYS_ADMIN or
         # CAP_NET_ADMIN bind ccm(aes) through AF_ALG.
-        # The runner's kernel does not autoload the AF_ALG AEAD interface
-        # or the ccm template.
+        # The Ubuntu runner disables algif_aead with an `install /bin/false`
+        # modprobe rule, so AF_ALG AEAD binds fail with ENOENT; load it anyway
+        # on this throwaway VM, with the ccm template.
         run: |
-          sudo modprobe -a algif_aead ccm
+          sudo modprobe --ignore-install -a algif_aead ccm
           sudo python3 -c "import socket; s=socket.socket(socket.AF_ALG, socket.SOCK_SEQPACKET); s.bind(('aead','ccm(aes)')); print('AF_ALG ccm(aes) bind ok')"
           make -C luks
           sudo make -C luks check
