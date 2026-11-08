@@ -115,6 +115,7 @@ jobs:
       - name: uhid device with libfido2, OpenSSH, pam_u2f and systemd-cryptenroll
         run: |
           sudo modprobe uhid || { sudo apt-get install -y "linux-modules-extra-$(uname -r)" && sudo modprobe uhid; }
+          sudo modprobe -a hid-generic hidraw 2>/dev/null || true
           sudo make -C fido check-uhid
 
   build:

@@ -42,7 +42,7 @@ start() {   # start TOUCH_MODE
 		>>"$work/daemon.log" 2>&1 &
 	pid=$!
 	dev=
-	for _ in $(seq 50); do
+	for _ in $(seq 100); do
 		dev=$(fido2-token -L 2>/dev/null | grep -F "$NAME" | head -1 | cut -d: -f1)
 		[ -n "$dev" ] && break
 		sleep 0.1
@@ -50,9 +50,18 @@ start() {   # start TOUCH_MODE
 	[ -n "$dev" ]
 }
 
+diagnose() {
+	echo "--- daemon log"; cat "$work/daemon.log"
+	echo "--- fido2-token -L"; fido2-token -L 2>&1
+	echo "--- hidraw"; ls -l /dev/hidraw* 2>&1
+	for h in /sys/class/hidraw/hidraw*; do [ -e "$h" ] && echo "$h: $(cat "$h/device/uevent" 2>/dev/null | tr '\n' ' ')"; done
+	echo "--- modules"; lsmod | grep -E '^(uhid|hid|hid_generic|hidraw)\b' || true
+	echo "--- dmesg"; dmesg 2>/dev/null | tail -15
+}
+
 b64() { base64 -w0; }
 
-start match && ok "device appears in fido2-token -L: $dev" || { no "no device"; cat "$work/daemon.log"; exit 1; }
+start match && ok "device appears in fido2-token -L: $dev" || { no "no device"; diagnose; exit 1; }
 
 info=$(fido2-token -I "$dev" 2>&1)
 echo "$info" | sed 's/^/    /'
