@@ -34,7 +34,6 @@ trap cleanup EXIT
 modprobe uhid 2>/dev/null || true
 command -v fido2-token >/dev/null || { echo "needs fido2-tools (libfido2)"; exit 2; }
 
-NAME="Aurora Touch ID Security Key (TEST, software keys)"
 dev=
 start() {   # start TOUCH_MODE
 	stop
@@ -42,9 +41,15 @@ start() {   # start TOUCH_MODE
 		>>"$work/daemon.log" 2>&1 &
 	pid=$!
 	dev=
+	# Older libfido2 names devices from USB attributes, which a uhid device
+	# does not have, so find it by its HID_PHYS and check libfido2 lists it.
 	for _ in $(seq 100); do
-		dev=$(fido2-token -L 2>/dev/null | grep -F "$NAME" | head -1 | cut -d: -f1)
-		[ -n "$dev" ] && break
+		for h in /sys/class/hidraw/hidraw*; do
+			grep -qx "HID_PHYS=aurora-fido-test" "$h/device/uevent" 2>/dev/null &&
+				dev=/dev/$(basename "$h") && break
+		done
+		[ -n "$dev" ] && fido2-token -L 2>/dev/null | grep -q "^$dev:" && break
+		dev=
 		sleep 0.1
 	done
 	[ -n "$dev" ]
