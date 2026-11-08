@@ -26,9 +26,14 @@ The additional data is `aurora-sep-ssh:1:<random id>`, so an SSH record can't be
 
 ## What it protects against, and what it does not
 
-- The key file and its `.sep` record are useless on any other machine, or after Linux is reinstalled on this one. Backups and stolen disks don't leak a usable key.
-- Malware running as you can't use a loaded key without your finger. Each signature needs a Touch ID match.
-- Once loaded, the private key lives in `ssh-agent` memory, as with any agent key. Root can read it. In macOS terms this is a Keychain item that only this Secure Enclave can unlock, not a non-extractable key whose signing happens inside the SEP. Signing inside the SEP would need the SEP's own key services, which is future work.
+The SEP seals the key at rest. It does not hold the key while you use it, and it does not enforce the Touch ID checks. Be clear about what that means:
+
+- At rest: the key file and its `.sep` record are useless on any other machine, or after Linux is reinstalled on this one. Backups and stolen disks don't leak a usable key. The enclave refuses a tampered record.
+- In use: `add` unseals the plaintext Ed25519 key into `ssh-agent` memory, as with any agent key.
+- The Touch ID checks, at `add` and before each signature, are enforced in software (`fprintd-verify`, run by the CLI and by the agent's askpass). They are not an SEP access-control policy on the key.
+- So root can use the key with no finger: by reading the agent's memory, or by running the unseal helper (`aurora-sep-ssh-seal unseal`) directly. Anyone who can become root without a touch can do the same. That includes a process running as you when sudo needs no password for you (a NOPASSWD rule, or a cached sudo ticket). This is not root-proof.
+- A process running as you that can't become root can't get a signature without your finger: the agent asks for a Touch ID match for each one, and `ssh-agent` blocks other processes of the same user from tracing it.
+- In macOS terms this is a Keychain item that only this Secure Enclave can unlock, not a non-extractable key whose signing happens inside the SEP under a biometric access-control policy. SEP-resident keys of that kind are the follow-up.
 - The key is bound to this Mac's SEP, the Linux SEP OS identity (`apple_sep.os_uuid_hi`/`_lo`) and the SEP key store in `/var/lib`, as described in [luks-sep.md](luks-sep.md). If any of them changes, the key no longer opens. Keep another way into the hosts you add it to.
 - `AURORA_SEP_SSH_PRESENCE=none` turns the per-use check off (for unattended tests only); `deny` refuses every use.
 
@@ -38,4 +43,4 @@ An Aurora kernel with the `apple_sep` trusted-key source, `algif_aead` (see [luk
 
 ## Tests
 
-`make -C ssh check` runs the whole flow with kernel `user` keys standing in for the SEP: keygen, add refused and allowed, a signature with presence stubbed, one refused with presence denied, a tampered record, another record's id, and the key file on its own. Run it as root where AF_ALG is restricted. `tests/test-ssh.sh ssh` with the production helper runs the same steps against the real SEP; it passed on the MacBook Neo and the J616s (fleet27) on 2026-11-08.
+`make -C ssh check` runs the whole flow with kernel `user` keys standing in for the SEP: keygen, add refused and allowed, a signature with presence stubbed, one refused with presence denied, a tampered record, another record's id, and the key file on its own. Run it as root where AF_ALG is restricted. `tests/test-ssh.sh ssh` with the production helper runs the same steps against the real SEP; it passed on the MacBook Neo and the J616s (fleet27) on 2026-11-08. The live Touch ID path passed on the J616s the same day with a finger on the sensor: `add`, a login per touch, a wrong finger refused, no touch refused after 30 s.
