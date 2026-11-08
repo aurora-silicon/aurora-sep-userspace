@@ -7,7 +7,7 @@ Opt in. The package installs it switched off; nothing turns it on for you.
     sudo aurora-fido disable     # off now and at boot; credentials are kept
     sudo aurora-fido disable --forget   # off, and delete every credential it made
 
-On NixOS set `services.aurora-fido.enable = true;` instead (the command then
+On NixOS set `aurora.fido.enable = true;` instead (the command then
 only reports status). `aurora-fido enable` is `systemctl enable --now
 aurora-fido.service` after a check that Touch ID (fprintd and python3-gobject),
 `/dev/uhid` and the Secure Enclave's sealing work.

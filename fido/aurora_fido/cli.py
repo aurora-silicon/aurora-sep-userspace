@@ -100,7 +100,8 @@ def render(s):
         lines.append(f"  key store when enabled: {s['keys_if_enabled']}")
     lines.append("  " + THREAT.get(s["keys_if_enabled"], ""))
     if not on:
-        lines.append("  Turn it on with: sudo aurora-fido enable")
+        lines.append("  Turn it on with: " + ("aurora.fido.enable = true; (NixOS)"
+                                              if _is_nixos() else "sudo aurora-fido enable"))
     lines.append(f"  More: {DOC}")
     return "\n".join(lines)
 
@@ -149,7 +150,7 @@ def wait_ready(timeout=20.0):
 
 def cmd_enable(a):
     if _is_nixos():
-        print("On NixOS set services.aurora-fido.enable = true; and rebuild.")
+        print("On NixOS set aurora.fido.enable = true; and rebuild.")
         return 1
     bad = preflight(a.seal_helper)
     if bad:
@@ -171,7 +172,7 @@ def cmd_enable(a):
 
 def cmd_disable(a):
     if _is_nixos():
-        print("On NixOS set services.aurora-fido.enable = false; and rebuild.")
+        print("On NixOS set aurora.fido.enable = false; and rebuild.")
         return 1
     rc, out = _systemctl("disable", "--now")
     if rc != 0:
