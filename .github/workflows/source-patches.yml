@@ -163,7 +163,7 @@ jobs:
             FPrintdVirtualDeviceVerificationTests.test_verify_error_locked_out \
             FPrintdVirtualDeviceVerificationTests.test_verify_error_password_required \
             FPrintdVirtualDeviceVerificationTests.test_verify_error_password_required_after_boot
-          meson test -C build --print-errorlogs test_pam_fprintd
+          meson test -C build --print-errorlogs --suite test_pam_fprintd
 
   touchid-rearm:
     runs-on: ubuntu-latest
