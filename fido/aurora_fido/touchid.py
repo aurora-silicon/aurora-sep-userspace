@@ -128,7 +128,11 @@ class Notifier:
                 f"--expire-time={int(timeout_s * 1000)}",
                 "--hint=int:transient:1", title, html.escape(body)])
             nid = r.stdout.strip()
-            return (uid, int(nid)) if r.returncode == 0 and nid.isdigit() else None
+            if r.returncode != 0 or not nid.isdigit():
+                log.debug("notify-send failed: %s", r.stderr.strip())
+                return None
+            log.debug("notification %s shown to uid %d", nid, uid)
+            return uid, int(nid)
         except (OSError, subprocess.SubprocessError, KeyError, ValueError) as e:
             log.debug("notification failed: %s", e)
             return None
