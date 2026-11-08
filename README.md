@@ -71,6 +71,23 @@ checks need root on kernels with `af_alg_restrict`, which let only
 CAP_SYS_ADMIN or CAP_NET_ADMIN bind `ccm(aes)` through AF_ALG.
 `luks/tests/hw-loop-test.sh` is the hardware test on a loop file.
 
+## Touch ID security key (FIDO2/U2F)
+
+`fido/` holds `aurora-fidod`, a root daemon that creates a virtual FIDO HID
+device through `/dev/uhid` and speaks CTAP 2.1 and CTAP1/U2F, for WebAuthn and
+passkeys in Firefox and Chromium, SSH `ecdsa-sk` keys, pam_u2f and
+`systemd-cryptenroll --fido2-device`. Credentials are P-256 keys inside the
+Secure Enclave (`/dev/sep-key`), and every operation that needs the user asks
+for a Touch ID match through fprintd. Attestation is self or none: nothing
+here can prove Apple hardware to a website. Until the enclave itself enforces
+a biometric access control on the keys, the touch is checked by the daemon in
+software, so root can sign without one; the keys still never leave the
+enclave. See [docs/fido.md](docs/fido.md).
+
+    make -C fido && sudo make -C fido install
+    make -C fido check                 # unit tests, software stand-ins
+    sudo make -C fido check-uhid       # libfido2, OpenSSH, pam_u2f, cryptenroll on a uhid device
+
 ## Clamshell mode
 
 With the lid closed nobody can touch the sensor, so the reader is not offered:
@@ -148,6 +165,7 @@ top of it, or keep the version lock.
   `GPL-2.0 WITH Linux-syscall-note OR MIT` (`LICENSES/GPL-2.0-only.txt`,
   `LICENSES/Linux-syscall-note.txt`, `LICENSES/MIT.txt`).
 - `luks/` is MIT.
+- `fido/` is MIT.
 - Everything else here is MIT.
 
 ## Qualification

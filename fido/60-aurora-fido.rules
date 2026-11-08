@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: MIT
+# The Touch ID security key is a uhid device made by aurora-fidod. Mark it as
+# a security token so 70-uaccess.rules gives the logged-in user access, as for
+# any USB FIDO key (browsers, ssh-keygen and pam_u2f open it through hidraw).
+# 60-fido-id.rules already does this from the report descriptor where
+# systemd's fido_id is present; this rule covers systems without it.
+SUBSYSTEM=="hidraw", ACTION=="add|change", KERNELS=="0003:1209:0001.*", IMPORT{parent}="HID_PHYS"
+SUBSYSTEM=="hidraw", ENV{HID_PHYS}=="aurora-fido", ENV{ID_SECURITY_TOKEN}="1", TAG+="uaccess"

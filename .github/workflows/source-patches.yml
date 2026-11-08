@@ -64,6 +64,8 @@ jobs:
           sudo python3 -c "import socket; s=socket.socket(socket.AF_ALG, socket.SOCK_SEQPACKET); s.bind(('aead','ccm(aes)')); print('AF_ALG ccm(aes) bind ok')"
           make -C luks
           sudo make -C luks check
+          make -C fido test/aurora-fido-seal
+          sudo make -C fido check-seal
       - name: AF_ALG diagnostics
         if: failure()
         run: |
@@ -73,7 +75,9 @@ jobs:
           sudo python3 -c "import socket; s=socket.socket(socket.AF_ALG, socket.SOCK_SEQPACKET); s.bind(('aead','ccm(aes)')); print('ccm bind ok')" || true
           sudo modprobe ccm && echo "ccm module loaded" || true
       - name: Shell syntax
-        run: sh -n luks/tests/hw-loop-test.sh && sh -n luks/tests/test-luks.sh
+        run: |
+          sh -n luks/tests/hw-loop-test.sh && sh -n luks/tests/test-luks.sh
+          bash -n fido/tests/test-uhid.sh && bash -n fido/tests/test-seal.sh
 
   luks-token-fedora:
     runs-on: ubuntu-latest
@@ -87,6 +91,29 @@ jobs:
           make -C luks install DESTDIR=$PWD/dest
           test -x dest/usr/bin/aurora-sep-cryptenroll
           test -f dest/usr/lib64/cryptsetup/libcryptsetup-token-aurora-sep.so
+          make -C fido
+          make -C fido install DESTDIR=$PWD/dest
+          test -x dest/usr/libexec/aurora-fido/aurora-fidod
+          test -x dest/usr/libexec/aurora-fido/aurora-fido-seal
+          test -f dest/usr/lib/aurora-fido/aurora_fido/ctap2.py
+          test -f dest/usr/lib/systemd/system/aurora-fido.service
+
+  fido:
+    # Not in a container: the uhid device and its hidraw node belong to the VM.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install test tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-cryptography fido2-tools libfido2-1 openssh-client \
+            libpam-u2f pamu2fcfg pamtester cryptsetup-bin systemd-cryptsetup
+      - name: Unit tests (software keys, scripted Touch ID)
+        run: make -C fido check
+      - name: uhid device with libfido2, OpenSSH, pam_u2f and systemd-cryptenroll
+        run: |
+          sudo modprobe uhid || { sudo apt-get install -y "linux-modules-extra-$(uname -r)" && sudo modprobe uhid; }
+          sudo make -C fido check-uhid
 
   build:
     runs-on: ubuntu-latest

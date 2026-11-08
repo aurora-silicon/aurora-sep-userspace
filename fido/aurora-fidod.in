@@ -1,0 +1,9 @@
+#!/usr/bin/python3 -I
+# SPDX-License-Identifier: MIT
+# aurora-fidod: this Mac's Secure Enclave and Touch ID as a FIDO2/U2F security key.
+import sys
+
+sys.path.insert(0, "@PYDIR@")
+from aurora_fido.daemon import main  # noqa: E402
+
+sys.exit(main())

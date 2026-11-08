@@ -1,0 +1,175 @@
+# Touch ID security key (FIDO2/U2F)
+
+`aurora-fidod` makes the Mac's Secure Enclave and Touch ID look like a
+built-in USB security key (the "YubiKey" kind) to Linux. It creates a virtual
+FIDO HID device through `/dev/uhid` and speaks CTAP 2.1 and CTAP1/U2F over
+CTAPHID, so anything that talks to a USB security key works unchanged:
+
+- WebAuthn and passkeys in Firefox and Chromium,
+- SSH security keys from `ssh-keygen -t ecdsa-sk` (P-256; the enclave has no
+  Ed25519, so `ed25519-sk` is not offered),
+- `pam_u2f` (sudo, login),
+- `systemd-cryptenroll --fido2-device` (hmac-secret),
+- `fido2-token`, `fido2-cred`, `fido2-assert` from libfido2.
+
+Every operation that needs the user asks for a Touch ID match: user presence
+and user verification are the same touch. fprintd does the match, as it does
+for sudo and the login screen. fprintd itself only answers "this finger
+matches"; it cannot act as a security key, which is why this daemon exists.
+
+## How it works
+
+| piece | what it does |
+| --- | --- |
+| `/dev/uhid` | a HID device with the FIDO usage page (`0xF1D0`); udev marks it as a security token, so the logged-in user's browser and tools can open its hidraw node |
+| CTAPHID | channels, fragmentation, keepalive (`UPNEEDED` while Touch ID waits), cancel |
+| CTAP 2.1 | makeCredential, getAssertion, getNextAssertion, getInfo, clientPIN (key agreement and `getPinUvAuthTokenUsingUvWithPermissions` only), credentialManagement, selection, reset; extensions `credProtect` and `hmac-secret` |
+| CTAP1/U2F | register and authenticate, for old relying parties and `pam_u2f` U2F mode |
+| Touch ID | fprintd over D-Bus: one prompt is one fprintd claim, like pam_fprintd; a desktop notification says "Touch ID to sign in to *site*" |
+| keys | `/dev/sep-key` from the `apple_sep` driver: P-256 keys created inside the Secure Enclave; the private half never leaves it |
+| state | `/var/lib/aurora-fido` (root, 0700): resident credentials, the signature counter, and a master secret sealed by the Secure Enclave |
+
+### Credentials
+
+A credential's private key is an enclave ref-key. The daemon holds only the
+key handle the kernel returns, which is useless on any other Mac and on any
+other Linux install on this one.
+
+**Non-resident credentials:** the credential ID is the key handle, encrypted
+with AES-256-GCM under a key derived from the daemon's master secret, with
+the relying party's ID hash as additional data. An ID only opens for the RP
+it was made for. If a handle would make the ID longer than the protocol
+allows (1023 bytes for CTAP2, 255 for U2F key handles), the handle is stored
+in `/var/lib/aurora-fido/handles/` and the ID carries an encrypted reference
+to it.
+
+**Resident credentials (passkeys):** the same credential ID, plus a record
+(RP, user ID and names, public key) encrypted under the master secret in
+`/var/lib/aurora-fido/resident/`. `fido2-token -L -r`, `-L -k` and `-D`, and
+the passkey managers in browser settings, list and delete them with a
+Touch ID token (CTAP 2.1 credential management).
+
+**Master secret:** 64 random bytes, sealed by this Mac's Secure Enclave with
+the kernel's `trusted` key type (`aurora-fido-seal`, the same sealing as
+`aurora-sep-cryptenroll`). A copy of `/var/lib/aurora-fido` opens nothing on
+another machine.
+
+**Signature counter:** one global counter kept by the daemon in
+`/var/lib/aurora-fido/counter`, not by the Secure Enclave.
+
+### Attestation
+
+`attestation = self` (default) returns `packed` self attestation: the
+statement is signed by the new credential key itself, with no certificate.
+U2F registration uses a self-signed certificate made by the new key.
+`attestation = none` returns no statement.
+
+This cannot prove to a website that the key lives in Apple hardware. Apple's
+attestation needs the Secure Enclave's device attestation key, which a Linux
+host does not have. Relying parties that require attestation from a list of
+certified authenticators (some enterprise policies) will refuse this key.
+The AAGUID `a0f1d0e5-aa5b-4a7e-9c51-f1d0a0c0de01` names this software, not a
+certified device.
+
+### Touch ID behaviour
+
+- Whose finger: the user of the active local session on seat0 (whoever is at
+  the keyboard and can reach the sensor), or `user =` in the config.
+- One request is one prompt: up to `max_tries` (3) touches, then the request
+  fails with `CTAP2_ERR_OPERATION_DENIED`. No touch within `timeout` (30 s):
+  `CTAP2_ERR_USER_ACTION_TIMEOUT`. Cancel in the browser:
+  `CTAP2_ERR_KEEPALIVE_CANCEL`.
+- The Touch ID lockout is the enclave's: misses here count with misses at
+  sudo or the login screen. A locked-out Touch ID ends the request at once
+  (`OPERATION_DENIED`); unlock it the usual way (your password at a sudo or
+  login prompt). The daemon never retries past a lockout and never enrols or
+  deletes fingerprints.
+- No fixed waits between touches: the driver arms the sensor again when the
+  finger lifts.
+- U2F has no "please wait" message, so for U2F requests the touch prompt runs
+  in the background while the client polls; a match is good for one
+  operation within 10 seconds.
+- A request with `up=false` and no `uv` (browsers and libfido2 probing for a
+  credential) is answered without asking and without the user-present or
+  user-verified flags, as CTAP requires. Relying parties reject such
+  assertions for sign-in.
+
+There is no PIN. The key reports built-in user verification (`uv`) and the
+CTAP 2.1 `pinUvAuthToken` option, so platforms get their tokens with a touch.
+
+## Threat model
+
+Be precise about what the touch protects, because it is not yet the Secure
+Enclave that checks it.
+
+**Today:** the Touch ID check is made by this daemon in software. The enclave
+signs whatever `/dev/sep-key` asks it to sign; it does not know a touch
+happened. Root, or anything that can open `/dev/sep-key` or control this
+daemon, can sign with these keys without a touch. What `/dev/sep-key` does
+give: the private keys never leave the Secure Enclave. They cannot be copied
+off this Mac, so a stolen disk, a backup, a credential ID or a leaked
+`/var/lib/aurora-fido` is useless anywhere else, and an attacker has to keep
+running code on this Mac to use them.
+
+**After the enclave enforces it:** lane SEPKEY is working on keys with a
+biometric access-control list that the Secure Enclave itself enforces
+(Daybreak research t-5729 and t-5730, SEPKEY stage S1). The kernel then runs
+match-then-sign as one enclave operation, and root can no longer sign without
+a live matching finger; at most it can redirect the one operation a touch was
+meant for. This daemon switches to that interface without changes to its
+protocol side.
+
+| actor | today | with an SEP-enforced ACL |
+| --- | --- | --- |
+| thief with the disk or a backup | cannot use any key | cannot |
+| website, or another site's credential ID | cannot use a key made for a different RP (ID bound to the RP hash) | cannot |
+| malware running as the desktop user, no root | can send requests; each one still needs your finger (the root daemon checks it), but it can time a request to coincide with a touch you expected for something else; the notification names the site | same |
+| root on this Mac | **can sign without a touch** while it is root | cannot sign without a touch; can redirect one touch |
+| root after losing root | nothing to take away: keys never left the enclave | same |
+
+`hmac-secret` (what `systemd-cryptenroll` uses) is a per-credential secret
+derived by the daemon from data it keeps sealed under the master secret, not
+by the enclave. A running root can compute it; a disk thief cannot. For LUKS
+volumes, `aurora-sep-cryptenroll` (Secure Enclave sealing, see
+[luks-sep.md](luks-sep.md)) is the stronger choice; the FIDO2 route is for
+setups that already use `systemd-cryptenroll`. The daemon is not in the
+initrd, so `--fido2-device` volumes open after boot (data volumes), not the
+root volume.
+
+Reset (`fido2-token -R`) invalidates every credential: it deletes the
+resident store and seals a new master secret. As CTAP requires, it works only
+within 10 seconds of the daemon starting (`systemctl restart aurora-fido`,
+then reset) and needs a touch.
+
+## Install
+
+    make -C fido && sudo make -C fido install
+    sudo systemctl daemon-reload && sudo udevadm control --reload
+    sudo systemctl enable --now aurora-fido
+
+It needs Python 3 with `python3-cryptography` and `python3-gobject`, fprintd
+with at least one enrolled finger, the `uhid` module, json-c for the sealing
+helper, and a kernel with `/dev/sep-key`. Without `/dev/sep-key` the unit does
+not start (`ConditionPathExists`), and the daemon refuses to run on any other
+key store. Check:
+
+    fido2-token -L                     # lists "Aurora Touch ID Security Key"
+    fido2-token -I /dev/hidrawN        # versions FIDO_2_1 U2F_V2, options uv rk credMgmt
+
+Browsers in Flatpak or Snap need access to hidraw devices, as for any USB
+security key.
+
+The HID device uses the pid.codes test product ID `1209:0001`; nothing matches
+on it (udev and browsers recognise FIDO devices by the usage page).
+
+## Tests
+
+    make -C fido check                 # unit tests, no root, no hardware
+    sudo make -C fido check-uhid       # real uhid device: libfido2, OpenSSH, pam_u2f, cryptenroll
+    make -C fido test/aurora-fido-seal && sudo make -C fido check-seal
+
+The tests use `fido/tests/stub.py`: software P-256 keys and a scripted
+Touch ID. They are test fixtures only; the stub is not installed and the
+daemon cannot select it. `fido/tests/run-stub-daemon.py` runs the real uhid
+and CTAP stack on top of them, with real Touch ID if asked (`--touch
+fprintd`), for hardware checks before `/dev/sep-key` is in a kernel.

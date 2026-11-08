@@ -1,0 +1,39 @@
+# SPDX-License-Identifier: MIT
+[Unit]
+Description=Touch ID security key (FIDO2/U2F with Secure Enclave keys)
+Documentation=file:///usr/share/doc/aurora-fido/fido.md
+# /dev/sep-key comes from the apple_sep driver; without it there is no key store.
+ConditionPathExists=/dev/sep-key
+After=aurora-sep.service dbus.service systemd-logind.service
+Wants=aurora-sep.service
+
+[Service]
+Type=simple
+ExecStart=@LIBEXECDIR@/aurora-fidod
+Restart=on-failure
+RestartSec=5
+StateDirectory=aurora-fido
+StateDirectoryMode=0700
+ConfigurationDirectory=aurora-fido
+UMask=0077
+DevicePolicy=closed
+DeviceAllow=/dev/uhid rw
+DeviceAllow=/dev/sep-key rw
+PrivateNetwork=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+# AF_ALG + the kernel keyring: the master secret is unsealed with the SEP trusted key.
+RestrictAddressFamilies=AF_UNIX AF_ALG AF_NETLINK
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SETUID CAP_SETGID
+
+[Install]
+WantedBy=multi-user.target
