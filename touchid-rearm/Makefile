@@ -9,6 +9,7 @@ LIBEXECDIR ?= $(PREFIX)/libexec
 PAMDIR ?= $(PREFIX)/lib64/security
 PAMCONFDIR ?= $(PREFIX)/lib/pam.d
 UNITDIR ?= $(PREFIX)/lib/systemd/system
+SYSCONFDIR ?= /etc
 DOCDIR ?= $(PREFIX)/share/doc/aurora-touchid-rearm
 READELF ?= readelf
 EXPECTED_ELF_MACHINE ?= AArch64
@@ -43,6 +44,8 @@ install: all
 	install -Dm0644 aurora-touchid-rearm.pam $(DESTDIR)$(PAMCONFDIR)/aurora-touchid-rearm
 	install -Dm0644 aurora-touchid-rearm.socket $(DESTDIR)$(UNITDIR)/aurora-touchid-rearm.socket
 	install -Dm0644 aurora-touchid-rearm@.service $(DESTDIR)$(UNITDIR)/aurora-touchid-rearm@.service
+	install -Dm0644 aurora-touchid-boot.service $(DESTDIR)$(UNITDIR)/aurora-touchid-boot.service
+	install -Dm0644 touchid.conf $(DESTDIR)$(SYSCONFDIR)/aurora/touchid.conf
 	install -Dm0644 README.md $(DESTDIR)$(DOCDIR)/README.md
 
 # A Neo bundle must never silently contain host-architecture binaries. Keep

@@ -23,6 +23,17 @@
  * Only then does it ask the apple_sep driver to re-arm Touch ID
  * (SEP_BIO_REARM on /dev/sep-bio-rearm, root only). Lock screens that run
  * PAM as the user, such as Plasma's, can re-arm only through here.
+ *
+ * Two more modes, both for root:
+ *
+ *  --boot    aurora-touchid-boot.service runs it once per boot, before any
+ *            login. With "require_password_after_boot = yes" in
+ *            /etc/aurora/touchid.conf it asks the driver to refuse Touch ID
+ *            until the first password since boot (SEP_BIO_REQUIRE_PASSWORD),
+ *            as macOS does after a restart. The default, "no", leaves Touch
+ *            ID working from the first login.
+ *  --status  prints what the driver reports: locked or not, why, and the
+ *            failed matches since the last match or password.
  */
 #define _GNU_SOURCE
 #include <dirent.h>
@@ -57,6 +68,12 @@ struct sep_bio_lockout {
 #ifndef SEP_BIO_LOCKOUT_FLAG_EVERY_PASSWORD
 #define SEP_BIO_LOCKOUT_FLAG_EVERY_PASSWORD 1
 #endif
+#ifndef SEP_BIO_LOCKOUT_FLAG_AFTER_BOOT
+#define SEP_BIO_LOCKOUT_FLAG_AFTER_BOOT 2
+#endif
+#ifndef SEP_BIO_REQUIRE_PASSWORD
+#define SEP_BIO_REQUIRE_PASSWORD _IO(0xB1, 0x10)
+#endif
 
 #ifndef SEP_BIO_REARM_SECRET_MAX
 #define SEP_BIO_REARM_SECRET_MAX 1024
@@ -75,6 +92,9 @@ struct sep_bio_rearm {
 #define SERVICE        "aurora-touchid-rearm"
 #define REARM_DEVICE   "/dev/sep-bio-rearm"
 #define FPRINT_DIR     "/var/lib/fprint"
+#define CONF_FILE      "/etc/aurora/touchid.conf"
+/* How long --boot waits for the driver to register its re-arm node. */
+#define BOOT_WAIT_S    30
 
 enum lock_state { NOT_LOCKED, LOCKED, NO_DEVICE, STATE_ERROR };
 
@@ -111,8 +131,43 @@ static enum lock_state lockout_state(unsigned *failures, unsigned *flags)
 		*failures = (unsigned)strtoul(buf + 9, &end, 10);
 		*flags = (unsigned)strtoul(end, NULL, 10);
 	}
+	/* "required": the driver waits for the first password since boot. */
+	if (strncmp(buf, "required", 8) == 0) {
+		*flags = SEP_BIO_LOCKOUT_FLAG_EVERY_PASSWORD | SEP_BIO_LOCKOUT_FLAG_AFTER_BOOT;
+		return LOCKED;
+	}
 	return strncmp(buf, "locked", 6) == 0 ? LOCKED : NOT_LOCKED;
 }
+
+/* "old-driver" in the device file stands in for a kernel without the ioctl. */
+static int require_password(void)
+{
+	char buf[32] = "";
+	const char *path = test_env("AURORA_REARM_TEST_DEVICE", REARM_DEVICE);
+	FILE *f = fopen(path, "r");
+
+	if (!f)
+		return -1;
+	if (!fgets(buf, sizeof(buf), f))
+		buf[0] = '\0';
+	fclose(f);
+	if (strncmp(buf, "old-driver", 10) == 0) {
+		errno = ENOTTY;
+		return -1;
+	}
+	f = fopen(path, "w");
+	if (!f)
+		return -1;
+	fputs("required\n", f);
+	return fclose(f);
+}
+
+static const char *device_path(void)
+{
+	return test_env("AURORA_REARM_TEST_DEVICE", REARM_DEVICE);
+}
+
+#define conf_file() test_env("AURORA_REARM_TEST_CONF", CONF_FILE)
 
 static uid_t peer_uid(uid_t peer)
 {
@@ -192,7 +247,27 @@ static int pam_open(const char *user, const struct pam_conv *conv, pam_handle_t 
 	return pam_start(SERVICE, user, conv, h);
 }
 
+static int require_password(void)
+{
+	int fd = open(REARM_DEVICE, O_RDONLY | O_CLOEXEC);
+	int ret, saved;
+
+	if (fd < 0)
+		return -1;
+	ret = ioctl(fd, SEP_BIO_REQUIRE_PASSWORD);
+	saved = errno;
+	close(fd);
+	errno = saved;
+	return ret;
+}
+
+static const char *device_path(void)
+{
+	return REARM_DEVICE;
+}
+
 #define fprint_dir() FPRINT_DIR
+#define conf_file() CONF_FILE
 #endif
 
 static void answer(const char *line)
@@ -363,7 +438,10 @@ static int serve(char *req, size_t len, uid_t peer)
 		answer("error the driver did not re-arm\n");
 		return 1;
 	}
-	if (locked) {
+	if (locked && (flags & SEP_BIO_LOCKOUT_FLAG_AFTER_BOOT) && failures == 0) {
+		syslog(LOG_NOTICE, "Touch ID armed by the first password since boot (%s)", user);
+		answer("ok armed\n");
+	} else if (locked) {
 		syslog(LOG_NOTICE, "Touch ID re-armed after the password of %s (%u failed matches before it)",
 		       user, failures);
 		answer("ok rearmed\n");
@@ -377,7 +455,118 @@ static int serve(char *req, size_t len, uid_t peer)
 	return 0;
 }
 
-int main(void)
+/*
+ * The value of "require_password_after_boot" in the configuration: 0 for no
+ * (also when the file or the key is missing), 1 for yes, -1 when the file
+ * says something else, which --boot treats as yes: a setting meant to
+ * tighten Touch ID must not loosen it by a typo.
+ */
+static int conf_require_password(void)
+{
+	char line[256];
+	int value = 0;
+	FILE *f = fopen(conf_file(), "r");
+
+	if (!f)
+		return 0;
+	while (fgets(line, sizeof(line), f)) {
+		char *p = line, *key, *val, *end;
+
+		while (*p == ' ' || *p == '\t')
+			p++;
+		if (*p == '#' || *p == '\n' || *p == '\0')
+			continue;
+		key = p;
+		p = strchr(p, '=');
+		if (!p) {
+			value = -1;
+			continue;
+		}
+		end = p;
+		while (end > key && (end[-1] == ' ' || end[-1] == '\t'))
+			end--;
+		*end = '\0';
+		val = p + 1;
+		while (*val == ' ' || *val == '\t')
+			val++;
+		end = val + strcspn(val, " \t\r\n#");
+		*end = '\0';
+		if (strcmp(key, "require_password_after_boot") != 0)
+			continue;
+		if (strcmp(val, "yes") == 0 || strcmp(val, "true") == 0 || strcmp(val, "1") == 0)
+			value = 1;
+		else if (strcmp(val, "no") == 0 || strcmp(val, "false") == 0 || strcmp(val, "0") == 0)
+			value = 0;
+		else
+			value = -1;
+	}
+	fclose(f);
+	return value;
+}
+
+static int boot(void)
+{
+	int want = conf_require_password();
+	struct stat st;
+
+	if (want == 0) {
+		syslog(LOG_INFO, "Touch ID works from the first login (require_password_after_boot = no)");
+		printf("Touch ID works from the first login after boot\n");
+		return 0;
+	}
+	if (want < 0)
+		syslog(LOG_WARNING, "%s: require_password_after_boot is neither yes nor no; asking for the password after boot",
+		       conf_file());
+	/* The driver registers the node when the Secure Enclave comes up. */
+	for (int i = 0; i < BOOT_WAIT_S * 10 && stat(device_path(), &st) < 0; i++)
+		usleep(100000);
+	if (require_password() < 0) {
+		if (errno == ENOENT) {
+			syslog(LOG_INFO, "no Touch ID re-arm node (%s); nothing to require", device_path());
+			printf("no Touch ID on this machine\n");
+			return 0;
+		}
+		if (errno == ENOTTY || errno == EINVAL) {
+			syslog(LOG_WARNING, "this kernel cannot make Touch ID wait for the password after boot; Touch ID works from the first login");
+			printf("this kernel cannot make Touch ID wait for the password after boot\n");
+			return 0;
+		}
+		syslog(LOG_ERR, "cannot make Touch ID wait for the password after boot: %m");
+		return 1;
+	}
+	syslog(LOG_NOTICE, "Touch ID waits for the first password since boot (require_password_after_boot = yes)");
+	printf("Touch ID waits for the first password since boot\n");
+	return 0;
+}
+
+static int status(void)
+{
+	unsigned failures, flags;
+
+	switch (lockout_state(&failures, &flags)) {
+	case NO_DEVICE:
+		printf("no Touch ID re-arm node\n");
+		return 0;
+	case STATE_ERROR:
+		fprintf(stderr, "cannot read the Touch ID lockout from %s: %s\n", device_path(), strerror(errno));
+		return 1;
+	case LOCKED:
+		if ((flags & SEP_BIO_LOCKOUT_FLAG_AFTER_BOOT) && failures == 0)
+			printf("locked: waits for the first password since boot\n");
+		else if (flags & SEP_BIO_LOCKOUT_FLAG_AFTER_BOOT)
+			printf("locked: waits for the first password since boot, and %u failed matches\n", failures);
+		else
+			printf("locked: too many failed matches, or the password is due (%u failed matches)\n", failures);
+		break;
+	case NOT_LOCKED:
+		printf("not locked (%u failed matches since the last match or password)\n", failures);
+		break;
+	}
+	printf("password after boot: %s\n", conf_require_password() == 0 ? "no" : "yes");
+	return 0;
+}
+
+int main(int argc, char **argv)
 {
 	/* One byte more than a request may have, to see a longer one. */
 	char req[AURORA_REARM_MAX_REQUEST + 2];
@@ -388,6 +577,14 @@ int main(void)
 	int ret;
 
 	openlog(SERVICE, LOG_PID, LOG_AUTHPRIV);
+	if (argc == 2 && strcmp(argv[1], "--boot") == 0)
+		return boot();
+	if (argc == 2 && strcmp(argv[1], "--status") == 0)
+		return status();
+	if (argc != 1) {
+		fprintf(stderr, "usage: %s [--boot | --status]\n", argv[0]);
+		return 2;
+	}
 	if (getsockopt(STDIN_FILENO, SOL_SOCKET, SO_PEERCRED, &cred, &cl) < 0) {
 		syslog(LOG_ERR, "stdin is not a socket connection: %m");
 		return 1;

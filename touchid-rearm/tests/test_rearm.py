@@ -168,6 +168,22 @@ class RearmTest(unittest.TestCase):
         self.assertEqual(self.rig.direct(USER, 'wrong'), 'ok not-locked')
         self.assertEqual(self.rig.state(), 'unlocked 0 1')
 
+    def test_first_password_after_boot_arms_touch_id(self):
+        self.rig.lock('required')
+        self.assertEqual(self.rig.direct(USER, 'right'), 'ok armed')
+        self.assertEqual(self.rig.state(), 'rearmed')
+
+    def test_after_boot_wait_needs_the_right_password(self):
+        self.rig.lock('required')
+        self.assertEqual(self.rig.authenticate('client', 'wrong'), PAM_AUTH_ERR)
+        self.assertEqual(self.rig.direct(USER, 'wrong'), 'refused password')
+        self.assertEqual(self.rig.state(), 'required')
+
+    def test_after_boot_wait_ends_through_the_stack(self):
+        self.rig.lock('required')
+        self.assertEqual(self.rig.authenticate('client', 'right'), PAM_SUCCESS)
+        self.assertEqual(self.rig.state(), 'rearmed')
+
     def test_service_rechecks_the_password(self):
         self.rig.lock('locked')
         self.assertEqual(self.rig.direct(USER, 'wrong'), 'refused password')
@@ -202,6 +218,75 @@ class RearmTest(unittest.TestCase):
         self.rig.lock('locked')
         self.assertEqual(self.rig.authenticate('down', 'right'), PAM_SUCCESS)
         self.assertEqual(self.rig.state(), 'locked')
+
+
+class BootTest(unittest.TestCase):
+    """aurora-touchid-rearm --boot and --status against the fake device."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.tmp = Path(self.tmpdir.name)
+        self.device = self.tmp / 'device'
+        self.conf = self.tmp / 'touchid.conf'
+        self.device.write_text('unlocked 0 1\n')
+        self.env = dict(os.environ, AURORA_REARM_TEST_DEVICE=str(self.device),
+                        AURORA_REARM_TEST_CONF=str(self.conf))
+
+    def tearDown(self):
+        self.tmpdir.cleanup()
+
+    def run_helper(self, arg):
+        return subprocess.run([HELPER, arg], env=self.env, capture_output=True, text=True,
+                              check=False, timeout=60)
+
+    def state(self):
+        return self.device.read_text().strip()
+
+    def test_default_is_touch_id_from_the_first_login(self):
+        out = self.run_helper('--boot')
+        self.assertEqual(out.returncode, 0)
+        self.assertEqual(self.state(), 'unlocked 0 1')
+        self.conf.write_text('# nothing set\n')
+        self.assertEqual(self.run_helper('--boot').returncode, 0)
+        self.assertEqual(self.state(), 'unlocked 0 1')
+
+    def test_no_keeps_touch_id_from_the_first_login(self):
+        self.conf.write_text('require_password_after_boot = no\n')
+        self.assertEqual(self.run_helper('--boot').returncode, 0)
+        self.assertEqual(self.state(), 'unlocked 0 1')
+        self.assertIn('password after boot: no', self.run_helper('--status').stdout)
+
+    def test_yes_waits_for_the_password(self):
+        self.conf.write_text('# macOS-like\nrequire_password_after_boot=yes  # comment\n')
+        out = self.run_helper('--boot')
+        self.assertEqual(out.returncode, 0)
+        self.assertEqual(self.state(), 'required')
+        st = self.run_helper('--status').stdout
+        self.assertIn('locked: waits for the first password since boot', st)
+        self.assertIn('password after boot: yes', st)
+
+    def test_a_typo_counts_as_yes(self):
+        self.conf.write_text('require_password_after_boot = yse\n')
+        self.assertEqual(self.run_helper('--boot').returncode, 0)
+        self.assertEqual(self.state(), 'required')
+
+    def test_older_kernel_keeps_touch_id_working(self):
+        self.conf.write_text('require_password_after_boot = yes\n')
+        self.device.write_text('old-driver\n')
+        out = self.run_helper('--boot')
+        self.assertEqual(out.returncode, 0)
+        self.assertIn('cannot', out.stdout)
+        self.assertEqual(self.state(), 'old-driver')
+
+    def test_no_touch_id_is_not_an_error(self):
+        self.conf.write_text('require_password_after_boot = yes\n')
+        self.device.unlink()
+        out = self.run_helper('--status')
+        self.assertEqual(out.returncode, 0)
+        self.assertIn('no Touch ID', out.stdout)
+
+    def test_unknown_argument(self):
+        self.assertEqual(self.run_helper('--frobnicate').returncode, 2)
 
 
 if __name__ == '__main__':

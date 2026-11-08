@@ -52,6 +52,34 @@ new re-arm has passed its finger test. Restoring requires booting the previous
 kernel, stopping the same services, restoring the complete set together, and
 rebooting with the same `apple_sep.os_uuid_hi/lo` identity.
 
+## Touch ID after a restart
+
+macOS does not take Touch ID after a restart until the password has been
+entered once. Here that is a choice, in `/etc/aurora/touchid.conf`:
+
+    # no (default): Touch ID works from the first login after boot.
+    # yes: the first login or unlock after boot needs the password.
+    require_password_after_boot = no
+
+`aurora-touchid-boot.service` reads it once per boot, before the display
+manager, user sessions and fprintd start. With `yes` it runs
+`aurora-touchid-rearm --boot`, which asks the driver
+(`SEP_BIO_REQUIRE_PASSWORD`) to refuse every verify, without a capture,
+until the first password authentication; that password reaches the driver
+through the same path as a lockout's (steps 3 and 4), and Touch ID works
+from then on. Until then pam_fprintd goes straight to the password. Any
+value other than `yes` or `no` counts as `yes`. A kernel without the ioctl
+keeps Touch ID working from the first login and says so in the journal. The
+setting applies from the next boot.
+
+`aurora-touchid-rearm --status` (root) prints what the driver reports:
+
+    locked: waits for the first password since boot
+    password after boot: yes
+
+The wait is the host's, kept in the driver's memory only: the enclave is
+not involved, and a restart starts over from the setting.
+
 A fingerprint never re-arms Touch ID: pam_fprintd sets no password, so the
 module does nothing. The module always returns `PAM_IGNORE`, so it never
 changes a stack's result, and it never prompts. Lock screens that run PAM as
@@ -80,6 +108,8 @@ module goes after the last auth line.
 | `pam_aurora_touchid.c` | `pam_aurora_touchid.so` in the PAM module directory |
 | `aurora-touchid-rearm.c` | `/usr/libexec/aurora-touchid-rearm` |
 | `aurora-touchid-rearm.socket`, `aurora-touchid-rearm@.service` | systemd units; enable the socket |
+| `aurora-touchid-boot.service` | systemd unit; enable it (it does nothing with the default setting) |
+| `touchid.conf` | `/etc/aurora/touchid.conf` |
 | `aurora-touchid-rearm.pam` | `/usr/lib/pam.d/aurora-touchid-rearm` (or `/etc/pam.d`) |
 | `rearm-proto.h` | the request and answer format |
 | `tests/` | `make check`: real libpam stacks with stand-ins for pam_unix and pam_fprintd, a fake device, and the service started per connection |
