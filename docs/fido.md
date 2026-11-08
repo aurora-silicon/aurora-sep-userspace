@@ -105,6 +105,33 @@ certified authenticators (some enterprise policies) will refuse this key.
 The AAGUID `a0f1d0e5-aa5b-4a7e-9c51-f1d0a0c0de01` names this software, not a
 certified device.
 
+### Who may approve: the policy
+
+As on macOS, each credential gets an access policy when it is made, from
+`policy =` in `[touchid]` of `/etc/aurora-fido/aurora-fido.conf`. Changing
+the setting affects new credentials only; `aurora-fido status` shows it.
+
+| policy | approves a request | macOS equivalent |
+| --- | --- | --- |
+| `touchid-or-password` (default) | Touch ID; or, when Touch ID does not match after `max_tries`, is locked out or is unavailable (no enrolled finger, lid closed), your password in the desktop's polkit dialog (`org.aurora.fido.authenticate`, `auth_self`, asked every time, never kept; this daemon never sees the password) | `.userPresence` |
+| `touchid-any` | Touch ID only, any finger enrolled at the time | `.biometryAny` |
+| `touchid-current` | Touch ID only, and only while the enrolled fingers are the ones enrolled when the credential was made; adding, removing or re-enrolling a finger retires the credential for good | `.biometryCurrentSet` |
+
+No touch within the timeout never opens the password dialog. A
+pinUvAuthToken a browser got with the password does not unlock a Touch ID
+only credential; the daemon asks for Touch ID again.
+
+Who enforces it: today this daemon (for `touchid-current` it keeps a digest
+of fprintd's stored prints for the user and compares it at each use). With
+`enclave_policy = yes` in `[keys]` and a kernel whose `/dev/sep-key` offers
+the matching create flag (`SEP_KEY_CREATE_BIOMETRY_CURRENT_SET` for
+`touchid-current`, and `SEP_KEY_CREATE_BIOMETRY_ANY` for `touchid-any` once
+lane SEPKEY adds it), the key is made with the Secure Enclave's own
+biometric access control, and the enclave checks the finger inside the
+signature itself. That is off until linux#1196's enclave policies are
+qualified on hardware. `touchid-or-password` keys stay plain enclave keys
+with the touch checked here.
+
 ### Touch ID behaviour
 
 - Whose finger: the user of the active local session on seat0 (whoever is at
@@ -121,7 +148,7 @@ certified device.
 - No fixed waits between touches: the driver arms the sensor again when the
   finger lifts.
 - A request Touch ID has just refused (wrong finger or lockout) that the
-  client sends again unchanged, within 30 seconds, is refused again at once,
+  client sends again unchanged (same challenge and options), within 10 seconds, is refused again at once,
   with no new prompt and without spending Touch ID tries. OpenSSH does this:
   it reads `OPERATION_DENIED` as "PIN required" and signs the same data once
   more. So a refused `ssh` login costs at most `max_tries` misses, as with a
@@ -178,6 +205,11 @@ protocol side.
 | root on this Mac | **can sign without a touch** | **can sign without a touch** while it is root | cannot sign without a touch; can redirect one touch |
 | root after losing root | **keeps any key it copied** | nothing to take away: keys never left the enclave | same |
 
+The policy does not change the root rows above: whatever root can do to the
+daemon, it can do whichever policy a credential has, until the enclave
+enforces the policy (`enclave_policy`), and then only for `touchid-any` and
+`touchid-current` keys.
+
 `hmac-secret` (what `systemd-cryptenroll` uses) is a per-credential secret
 derived by the daemon from data it keeps sealed under the master secret, not
 by the enclave. A running root can compute it; a disk thief cannot. For LUKS
@@ -201,6 +233,9 @@ then reset) and needs a touch.
   each use. Press Enter: it then uses the built-in user verification (one
   touch).
 - `pamu2fcfg` needs pam-u2f 1.1.1 or newer to accept self attestation.
+- "Installed off" relies on systemd presets (`90-aurora-fido.preset`). A
+  packaging that enables units regardless of presets (Debian's
+  `dh_installsystemd` default) must pass `--no-enable`.
 - U2F key handles are at most 255 bytes, and Secure Enclave handles are
   longer, so U2F credentials always use the stored-reference form. Deleting
   `/var/lib/aurora-fido/handles` breaks them.

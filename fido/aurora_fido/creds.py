@@ -14,7 +14,8 @@ Credential ID, version 1 (every credential, resident or not):
   0x01 | kind | nonce[12] | AES-256-GCM(cred, nonce, payload, aad) (ct || tag)
   aad = "aurora-fido/cred/1" | kind | rpIdHash
 
-  kind 0x00: payload is CBOR {1: key handle, 2: seed[32], 3: credProtect}
+  kind 0x00: payload is CBOR {1: key handle, 2: seed[32], 3: credProtect,
+             4: policy (absent = 0), 6: enrolled-set digest[32] (policy 2)}
   kind 0x01: payload is CBOR {5: ref[16]}, and the kind-0 payload lives in
              handles/<ref>, wrapped with the same key; used when the key
              handle would make the ID longer than the protocol allows
@@ -66,13 +67,32 @@ def atomic_write(path, data, mode=0o600):
         os.close(dfd)
 
 
+# Who may approve a credential's use, fixed when it is made (like a macOS
+# key's access control): config [touchid] policy.
+POLICY_TOUCHID_OR_PASSWORD = 0   # Touch ID, or the user's password (macOS .userPresence)
+POLICY_TOUCHID_ANY = 1           # Touch ID only, any enrolled finger (.biometryAny)
+POLICY_TOUCHID_CURRENT = 2       # Touch ID only, and only the fingers enrolled now
+                                 # (.biometryCurrentSet): an enrolment change retires it
+POLICIES = {"touchid-or-password": POLICY_TOUCHID_OR_PASSWORD,
+            "touchid-any": POLICY_TOUCHID_ANY,
+            "touchid-current": POLICY_TOUCHID_CURRENT}
+POLICY_NAMES = {v: k for k, v in POLICIES.items()}
+
+
 class Credential:
     """What a credential ID opens to."""
 
-    def __init__(self, handle, seed, cred_protect=1):
+    def __init__(self, handle, seed, cred_protect=1, policy=POLICY_TOUCHID_OR_PASSWORD,
+                 bio_set=None):
         self.handle = handle
         self.seed = seed
         self.cred_protect = cred_protect
+        self.policy = policy
+        self.bio_set = bio_set
+
+    @property
+    def allow_password(self):
+        return self.policy == POLICY_TOUCHID_OR_PASSWORD
 
     def cred_random(self, uv):
         """hmac-secret CredRandom: separate values with and without UV."""
@@ -102,6 +122,10 @@ class Vault:
 
     def wrap(self, rp_id_hash, cred, max_len=ID_MAX_CTAP2):
         payload = {1: cred.handle, 2: cred.seed, 3: cred.cred_protect}
+        if cred.policy:
+            payload[4] = cred.policy
+        if cred.bio_set is not None:
+            payload[6] = cred.bio_set
         cid = self._seal(KIND_INLINE, rp_id_hash, payload)
         if len(cid) <= max_len:
             return cid
@@ -140,10 +164,13 @@ class Vault:
         if not p:
             return None
         h, s, cp = p.get(1), p.get(2), p.get(3, 1)
+        pol, bio = p.get(4, POLICY_TOUCHID_OR_PASSWORD), p.get(6)
         if not (isinstance(h, bytes) and isinstance(s, bytes) and len(s) == 32
-                and cp in (1, 2, 3)):
+                and cp in (1, 2, 3) and pol in POLICY_NAMES):
             return None
-        return Credential(h, s, cp)
+        if pol == POLICY_TOUCHID_CURRENT and not (isinstance(bio, bytes) and len(bio) == 32):
+            return None
+        return Credential(h, s, cp, pol, bio if pol == POLICY_TOUCHID_CURRENT else None)
 
     def seal_record(self, record):
         nonce = secrets.token_bytes(12)

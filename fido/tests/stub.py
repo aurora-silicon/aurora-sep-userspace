@@ -34,7 +34,7 @@ class StubKeyBackend(KeyBackend):
         self.signs = 0
         self.creates = 0
 
-    def create(self):
+    def create(self, policy=0):
         priv = ec.generate_private_key(ec.SECP256R1())
         scalar = priv.private_numbers().private_value.to_bytes(32, "big")
         nonce = secrets.token_bytes(12)
@@ -65,7 +65,11 @@ class StubKeyBackend(KeyBackend):
 
 
 class StubVerifier(touchid.Verifier):
-    """mode: match | no-match | timeout | locked | unavailable | wait (until cancelled)."""
+    """mode: match | no-match | timeout | locked | unavailable | password | wait (until cancelled).
+
+    "password": Touch ID failed and the password was accepted (what
+    touchid.PolicyVerifier answers); the Authenticator decides whether that counts.
+    """
 
     max_tries = 3
 

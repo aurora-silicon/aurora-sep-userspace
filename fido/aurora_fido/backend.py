@@ -59,14 +59,30 @@ class InvalidHandle(BackendError):
     """The handle is not one this backend (this enclave) can use."""
 
 
+class EnclaveRefused(BackendError):
+    """An enclave-gated key: the Secure Enclave's own Touch ID check did not match."""
+
+
+class EnclaveTimeout(BackendError):
+    """An enclave-gated key: no finger within the enclave's wait."""
+
+
 class KeyBackend:
     name = "abstract"
     #: True when the private key cannot be read by anything on the host.
     non_extractable = False
 
-    def create(self):
-        """Return (handle: bytes, public_point: 65-byte uncompressed P-256)."""
+    def create(self, policy=0):
+        """Return (handle: bytes, public_point: 65-byte uncompressed P-256).
+
+        policy: the credential's creds.POLICY_*; only a backend that can
+        have the Secure Enclave enforce it looks at it.
+        """
         raise NotImplementedError
+
+    def enclave_gated(self, handle):
+        """True when signing with handle makes the enclave ask for Touch ID itself."""
+        return False
 
     def sign(self, handle, digest):
         """Return a DER ECDSA-Sig-Value over the 32-byte digest."""
@@ -94,6 +110,12 @@ IOC_CREATE = _ioc(_IOC_READ | _IOC_WRITE, _MAGIC, 0x21, _CREATE.size)
 IOC_SIGN = _ioc(_IOC_READ | _IOC_WRITE, _MAGIC, 0x22, _SIGN.size)
 IOC_PUBLIC = _ioc(_IOC_READ | _IOC_WRITE, _MAGIC, 0x23, _PUBLIC.size)
 IFACE_VERSIONS = (1, 2)
+# CREATE flags. Version 2 has BIOMETRY_CURRENT_SET; the others are the names
+# proposed to lane SEPKEY (11-08) for the macOS-matching policies and are
+# used only if the kernel lists them in INFO flags_supported.
+CREATE_BIOMETRY_CURRENT_SET = 0x1     # .biometryCurrentSet
+CREATE_BIOMETRY_ANY = 0x2             # .biometryAny (proposed)
+HANDLE_FLAG_BIOMETRY = 0x01           # handle byte 5: the record carries a biometric ACL
 SEP_MAGIC = b"SEPK"
 
 assert (_INFO.size, _CREATE.size, _SIGN.size) == (16, 2124, 2164)
@@ -115,8 +137,11 @@ class SepKeyBackend(KeyBackend):
         try:
             fcntl.ioctl(self.fd, IOC_INFO, buf, True)
         except OSError as e:
+            os.close(self.fd)
             raise BackendError(f"{path}: info ioctl failed: {e.strerror}") from e
-        version, _flags, handle_max, _ = _INFO.unpack(buf)
+        version, flags_supported, handle_max, _ = _INFO.unpack(buf)
+        self.flags_supported = flags_supported if version >= 2 else 0
+        self.enclave_policies = False     # config [keys] enclave_policy
         if version not in IFACE_VERSIONS:
             os.close(self.fd)
             raise BackendError(f"{path}: interface version {version}, this daemon "
@@ -130,10 +155,26 @@ class SepKeyBackend(KeyBackend):
         except OSError as e:
             if e.errno in (errno.EINVAL, EKEYREJECTED):
                 raise InvalidHandle(e.strerror) from e
+            if e.errno == errno.EACCES:
+                raise EnclaveRefused("no Touch ID match") from e
+            if e.errno == errno.ETIMEDOUT:
+                raise EnclaveTimeout("no touch") from e
             raise BackendError(e.strerror) from e
 
-    def create(self):
-        buf = bytearray(_CREATE.size)
+    def create_flags(self, policy):
+        """The CREATE flag that has the enclave enforce policy, or 0 (daemon checks it)."""
+        from .creds import POLICY_TOUCHID_ANY, POLICY_TOUCHID_CURRENT
+        want = {POLICY_TOUCHID_CURRENT: CREATE_BIOMETRY_CURRENT_SET,
+                POLICY_TOUCHID_ANY: CREATE_BIOMETRY_ANY}.get(policy, 0)
+        if self.enclave_policies and want and self.flags_supported & want == want:
+            return want
+        return 0
+
+    def enclave_gated(self, handle):
+        return handle[:4] == SEP_MAGIC and len(handle) > 5 and bool(handle[5] & HANDLE_FLAG_BIOMETRY)
+
+    def create(self, policy=0):
+        buf = bytearray(_CREATE.pack(self.create_flags(policy), 0, b"", b"", b""))
         self._call(IOC_CREATE, buf)
         _f, n, point, _r, handle = _CREATE.unpack(buf)
         if not 0 < n <= self.handle_max or point[0] != 4:
@@ -196,7 +237,7 @@ class SealedKeyBackend(KeyBackend):
         if self._aead is None:
             raise BackendError("sealed key store has no master secret")
 
-    def create(self):
+    def create(self, policy=0):
         self._need_key()
         priv = ec.generate_private_key(ec.SECP256R1())
         scalar = priv.private_numbers().private_value.to_bytes(32, "big")
@@ -250,8 +291,11 @@ class KeyStore(KeyBackend):
             return self.sealed
         raise InvalidHandle("unknown key handle")
 
-    def create(self):
-        return self.primary.create()
+    def create(self, policy=0):
+        return self.primary.create(policy)
+
+    def enclave_gated(self, handle):
+        return self.sep is not None and self.sep.enclave_gated(handle)
 
     def sign(self, handle, digest):
         return self._for(handle).sign(handle, digest)
@@ -263,7 +307,7 @@ class KeyStore(KeyBackend):
 STORES = ("auto", "sep-key", "sealed")
 
 
-def open_store(store="auto", sep_path="/dev/sep-key"):
+def open_store(store="auto", sep_path="/dev/sep-key", enclave_policy=False):
     """(KeyStore, why /dev/sep-key is not used or None).
 
     auto: the Secure Enclave when /dev/sep-key works, else sealed keys.
@@ -273,12 +317,22 @@ def open_store(store="auto", sep_path="/dev/sep-key"):
     if store not in STORES:
         raise BackendError(f"keys: store = {store!r}; use {', '.join(STORES)}")
     sep, why = None, None
-    try:
-        sep = SepKeyBackend(sep_path)
-    except BackendError as e:
-        why = str(e)
+    if store == "sealed" and not os.path.exists(sep_path):
+        pass
+    elif not os.path.exists(sep_path):
+        why = f"{sep_path} not present (kernel without Secure Enclave keys)"
         if store == "sep-key":
-            raise
+            raise BackendError(why)
+    else:
+        # The node exists: any failure is an error, never a quiet fall back
+        # to sealed keys (a late or broken driver must not weaken new keys).
+        try:
+            sep = SepKeyBackend(sep_path)
+        except BackendError:
+            if store != "sealed":
+                raise
+        if sep is not None:
+            sep.enclave_policies = bool(enclave_policy)
     sealed = SealedKeyBackend()
     primary = sep if (sep is not None and store != "sealed") else sealed
     if store == "sealed" and sep is not None:

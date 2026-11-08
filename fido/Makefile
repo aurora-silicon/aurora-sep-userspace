@@ -20,6 +20,7 @@ SYSCONFDIR ?= /etc
 DOCDIR ?= $(PREFIX)/share/doc/aurora-fido
 BINDIR ?= $(PREFIX)/bin
 PRESETDIR ?= $(PREFIX)/lib/systemd/system-preset
+POLKITDIR ?= $(PREFIX)/share/polkit-1/actions
 
 SEAL := aurora-fido-seal
 SRC := aurora-fido-seal.c ../luks/sep-seal.c ../luks/sep-seal.h
@@ -37,12 +38,16 @@ test/$(SEAL): $(SRC)
 	$(CC) $(CFLAGS) -DSEP_SEAL_TEST_USER_KEYS $(DEPS_CFLAGS) -o $@ \
 		aurora-fido-seal.c ../luks/sep-seal.c $(DEPS_LIBS)
 
-aurora-fidod aurora-fido: %: %.in
-	sed -e 's|@PYDIR@|$(PYDIR)|' -e 's|@LIBEXECDIR@|$(LIBEXECDIR)|' $< > $@
+# Generated from the install paths: always regenerated (FORCE), so that
+# `make install LIBEXECDIR=...` after a plain `make` never ships stale paths.
+aurora-fidod aurora-fido: %: %.in FORCE
+	sed -e 's|@PYDIR@|$(PYDIR)|' -e 's|@LIBEXECDIR@|$(LIBEXECDIR)|' -e 's|@DOCDIR@|$(DOCDIR)|' $< > $@
 	chmod 755 $@
 
-aurora-fido.service.out: aurora-fido.service
+aurora-fido.service.out: aurora-fido.service FORCE
 	sed 's|@LIBEXECDIR@|$(LIBEXECDIR)|' $< > $@
+
+FORCE:
 
 # Unit tests: no root, no hardware (software keys, scripted Touch ID).
 check:
@@ -64,10 +69,11 @@ install: all
 	for f in $(PY); do install -Dm644 $$f $(DESTDIR)$(PYDIR)/$$f; done
 	install -Dm644 aurora-fido.service.out $(DESTDIR)$(UNITDIR)/aurora-fido.service
 	install -Dm644 60-aurora-fido.rules $(DESTDIR)$(UDEVRULESDIR)/60-aurora-fido.rules
+	install -Dm644 org.aurora.fido.policy $(DESTDIR)$(POLKITDIR)/org.aurora.fido.policy
 	install -Dm644 aurora-fido.conf $(DESTDIR)$(SYSCONFDIR)/aurora-fido/aurora-fido.conf
 	install -Dm644 ../docs/fido.md $(DESTDIR)$(DOCDIR)/fido.md
 
 clean:
 	rm -rf $(SEAL) test aurora-fidod aurora-fido aurora-fido.service.out aurora_fido/__pycache__ tests/__pycache__
 
-.PHONY: all check check-uhid check-seal install clean
+.PHONY: all check check-uhid check-seal install clean FORCE

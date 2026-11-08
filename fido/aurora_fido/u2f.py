@@ -23,7 +23,7 @@ import time
 
 from . import keys, touchid
 from .backend import InvalidHandle
-from .creds import ID_MAX_U2F, Credential
+from .creds import ID_MAX_U2F, POLICY_TOUCHID_CURRENT, POLICY_TOUCHID_OR_PASSWORD, Credential
 
 log = logging.getLogger("aurora-fido")
 
@@ -97,8 +97,9 @@ class Presence:
             gap = now - self.last_poll
             self.last_poll = now
             running = self.thread is not None and self.thread.is_alive()
-            if self.app == app and self.result == touchid.MATCH \
-                    and now - self.result_at <= GRANT_LIFETIME:
+            granted = self.result == touchid.MATCH or (
+                self.result == touchid.PASSWORD and prompt.allow_password)
+            if self.app == app and granted and now - self.result_at <= GRANT_LIFETIME:
                 self.result = None
                 return True
             if running:
@@ -144,11 +145,18 @@ class U2F:
         if len(data) != 64:
             return _sw(SW_WRONG_LENGTH)
         chal, app = data[:32], data[32:]
-        if not self.presence.check(app, touchid.Prompt("register", None, "U2F")):
-            return _sw(SW_CONDITIONS_NOT_SATISFIED)
         a = self.auth
-        handle, point = a.backend.create()
-        cred = Credential(handle, os.urandom(32), 1)
+        if not self.presence.check(app, touchid.Prompt(
+                "register", None, "U2F",
+                allow_password=a.policy == POLICY_TOUCHID_OR_PASSWORD)):
+            return _sw(SW_CONDITIONS_NOT_SATISFIED)
+        bio_set = None
+        if a.policy == POLICY_TOUCHID_CURRENT:
+            bio_set = a.enrolled_set()
+            if bio_set is None:
+                return _sw(SW_CONDITIONS_NOT_SATISFIED)
+        handle, point = a.backend.create(a.policy)
+        cred = Credential(handle, os.urandom(32), 1, a.policy, bio_set)
         kh = a.vault.wrap(app, cred, ID_MAX_U2F)
 
         def sign(digest):
@@ -166,10 +174,13 @@ class U2F:
         cred = self.auth.vault.unwrap(app, kh)
         if cred is None:
             return _sw(SW_WRONG_DATA)
+        if cred.policy == POLICY_TOUCHID_CURRENT and cred.bio_set != self.auth.enrolled_set():
+            return _sw(SW_WRONG_DATA)          # the enrolled fingers changed: retired
         if p1 == 0x07:                                  # check-only
             return _sw(SW_CONDITIONS_NOT_SATISFIED)
         if p1 == 0x03:                                  # enforce user presence
-            if not self.presence.check(app, touchid.Prompt("sign-in", None, "U2F")):
+            if not self.presence.check(app, touchid.Prompt(
+                    "sign-in", None, "U2F", allow_password=cred.allow_password)):
                 return _sw(SW_CONDITIONS_NOT_SATISFIED)
             up = 0x01
         elif p1 == 0x08:                                # don't enforce

@@ -19,20 +19,20 @@ import subprocess
 import sys
 import threading
 
-from . import __version__, creds, ctap2, ctaphid, touchid, u2f
+from . import __version__, creds, ctap2, ctaphid, paths, touchid, u2f
 from .backend import BackendError, open_store
 
 log = logging.getLogger("aurora-fido")
 
-STATE_DIR = "/var/lib/aurora-fido"
-RUN_DIR = "/run/aurora-fido"
-CONFIG = "/etc/aurora-fido/aurora-fido.conf"
-SEAL_HELPER = "/usr/libexec/aurora-fido/aurora-fido-seal"
+STATE_DIR = paths.STATE_DIR
+RUN_DIR = paths.RUN_DIR
+CONFIG = paths.CONFIG
 
 DEFAULTS = {
-    "touchid": {"user": "auto", "timeout": "30", "max_tries": "3", "notify": "yes"},
+    "touchid": {"user": "auto", "timeout": "30", "max_tries": "3", "notify": "yes",
+                "policy": "touchid-or-password", "password_timeout": "60"},
     "authenticator": {"attestation": "self", "max_resident": "256", "u2f": "yes"},
-    "keys": {"store": "auto"},
+    "keys": {"store": "auto", "enclave_policy": "no"},
 }
 
 DEVICE_NAME = "Aurora Touch ID Security Key"
@@ -41,9 +41,9 @@ DEVICE_NAME = "Aurora Touch ID Security Key"
 class SealedSecret:
     """The 64-byte master secret, sealed by this Mac's Secure Enclave."""
 
-    def __init__(self, state_dir, helper=SEAL_HELPER):
+    def __init__(self, state_dir, helper=None):
         self.path = os.path.join(state_dir, "master.sep")
-        self.helper = helper
+        self.helper = helper or paths.SEAL_HELPER
 
     def _run(self, args, stdin=None):
         r = subprocess.run([self.helper] + args, input=stdin, capture_output=True,
@@ -78,7 +78,15 @@ def load_config(path):
     return cp
 
 
-def build(cfg, state_dir, backend, verifier, secret):
+def policy_of(cfg):
+    name = cfg.get("touchid", "policy")
+    if name not in creds.POLICIES:
+        raise ValueError(f"[touchid] policy = {name!r}; use "
+                         + ", ".join(creds.POLICIES))
+    return creds.POLICIES[name]
+
+
+def build(cfg, state_dir, backend, verifier, secret, enrolled_set=lambda: None):
     """Wire the authenticator; secret has load() and new()."""
     os.makedirs(state_dir, mode=0o700, exist_ok=True)
     max_rk = cfg.getint("authenticator", "max_resident")
@@ -93,7 +101,8 @@ def build(cfg, state_dir, backend, verifier, secret):
     auth = ctap2.Authenticator(
         backend, verifier, vault, store, creds.Counter(state_dir),
         attestation=cfg.get("authenticator", "attestation"),
-        new_vault=lambda: fresh(secret.new()))
+        new_vault=lambda: fresh(secret.new()),
+        policy=policy_of(cfg), enrolled_set=enrolled_set)
     u = u2f.U2F(auth) if cfg.getboolean("authenticator", "u2f") else None
     return auth, u
 
@@ -104,6 +113,7 @@ def write_status(run_dir, info):
         return
     try:
         os.makedirs(run_dir, mode=0o755, exist_ok=True)
+        os.chmod(run_dir, 0o755)
         path = os.path.join(run_dir, "status.json")
         creds.atomic_write(path, json.dumps(info, indent=1).encode() + b"\n", 0o644)
         os.chmod(path, 0o644)
@@ -152,11 +162,35 @@ def fprintd_verifier(cfg):
         notifier=touchid.Notifier(cfg.getboolean("touchid", "notify")))
 
 
+def verifier_for(cfg):
+    """Touch ID, with the password behind it for touchid-or-password credentials."""
+    touch = fprintd_verifier(cfg)
+    return touchid.PolicyVerifier(
+        touch, touchid.PolkitPassword(cfg.getfloat("touchid", "password_timeout")))
+
+
+def enrolled_set_for(verifier):
+    def digest():
+        touch = getattr(verifier, "touch", verifier)
+        who = touch._resolve_user() if hasattr(touch, "_resolve_user") else None
+        return touchid.enrolled_set_digest(who[0]) if who else None
+    return digest
+
+
+POLICY_TEXT = {
+    "touchid-or-password": "Touch ID, or your password when Touch ID does not match, "
+                           "is locked or unavailable",
+    "touchid-any": "Touch ID only, any enrolled finger",
+    "touchid-current": "Touch ID only, and only the fingers enrolled when a credential "
+                       "is made (adding or removing a finger retires it)",
+}
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="aurora-fidod")
     ap.add_argument("--config", default=CONFIG)
     ap.add_argument("--state-dir", default=STATE_DIR)
-    ap.add_argument("--seal-helper", default=SEAL_HELPER)
+    ap.add_argument("--seal-helper", default=paths.SEAL_HELPER)
     ap.add_argument("--run-dir", default=RUN_DIR)
     ap.add_argument("-v", "--verbose", action="store_true")
     a = ap.parse_args(argv)
@@ -167,28 +201,34 @@ def main(argv=None):
         return 1
     cfg = load_config(a.config)
     try:
-        backend, why = open_store(cfg.get("keys", "store"))
-    except BackendError as e:
-        log.error("no key store: %s", e)
+        policy_of(cfg)
+        backend, why = open_store(cfg.get("keys", "store"),
+                                  enclave_policy=cfg.getboolean("keys", "enclave_policy"))
+    except (BackendError, ValueError) as e:
+        log.error("%s", e)
         return 1
     if backend.name != "sep-key":
         log.warning("keys are sealed by the Secure Enclave, not kept in it (%s); "
                     "see /usr/share/doc/aurora-fido/fido.md", why)
     try:
-        verifier = fprintd_verifier(cfg)
+        verifier = verifier_for(cfg)
     except ImportError as e:
         log.error("Touch ID needs python3-gobject: %s", e)
         return 1
     os.umask(0o077)
     try:
         auth, u = build(cfg, a.state_dir, backend, verifier,
-                        SealedSecret(a.state_dir, a.seal_helper))
+                        SealedSecret(a.state_dir, a.seal_helper), enrolled_set_for(verifier))
     except (RuntimeError, OSError, subprocess.SubprocessError) as e:
         log.error("cannot open the sealed master secret: %s", e)
         return 1
     from .uhid import UhidDevice
+    pol = cfg.get("touchid", "policy")
+    enclave = bool(backend.sep is not None and backend.sep.create_flags(creds.POLICIES[pol]))
     info = dict(key_store_info(backend, why), version=__version__,
-                touchid_user=cfg.get("touchid", "user"), u2f=u is not None)
+                touchid_user=cfg.get("touchid", "user"), u2f=u is not None,
+                policy=pol, policy_detail=POLICY_TEXT[pol]
+                + (" (enforced by the Secure Enclave)" if enclave else " (checked by aurora-fidod)"))
     serve(auth, u, lambda: UhidDevice(name=DEVICE_NAME), a.run_dir, info)
     return 0
 

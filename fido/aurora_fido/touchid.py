@@ -13,8 +13,17 @@ otherwise changes fingerprints.
 Whose finger: the user of the active session on seat0 (the person at the
 keyboard, who is the only one who can reach the sensor), unless the config
 names a user.
+
+Policy (as macOS key access control): a credential made under
+"touchid-or-password" (the default) may also be approved with the user's
+password when Touch ID does not match, is locked out or is unavailable. The
+password is asked by the desktop's polkit agent in the user's own session
+(action org.aurora.fido.authenticate, auth_self, never kept), so this daemon
+never sees it. "touchid-any" and "touchid-current" credentials take Touch ID
+only.
 """
 
+import hashlib
 import html
 import logging
 import os
@@ -26,6 +35,7 @@ import time
 log = logging.getLogger("aurora-fido")
 
 MATCH = "match"
+PASSWORD = "password"       # approved with the password (touchid-or-password only)
 NO_MATCH = "no-match"
 TIMEOUT = "timeout"
 CANCELLED = "cancelled"
@@ -36,10 +46,11 @@ UNAVAILABLE = "unavailable"
 class Prompt:
     """What the user is asked to approve."""
 
-    def __init__(self, action, rp, detail=""):
+    def __init__(self, action, rp, detail="", allow_password=False):
         self.action = action      # "register", "sign-in", "reset", ...
         self.rp = rp              # relying party ID as the client sent it
         self.detail = detail
+        self.allow_password = allow_password
 
     def title(self):
         return {
@@ -75,6 +86,12 @@ class Verifier:
 
 def seat_user():
     """(name, uid) of the active local session on seat0, or None."""
+    s = seat_session()
+    return s[1:] if s else None
+
+
+def seat_session():
+    """(session id, name, uid) of the active local session on seat0, or None."""
     try:
         sid = subprocess.run(
             ["loginctl", "show-seat", "seat0", "-p", "ActiveSession", "--value"],
@@ -91,9 +108,37 @@ def seat_user():
     if p.get("Remote") != "no" or p.get("Active") != "yes" or p.get("Class") != "user":
         return None
     try:
-        return p["Name"], int(p["User"])
+        return sid, p["Name"], int(p["User"])
     except (KeyError, ValueError):
         return None
+
+
+def enrolled_set_digest(user, root="/var/lib/fprint"):
+    """SHA-256 over fprintd's stored prints for user (names and contents), or None.
+
+    Any enrolment, deletion or re-enrolment changes it. A "touchid-current"
+    credential keeps the digest of the set it was made with and stops
+    working when it changes, as a macOS .biometryCurrentSet key does. (With
+    the Secure Enclave policy the enclave enforces this instead.)
+    """
+    base = os.path.join(root, user)
+    if not user or "/" in user or not os.path.isdir(base):
+        return None
+    h = hashlib.sha256(b"aurora-fido enrolled set v1\0")
+    n = 0
+    for d, dirs, files in os.walk(base):
+        dirs.sort()
+        for f in sorted(files):
+            path = os.path.join(d, f)
+            try:
+                with open(path, "rb") as fh:
+                    data = fh.read(1 << 20)
+            except OSError:
+                continue
+            rel = os.path.relpath(path, base).encode()
+            h.update(len(rel).to_bytes(4, "big") + rel + len(data).to_bytes(4, "big") + data)
+            n += 1
+    return h.digest() if n else None
 
 
 class Notifier:
@@ -304,3 +349,83 @@ class FprintdVerifier(Verifier):
                 bus.signal_unsubscribe(sub)
             ctx.pop_thread_default()
             self.notifier.close(note)
+
+
+POLKIT_ACTION = "org.aurora.fido.authenticate"
+
+
+class PolkitPassword:
+    """The user's password through the polkit agent of the seat0 session."""
+
+    def __init__(self, timeout=60.0):
+        self.timeout = float(timeout)
+        from gi.repository import Gio, GLib  # noqa: F401
+
+    def verify(self, prompt, cancel, waiting=lambda: None):
+        from gi.repository import Gio, GLib
+
+        who = seat_session()
+        if not who:
+            return UNAVAILABLE
+        sid, user, _uid = who
+        ctx = GLib.MainContext.new()
+        ctx.push_thread_default()
+        cid = f"aurora-fido-{os.getpid()}-{time.monotonic_ns()}"
+        done = []
+        try:
+            bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+            subject = ("unix-session", {"session-id": GLib.Variant("s", sid)})
+            details = {"polkit.message": f"Use your password: {prompt.title()}",
+                       "aurora.fido.rp": display_rp(prompt.rp)}
+            log.info("asking %s for the password: %s", user, prompt.title())
+            bus.call(
+                "org.freedesktop.PolicyKit1", "/org/freedesktop/PolicyKit1/Authority",
+                "org.freedesktop.PolicyKit1.Authority", "CheckAuthorization",
+                GLib.Variant("((sa{sv})sa{ss}us)", (subject, POLKIT_ACTION, details, 1, cid)),
+                GLib.VariantType.new("((bba{ss}))"), Gio.DBusCallFlags.NONE,
+                int(self.timeout * 1000) + 5000, None,
+                lambda b, res: done.append(res))
+            waiting()
+            deadline = time.monotonic() + self.timeout
+            while not done:
+                ctx.iteration(False) or time.sleep(0.05)
+                if cancel.is_set() or time.monotonic() > deadline:
+                    try:
+                        bus.call_sync("org.freedesktop.PolicyKit1",
+                                      "/org/freedesktop/PolicyKit1/Authority",
+                                      "org.freedesktop.PolicyKit1.Authority",
+                                      "CancelCheckAuthorization", GLib.Variant("(s)", (cid,)),
+                                      None, Gio.DBusCallFlags.NONE, 5000, None)
+                    except GLib.Error:
+                        pass
+                    return CANCELLED if cancel.is_set() else TIMEOUT
+            try:
+                ((authorized, _challenge, _d),) = bus.call_finish(done[0]).unpack()
+            except GLib.Error as e:
+                log.warning("polkit: %s", e.message)
+                return UNAVAILABLE
+            log.info("password for %s: %s", user, "accepted" if authorized else "refused")
+            return MATCH if authorized else NO_MATCH
+        except GLib.Error as e:
+            log.warning("polkit error: %s", e.message)
+            return UNAVAILABLE
+        finally:
+            ctx.pop_thread_default()
+
+
+class PolicyVerifier(Verifier):
+    """Touch ID first; the password too when the prompt's policy allows it."""
+
+    def __init__(self, touch, password=None):
+        self.touch = touch
+        self.password = password
+        self.max_tries = getattr(touch, "max_tries", 3)
+
+    def verify(self, prompt, cancel, waiting=lambda: None):
+        r = self.touch.verify(prompt, cancel, waiting)
+        if r in (NO_MATCH, LOCKED, UNAVAILABLE) and prompt.allow_password \
+                and self.password is not None and not cancel.is_set():
+            log.info("Touch ID: %s; this credential also takes the password", r)
+            p = self.password.verify(prompt, cancel, waiting)
+            return PASSWORD if p == MATCH else (r if p == NO_MATCH else p)
+        return r

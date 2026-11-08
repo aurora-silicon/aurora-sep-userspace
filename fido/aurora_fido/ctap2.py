@@ -25,8 +25,9 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec
 
 from . import cbor, keys, pinuv, touchid
-from .backend import BackendError, InvalidHandle
-from .creds import ID_MAX_CTAP2, Credential
+from .backend import BackendError, EnclaveRefused, EnclaveTimeout, InvalidHandle
+from .creds import (ID_MAX_CTAP2, POLICY_TOUCHID_CURRENT, POLICY_TOUCHID_OR_PASSWORD,
+                    Credential)
 from .errors import *  # noqa: F401,F403
 from .errors import CtapError
 
@@ -58,8 +59,8 @@ RESET_WINDOW = 10.0
 # and signs the same data once more. A hardware key with built-in UV that
 # has refused a match does not hand out new tries to a replay either, and
 # each extra prompt would spend Touch ID misses towards the lockout. Any new
-# request (new challenge) gets a normal prompt.
-REFUSAL_REPLAY_WINDOW = 30.0
+# request (new challenge, other options) gets a normal prompt.
+REFUSAL_REPLAY_WINDOW = 10.0
 NEXT_ASSERTION_WINDOW = 30.0
 MAX_USER_FIELD = 64
 
@@ -125,9 +126,13 @@ def _options(params, key):
 
 class Authenticator:
     def __init__(self, backend, verifier, vault, store, counter,
-                 attestation="self", new_vault=None, clock=time.monotonic):
+                 attestation="self", new_vault=None, clock=time.monotonic,
+                 policy=POLICY_TOUCHID_OR_PASSWORD, enrolled_set=lambda: None):
         self.backend = backend
         self.verifier = verifier
+        self.policy = policy              # for new credentials (config [touchid] policy)
+        self.enrolled_set = enrolled_set  # () -> digest of the seat user's prints, or None
+        self.token_method = None          # how the current pinUvAuthToken was approved
         self.vault = vault
         self.store = store
         self.counter = counter
@@ -184,6 +189,12 @@ class Authenticator:
         except CtapError as e:
             log.info("command 0x%02x: %s", cmd, e)
             return bytes([e.code])
+        except EnclaveRefused as e:
+            log.info("command 0x%02x: Secure Enclave: %s", cmd, e)
+            return bytes([ERR_OPERATION_DENIED])
+        except EnclaveTimeout as e:
+            log.info("command 0x%02x: Secure Enclave: %s", cmd, e)
+            return bytes([ERR_USER_ACTION_TIMEOUT])
         except BackendError as e:
             log.error("key backend: %s", e)
             return bytes([ERR_OTHER])
@@ -199,7 +210,9 @@ class Authenticator:
         return h.digest()
 
     def ask(self, ctx, prompt, request=None):
-        """Touch ID; returns normally on a match, raises the CTAP error otherwise.
+        """Touch ID (or the password, if prompt.allow_password).
+
+        Returns "touchid" or "password"; raises the CTAP error otherwise.
 
         request: request_digest() of the operation; a replay of one that was
         just refused is refused again at once (REFUSAL_REPLAY_WINDOW).
@@ -212,12 +225,16 @@ class Authenticator:
                          "refused again without a new prompt", prompt.title(), now - when)
                 raise CtapError(ERR_OPERATION_DENIED, "repeat of a refused request")
         result = self.verifier.verify(prompt, ctx.cancel, ctx.on_up_needed)
+        if result == touchid.PASSWORD and not prompt.allow_password:
+            result = touchid.NO_MATCH
         if result in (touchid.NO_MATCH, touchid.LOCKED) and request is not None:
             self._refused = (request, self.clock())
-        elif result == touchid.MATCH:
+        elif result in (touchid.MATCH, touchid.PASSWORD):
             self._refused = None
         if result == touchid.MATCH:
-            return
+            return "touchid"
+        if result == touchid.PASSWORD:
+            return "password"
         if ctx.cancel.is_set() or result == touchid.CANCELLED:
             raise CtapError(ERR_KEEPALIVE_CANCEL, "cancelled")
         if result == touchid.TIMEOUT:
@@ -330,13 +347,20 @@ class Authenticator:
         if rk and self.store.remaining() <= 0:
             raise CtapError(ERR_KEY_STORE_FULL)
 
-        if not token_up:
-            self.ask(ctx, prompt, self.request_digest("mc", rp_hash, cdh, uid))
+        strict = self.policy != POLICY_TOUCHID_OR_PASSWORD
+        prompt.allow_password = not strict
+        if not token_up or (strict and self.token_method == "password"):
+            self.ask(ctx, prompt, self.request_digest("mc", rp_hash, cdh, uid, sorted(opts.items())))
         if auth_param is not None:
             self.token.consumed_by_mc_ga()
 
-        handle, point = self.backend.create()
-        cred = Credential(handle, os.urandom(32), cred_protect or 1)
+        bio_set = None
+        if self.policy == POLICY_TOUCHID_CURRENT:
+            bio_set = self.enrolled_set()
+            if bio_set is None:
+                raise CtapError(ERR_OPERATION_DENIED, "no enrolled fingers to bind to")
+        handle, point = self.backend.create(self.policy)
+        cred = Credential(handle, os.urandom(32), cred_protect or 1, self.policy, bio_set)
         cred_id = self.vault.wrap(rp_hash, cred, ID_MAX_CTAP2)
 
         ext_out = {}
@@ -406,12 +430,26 @@ class Authenticator:
         will_verify = token_uv or uv or (up and not token_up)
 
         found = []
+        current = None
+
+        def usable(c):
+            nonlocal current
+            if c.policy != POLICY_TOUCHID_CURRENT:
+                return True
+            if current is None:
+                current = self.enrolled_set() or b""
+            return c.bio_set == current     # the enrolled fingers changed: retired
+
         if allow:
             for cid in allow:
                 c = self.vault.unwrap(rp_hash, cid)
                 if c is None:
                     continue
                 if c.cred_protect == 3 and not will_verify:
+                    continue
+                if not usable(c):
+                    log.info("credential for %s is bound to fingers that are no longer "
+                             "all enrolled; refusing it", rp_id)
                     continue
                 found.append((cid, c, self.store.find(cid)))
                 break
@@ -422,15 +460,26 @@ class Authenticator:
                     continue
                 if c.cred_protect >= 2 and not will_verify:
                     continue
+                if not usable(c):
+                    continue
                 found.append((rec["credId"], c, rec))
         if not found:
             raise CtapError(ERR_NO_CREDENTIALS)
 
         verified = token_uv
         present = token_up and up    # up=false: UP stays clear even with a token
-        if (up and not token_up) or uv:
-            self.ask(ctx, touchid.Prompt("sign-in", rp_id),
-                     self.request_digest("ga", rp_hash, cdh, *(allow or ())))
+        allow_password = all(c.allow_password for _cid, c, _r in found)
+        gated = all(self.backend.enclave_gated(c.handle) for _cid, c, _r in found)
+        if gated and ((up and not token_up) or uv):
+            # The enclave asks for the finger inside the signature itself.
+            ctx.on_up_needed()
+            verified = True
+            present = up
+        elif (up and not token_up) or uv or (
+                token_up and self.token_method == "password" and not allow_password):
+            self.ask(ctx, touchid.Prompt("sign-in", rp_id, allow_password=allow_password),
+                     self.request_digest("ga", rp_hash, cdh, sorted(opts.items()),
+                                         *(allow or ())))
             verified = True
             present = up
         # CTAP 2.1/2.2 getAssertion: the token's flags and permissions are used up
@@ -538,7 +587,9 @@ class Authenticator:
             action = "manage" if perms & pinuv.PERM_CM else (
                 "register" if perms & pinuv.PERM_MC else "sign-in")
             self.token.reset()
-            self.ask(ctx, touchid.Prompt(action, rp_id))
+            self.token_method = None
+            self.token_method = self.ask(ctx, touchid.Prompt(
+                action, rp_id, allow_password=self.policy == POLICY_TOUCHID_OR_PASSWORD))
             self.token.begin(perms, rp_id)
             return {2: proto.encrypt(shared, self.token.value)}
         if sub in (0x01, 0x03, 0x04, 0x05, 0x09):
@@ -558,6 +609,7 @@ class Authenticator:
                                      "Every passkey and security-key credential "
                                      "made with this Mac stops working"))
         self.store.wipe()
+        self._refused = None
         self.vault, self.store = self.new_vault()
         self.token.reset()
         self.key_agreement.regenerate()

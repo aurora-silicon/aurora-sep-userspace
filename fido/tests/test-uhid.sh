@@ -37,9 +37,11 @@ modprobe uhid 2>/dev/null || true
 command -v fido2-token >/dev/null || { echo "needs fido2-tools (libfido2)"; exit 2; }
 
 dev=
-start() {   # start TOUCH_MODE
+start() {   # start TOUCH_MODE [daemon args...]
 	stop
-	python3 "$here/run-stub-daemon.py" --state-dir "$work/state" --touch "$1" --keys "${KEYS:-stub}" \
+	local mode=$1
+	shift
+	python3 "$here/run-stub-daemon.py" --state-dir "$work/state" --touch "$mode" --keys "${KEYS:-stub}" "$@" \
 		>>"$work/daemon.log" 2>&1 &
 	pid=$!
 	dev=
@@ -228,6 +230,23 @@ fido2-assert -G -p -i "$work/as.in" -o /dev/null "$dev" 2>"$work/err" &&
 		ok "replay of a refused request: refused again without a Touch ID prompt" ||
 		no "replay of a refused request asked Touch ID again"
 }
+# Touch ID failed, the password was accepted: fine for the default policy
+# (the credential above was made under it), refused for a Touch ID only one.
+start password || no "restart with a password answer"
+cdh3=$(head -c32 /dev/urandom | b64)
+printf '%s\n%s\n%s\n' "$cdh3" "fido.example" "$credid" >"$work/as3.in"
+fido2-assert -G -p -i "$work/as3.in" -o /dev/null "$dev" 2>"$work/err" &&
+	ok "touchid-or-password credential: the password approves it" || no "password: $(cat "$work/err")"
+printf '[touchid]\npolicy = touchid-any\n' >"$work/strict.conf"
+start match --config "$work/strict.conf" || no "restart with touchid-any"
+printf '%s\n%s\n%s\n%s\n' "$cdh" "strict.example" "ryan" "$uid" >"$work/strict.in"
+fido2-cred -M -i "$work/strict.in" -o "$work/strict.out" "$dev" es256 2>"$work/err" &&
+	ok "touchid-any credential made with Touch ID" || no "strict make: $(cat "$work/err")"
+start password --config "$work/strict.conf" || no "restart (touchid-any, password answer)"
+printf '%s\n%s\n%s\n' "$cdh3" "strict.example" "$(sed -n 5p "$work/strict.out")" >"$work/strict-as.in"
+fido2-assert -G -p -i "$work/strict-as.in" -o /dev/null "$dev" 2>"$work/err" &&
+	no "touchid-any credential approved by password" ||
+	ok "touchid-any credential: the password is refused ($(tail -1 "$work/err"))"
 start timeout || no "restart with a timing-out Touch ID"
 fido2-assert -G -p -i "$work/as.in" -o /dev/null "$dev" 2>"$work/err" &&
 	no "assertion after a timeout" || {

@@ -18,11 +18,17 @@ import subprocess
 import sys
 import time
 
-from . import __version__, daemon
+from . import __version__, paths
 
 UNIT = "aurora-fido.service"
-STATUS = os.path.join(daemon.RUN_DIR, "status.json")
-DOC = "/usr/share/doc/aurora-fido/fido.md"
+
+POLICY_TEXT = {
+    "touchid-or-password": "Touch ID, or your password when Touch ID does not match, "
+                           "is locked or unavailable (the default, as on macOS)",
+    "touchid-any": "Touch ID only, any enrolled finger",
+    "touchid-current": "Touch ID only, and only the fingers enrolled when a credential "
+                       "is made (adding or removing a finger retires it)",
+}
 
 THREAT = {
     "sep-key": "Keys live in the Secure Enclave and cannot be copied off this Mac. "
@@ -60,7 +66,8 @@ def find_device(sys_root="/sys"):
     return None
 
 
-def read_status(path=STATUS):
+def read_status(path=None):
+    path = path or os.path.join(paths.RUN_DIR, "status.json")
     try:
         with open(path) as f:
             st = json.load(f)
@@ -71,6 +78,16 @@ def read_status(path=STATUS):
 
 def expected_keys(sep_key="/dev/sep-key"):
     return "sep-key" if os.path.exists(sep_key) else "sealed"
+
+
+def configured_policy(path=None):
+    import configparser
+    cp = configparser.ConfigParser()
+    try:
+        cp.read(path or paths.CONFIG)
+    except configparser.Error:
+        pass
+    return cp.get("touchid", "policy", fallback="touchid-or-password")
 
 
 def gather():
@@ -85,6 +102,8 @@ def gather():
         "keys": keys,
         "keys_if_enabled": keys or expected_keys(),
         "ready": bool(st and st.get("ready")),
+        "policy": (st or {}).get("policy") or configured_policy(),
+        "policy_detail": (st or {}).get("policy_detail"),
         "version": __version__,
     }
 
@@ -98,11 +117,15 @@ def render(s):
         lines.append(f"  key store: {s['keys'] or 'unknown'}")
     else:
         lines.append(f"  key store when enabled: {s['keys_if_enabled']}")
+    pol = s.get("policy") or "touchid-or-password"
+    lines.append(f"  approval:  {pol}: " + (s.get("policy_detail")
+                                         or POLICY_TEXT.get(pol, "unknown policy")))
+    lines.append("             (new credentials; set [touchid] policy in " + paths.CONFIG + ")")
     lines.append("  " + THREAT.get(s["keys_if_enabled"], ""))
     if not on:
         lines.append("  Turn it on with: " + ("aurora.fido.enable = true; (NixOS)"
                                               if _is_nixos() else "sudo aurora-fido enable"))
-    lines.append(f"  More: {DOC}")
+    lines.append(f"  More: {paths.DOC}")
     return "\n".join(lines)
 
 
@@ -180,6 +203,9 @@ def cmd_disable(a):
         return 1
     if a.forget:
         shutil.rmtree(a.state_dir, ignore_errors=True)
+        if os.path.exists(a.state_dir):
+            print(f"aurora-fido: off, but {a.state_dir} could not be deleted", file=sys.stderr)
+            return 1
         print(f"Touch ID security key off; every credential it made is deleted "
               f"({a.state_dir}). Sites and SSH keys registered with it no longer work.")
     else:
@@ -206,8 +232,8 @@ def main(argv=None):
     p.add_argument("--forget", action="store_true",
                    help="also delete every credential it made")
     p.set_defaults(fn=cmd_disable, root=True)
-    ap.add_argument("--state-dir", default=daemon.STATE_DIR, help=argparse.SUPPRESS)
-    ap.add_argument("--seal-helper", default=daemon.SEAL_HELPER, help=argparse.SUPPRESS)
+    ap.add_argument("--state-dir", default=paths.STATE_DIR, help=argparse.SUPPRESS)
+    ap.add_argument("--seal-helper", default=paths.SEAL_HELPER, help=argparse.SUPPRESS)
     a = ap.parse_args(argv)
     if a.root and os.geteuid() != 0:
         print(f"aurora-fido {a.cmd}: run as root (sudo aurora-fido {a.cmd})", file=sys.stderr)

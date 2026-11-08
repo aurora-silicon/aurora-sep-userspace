@@ -26,7 +26,7 @@ here = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(here, ".."))
 sys.path.insert(0, here)
 
-from aurora_fido import daemon, touchid  # noqa: E402
+from aurora_fido import daemon, paths, touchid  # noqa: E402
 from aurora_fido.backend import open_store  # noqa: E402
 from aurora_fido.uhid import UhidDevice  # noqa: E402
 from stub import FileSecret, StubKeyBackend, StubVerifier  # noqa: E402
@@ -38,7 +38,7 @@ def main():
     ap.add_argument("--touch", default="match")
     ap.add_argument("--keys", choices=("stub", "sealed", "sep"), default="stub")
     ap.add_argument("--secret", choices=("file", "sep"), default="file")
-    ap.add_argument("--seal-helper", default=daemon.SEAL_HELPER)
+    ap.add_argument("--seal-helper", default=paths.SEAL_HELPER)
     ap.add_argument("--config", default=None)
     ap.add_argument("--name", default=None)
     ap.add_argument("-v", "--verbose", action="store_true")
@@ -58,11 +58,11 @@ def main():
     os.umask(0o077)
     os.makedirs(a.state_dir, mode=0o700, exist_ok=True)
     if a.touch == "fprintd":
-        verifier = daemon.fprintd_verifier(cfg)
+        verifier = daemon.verifier_for(cfg)
     else:
         if a.touch not in (touchid.MATCH, touchid.NO_MATCH, touchid.TIMEOUT,
-                           touchid.LOCKED, touchid.UNAVAILABLE):
-            ap.error("--touch: match, no-match, timeout, locked, unavailable or fprintd")
+                           touchid.LOCKED, touchid.UNAVAILABLE, touchid.PASSWORD):
+            ap.error("--touch: match, no-match, timeout, locked, unavailable, password or fprintd")
         verifier = StubVerifier(a.touch)
     if a.secret == "sep":
         secret = daemon.SealedSecret(a.state_dir, a.seal_helper)
@@ -78,7 +78,8 @@ def main():
                 f.write(os.urandom(32))
         with open(kpath, "rb") as f:
             backend = StubKeyBackend(key=f.read())
-    auth, u = daemon.build(cfg, a.state_dir, backend, verifier, secret)
+    auth, u = daemon.build(cfg, a.state_dir, backend, verifier, secret,
+                           daemon.enrolled_set_for(verifier))
     daemon.serve(auth, u, lambda: UhidDevice(name=name, phys="aurora-fido-test"))
     return 0
 
