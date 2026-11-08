@@ -141,6 +141,19 @@ resident store and seals a new master secret. As CTAP requires, it works only
 within 10 seconds of the daemon starting (`systemctl restart aurora-fido`,
 then reset) and needs a touch.
 
+### Known limits
+
+- No PIN. OpenSSH's `ssh-keygen -K` (download resident SSH keys) asks for a
+  PIN and does not work. Ordinary (non-resident) `ecdsa-sk` keys, the
+  default, work.
+- For SSH keys made with `-O verify-required`, OpenSSH asks "Enter PIN" at
+  each use. Press Enter: it then uses the built-in user verification (one
+  touch).
+- `pamu2fcfg` needs pam-u2f 1.1.1 or newer to accept self attestation.
+- U2F key handles are at most 255 bytes, and Secure Enclave handles are
+  longer, so U2F credentials always use the stored-reference form. Deleting
+  `/var/lib/aurora-fido/handles` breaks them.
+
 ## Install
 
     make -C fido && sudo make -C fido install
