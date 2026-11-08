@@ -113,5 +113,22 @@ else
 	echo "SKIP sshd login"
 fi
 
+# policy choice at enrolment (test build: AURORA_SEP_SK_TEST_OFFER fakes what the kernel offers)
+if [ "$MODE" = test ]; then
+	pe() { ssh-keygen -q -t ecdsa-sk -w "$P" -N '' -C pol -f "$T/pol-$1" </dev/null 2>"$T/pol-$1.err"; }
+	AURORA_SEP_SK_TEST_OFFER=3 pe dflt && grep -q "any enrolled finger" "$T/pol-dflt.err" \
+		&& ok "default policy without a password path: biometry-any, says so" || bad "default policy: $(cat "$T/pol-dflt.err")"
+	AURORA_SEP_SK_TEST_OFFER=3 AURORA_SEP_SK_POLICY=current-set pe cs && grep -q "unusable" "$T/pol-cs.err" \
+		&& ok "current-set policy warns about enrolment changes" || bad "current-set: $(cat "$T/pol-cs.err")"
+	AURORA_SEP_SK_TEST_OFFER=3 AURORA_SEP_SK_POLICY=any pe any && ok "any policy" || bad "any policy: $(cat "$T/pol-any.err")"
+	AURORA_SEP_SK_TEST_OFFER=3 AURORA_SEP_SK_POLICY=presence pe pr \
+		&& bad "presence enrolled although the kernel does not offer it" || ok "presence refused when not offered (no software fallback)"
+	AURORA_SEP_SK_TEST_OFFER=3 AURORA_SEP_SK_POLICY=passcode pe pc \
+		&& bad "passcode enrolled although the kernel does not offer it" || ok "passcode refused when not offered"
+	AURORA_SEP_SK_TEST_OFFER=3 AURORA_SEP_SK_POLICY=bogus pe bg && bad "unknown policy enrolled" || ok "unknown policy refused"
+	AURORA_SEP_SK_TEST_OFFER=15 pe full && ! grep -q "no enclave-checked" "$T/pol-full.err" \
+		&& ok "default is presence when the kernel offers it" || bad "default with presence offered: $(cat "$T/pol-full.err")"
+fi
+
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

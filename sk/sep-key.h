@@ -63,7 +63,12 @@ _Static_assert(sizeof(struct sep_key_public) == 2124, "sep_key_public ABI");
 
 #ifndef SEP_KEY_CREATE_BIOMETRY_CURRENT_SET
 /* Version 2: signing needs a Touch ID match the enclave itself checks. */
-#define SEP_KEY_CREATE_BIOMETRY_CURRENT_SET 0x1
+#define SEP_KEY_CREATE_BIOMETRY_CURRENT_SET 0x1	/* fingers enrolled at creation */
+#endif
+#ifndef SEP_KEY_CREATE_BIOMETRY_ANY
+#define SEP_KEY_CREATE_BIOMETRY_ANY 0x2		/* any enrolled finger, now or later */
+#define SEP_KEY_CREATE_USER_PRESENCE 0x4	/* Touch ID or password (reserved) */
+#define SEP_KEY_CREATE_DEVICE_PASSCODE 0x8	/* password only (reserved) */
 #endif
 
 #define SEP_KEY_DEVICE "/dev/sep-key"

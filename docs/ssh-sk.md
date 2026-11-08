@@ -2,7 +2,7 @@
 
 `libaurora-sep-sk.so` is an OpenSSH security-key provider. It makes `ecdsa-sk` keys whose private key is created
 inside the Mac's Secure Enclave and never leaves it. Every signature is computed by the enclave. It needs an
-Aurora kernel with `/dev/sep-key` (interface version 1).
+Aurora kernel with `/dev/sep-key` (interface version 1; version 2 adds enclave-enforced Touch ID policies).
 
 ## Try it
 
@@ -33,15 +33,43 @@ starting it) and `ssh-add ~/.ssh/id_ecdsa_sep`.
 - Only P-256 (`ecdsa-sk`): the enclave makes no Ed25519 keys. No resident keys: the handle is in the key file. The
   signature counter is always 0 (the enclave keeps none for these keys).
 
-## Touch ID
+## Touch ID and access policies
 
-A key asks for user presence unless it was made with `-O no-touch-required` (as with any security key). Before
-such a signature the provider runs `fprintd-verify` and reports presence only after a match. `-O verify-required`
-keys get the same check and report user verification.
+A key asks for user presence unless it was made with `-O no-touch-required` (as with any security key). On a kernel
+with `/dev/sep-key` version 2 such a key gets an access policy that **the Secure Enclave enforces**, the same ones
+macOS offers through `SecAccessControl`. The kernel runs the Touch ID match inside the signing call; without a
+fresh match the enclave refuses to sign, root included. One touch gives one signature.
 
-**This check runs on the host, not in the enclave.** `/dev/sep-key` version 1 has no access-control policy of its
-own. Root, or anything that can open `/dev/sep-key` with your key file, can sign without a touch. What it does
-guarantee:
+Pick the policy at enrolment with `AURORA_SEP_SK_POLICY`:
+
+| policy | macOS name | who can sign | after you enrol or remove a finger | Linux status |
+|---|---|---|---|---|
+| `presence` (default) | `.userPresence` | Touch ID **or** your password | still works | waits for an enclave-checked password (below) |
+| `any` | `.biometryAny` | any enrolled finger | still works, new fingers too | yes (kernel flag 0x2) |
+| `current-set` | `.biometryCurrentSet` | only the fingers enrolled when the key was made | **the key is dead for good** | yes (kernel flag 0x1) |
+| `passcode` | `.devicePasscode` | your password only | still works | waits for an enclave-checked password |
+
+    AURORA_SEP_SK_POLICY=current-set ssh-keygen -t ecdsa-sk -w /usr/lib64/libaurora-sep-sk.so -f ~/.ssh/id_ecdsa_sep
+
+The default is `presence`, as on macOS. Until the kernel offers it, the default makes an `any` key and says so. An
+explicit policy the kernel does not offer fails the enrolment; there is no software fallback.
+
+**Why no password yet.** On macOS the enclave checks the password itself against your keychain's key bag, so root
+cannot fake it. On Linux the only "passcode" the enclave knows today is the secret of the Linux identity key bag,
+which root holds. A password path built on it would be root-satisfiable, and checking the password in software would
+be too, so neither is offered under the macOS name. It comes with per-user password-keyed key bags.
+
+**Lockout.** After five failed matches Touch ID locks out (as on macOS) and touch-gated keys refuse (`EACCES`) until
+Touch ID is unlocked again. On macOS the password is the way back in; with `any`/`current-set` keys on Linux, keep a
+second way in.
+
+**Keep a backup key.** No Secure Enclave key can be exported, copied or recovered: a lost Mac, a reinstalled Linux or
+(for `current-set`) a changed finger means a lost key. Do what you would do with a hardware security key: make a
+second key (another Mac, a FIDO key, or an ordinary key kept offline) and add it to `authorized_keys` next to this one.
+
+On a version 1 kernel the provider falls back to running `fprintd-verify` before each signature. **That check runs on
+the host, not in the enclave**: root, or anything that can open `/dev/sep-key` with your key file, can sign without a
+touch. What it still guarantees:
 
 | | this provider (sep-key v1) | the earlier sealed key (`aurora-sep-ssh`) |
 |---|---|---|
@@ -49,9 +77,6 @@ guarantee:
 | Key file or backup usable on another machine | no | no |
 | Signing after the attacker loses access to this Mac | no | yes, with a copied key |
 | Signing without a touch, by root | yes | yes |
-
-Signing without a touch stops being possible once the kernel adds an enclave-enforced biometric policy (planned
-`/dev/sep-key` flag): then the enclave itself refuses to sign without a fresh match.
 
 `AURORA_SEP_SK_PRESENCE=deny` refuses every signature that asks for presence (for tests). `AURORA_SEP_SK_DEBUG=1`
 prints what the provider does. `AURORA_SEP_SK_DEVICE` overrides `/dev/sep-key` (tests).
@@ -66,5 +91,6 @@ capability on this Mac: keep the key file private, as with any SSH key.
 
 `make -C sk check` runs the OpenSSH flow against a test build in which software P-256 keys stand in for the enclave:
 enrol, `ssh-keygen -Y sign/verify`, tampered message, distinct keys, presence denied and stubbed, rejected handle,
-Ed25519 and resident keys refused, `git commit -S` + `verify-commit`, and an ssh login through a private `sshd -i`.
+Ed25519 and resident keys refused, `git commit -S` + `verify-commit`, an ssh login through a private `sshd -i`, and
+the policy choice.
 `sk/tests/test-sk.sh <real provider> hw` runs the same against the enclave (no finger: only no-touch-required keys sign).

@@ -16,12 +16,21 @@
  * The enclave signs that outer digest.
  *
  * User presence: on a kernel with /dev/sep-key version 2, a key that asks for
- * presence or verification (the default for ecdsa-sk keys) is made with
- * SEP_KEY_CREATE_BIOMETRY_CURRENT_SET. The enclave then refuses every
- * signature without a fresh Touch ID match of a currently enrolled finger,
- * which the kernel runs inside the sign call. On a version 1 kernel the
- * provider falls back to asking fprintd-verify on the host, which root can
- * bypass. docs/ssh-sk.md has the details.
+ * presence or verification (the default for ecdsa-sk keys) gets an access
+ * policy the enclave enforces, as macOS's SecAccessControl flags do. The
+ * enclave then refuses every signature without a fresh Touch ID match, which
+ * the kernel runs inside the sign call. AURORA_SEP_SK_POLICY at enrolment
+ * picks the policy:
+ *   presence     Touch ID or the password (.userPresence; the default). Until
+ *                the kernel offers it, the provider makes a biometry-any key
+ *                and says so.
+ *   any          any enrolled finger, now or later (.biometryAny)
+ *   current-set  only the fingers enrolled now (.biometryCurrentSet);
+ *                enrolling or removing a finger makes the key unusable
+ *   passcode     the password only (.devicePasscode)
+ * An explicit policy the kernel does not offer fails the enrolment. On a
+ * version 1 kernel the provider falls back to asking fprintd-verify on the
+ * host, which root can bypass. docs/ssh-sk.md has the details.
  */
 
 #include <errno.h>
@@ -212,9 +221,12 @@ out:
 /* Test handle: "TSTK" || private scalar (32) || public point (65). Never shipped. */
 #define TEST_HANDLE_LEN (4 + 32 + SEP_KEY_PUB_LEN)
 
+/* Test only: pretend the kernel offers these SEP_KEY_CREATE_* bits. */
 static uint32_t backend_create_flags(void)
 {
-	return 0;
+	const char *o = getenv("AURORA_SEP_SK_TEST_OFFER");
+
+	return o ? (uint32_t)strtoul(o, NULL, 0) : 0;
 }
 
 static int backend_create(uint8_t pub[SEP_KEY_PUB_LEN], uint8_t **handle, size_t *handle_len,
@@ -397,6 +409,51 @@ SK_EXPORT uint32_t sk_api_version(void)
 	return SSH_SK_VERSION_MAJOR;
 }
 
+/*
+ * The SEP_KEY_CREATE_* policy for a key that wants presence, from
+ * AURORA_SEP_SK_POLICY and what the kernel offers. Returns 0 (no enclave
+ * policy: version 1 kernel) or the flag; -1 for an unknown or unavailable
+ * explicit policy.
+ */
+static int64_t choose_policy(uint32_t offered)
+{
+	const char *p = getenv("AURORA_SEP_SK_POLICY");
+	static const struct { const char *name; uint32_t flag; const char *what; } tab[] = {
+		{ "presence", SEP_KEY_CREATE_USER_PRESENCE, "Touch ID or password" },
+		{ "any", SEP_KEY_CREATE_BIOMETRY_ANY, "any enrolled finger" },
+		{ "current-set", SEP_KEY_CREATE_BIOMETRY_CURRENT_SET, "the fingers enrolled now" },
+		{ "passcode", SEP_KEY_CREATE_DEVICE_PASSCODE, "password only" },
+	};
+	size_t i;
+
+	if (!offered)
+		return 0;
+	if (!p || !*p) {
+		if (offered & SEP_KEY_CREATE_USER_PRESENCE)
+			return SEP_KEY_CREATE_USER_PRESENCE;
+		if (offered & SEP_KEY_CREATE_BIOMETRY_ANY) {
+			say("this kernel has no enclave-checked password fallback yet: the key needs Touch ID "
+			    "(any enrolled finger). Keep a backup key.");
+			return SEP_KEY_CREATE_BIOMETRY_ANY;
+		}
+		return offered & SEP_KEY_CREATE_BIOMETRY_CURRENT_SET;
+	}
+	for (i = 0; i < sizeof(tab) / sizeof(tab[0]); i++) {
+		if (strcmp(p, tab[i].name) != 0)
+			continue;
+		if (!(offered & tab[i].flag)) {
+			say("AURORA_SEP_SK_POLICY=%s (%s) is not offered by this kernel", p, tab[i].what);
+			return -1;
+		}
+		if (tab[i].flag == SEP_KEY_CREATE_BIOMETRY_CURRENT_SET)
+			say("current-set key: enrolling or removing any finger makes this key unusable "
+			    "for good. Keep a backup key.");
+		return tab[i].flag;
+	}
+	say("AURORA_SEP_SK_POLICY=%s: use presence, any, current-set or passcode", p);
+	return -1;
+}
+
 SK_EXPORT int sk_enroll(uint32_t alg, const uint8_t *challenge, size_t challenge_len,
 			const char *application, uint8_t flags, const char *pin,
 			struct sk_option **options, struct sk_enroll_response **enroll_response)
@@ -404,6 +461,7 @@ SK_EXPORT int sk_enroll(uint32_t alg, const uint8_t *challenge, size_t challenge
 	struct sk_enroll_response *resp;
 	uint8_t pub[SEP_KEY_PUB_LEN];
 	uint32_t kflags;
+	int64_t policy;
 	int ret;
 
 	(void)challenge;
@@ -421,17 +479,20 @@ SK_EXPORT int sk_enroll(uint32_t alg, const uint8_t *challenge, size_t challenge
 		say("resident keys are not supported; the key handle lives in the key file");
 		return SSH_SK_ERR_UNSUPPORTED;
 	}
+	/*
+	 * A key that wants presence or verification gets an enclave-enforced
+	 * policy when the kernel offers one.
+	 */
+	kflags = 0;
+	if (flags & (SSH_SK_USER_PRESENCE_REQD | SSH_SK_USER_VERIFICATION_REQD)) {
+		policy = choose_policy(backend_create_flags());
+		if (policy < 0)
+			return SSH_SK_ERR_UNSUPPORTED;
+		kflags = (uint32_t)policy;
+	}
 	resp = calloc(1, sizeof(*resp));
 	if (!resp)
 		return SSH_SK_ERR_GENERAL;
-	/*
-	 * A key that wants presence or verification gets the enclave-enforced
-	 * Touch ID policy when the kernel offers it.
-	 */
-	kflags = 0;
-	if ((flags & (SSH_SK_USER_PRESENCE_REQD | SSH_SK_USER_VERIFICATION_REQD)) &&
-	    (backend_create_flags() & SEP_KEY_CREATE_BIOMETRY_CURRENT_SET))
-		kflags = SEP_KEY_CREATE_BIOMETRY_CURRENT_SET;
 	ret = backend_create(pub, &resp->key_handle, &resp->key_handle_len, kflags);
 	if (ret != 0) {
 		free(resp);
@@ -447,9 +508,8 @@ SK_EXPORT int sk_enroll(uint32_t alg, const uint8_t *challenge, size_t challenge
 	resp->public_key_len = SEP_KEY_PUB_LEN;
 	/* What every signature will ask for: presence and/or verification. */
 	resp->flags = flags & (SSH_SK_USER_PRESENCE_REQD | SSH_SK_USER_VERIFICATION_REQD);
-	dbg("enrolled %s, handle %zu bytes, flags 0x%02x, %s", application,
-	    resp->key_handle_len, resp->flags,
-	    kflags ? "Touch ID enforced by the Secure Enclave" : "no enclave policy");
+	dbg("enrolled %s, handle %zu bytes, flags 0x%02x, enclave policy 0x%x", application,
+	    resp->key_handle_len, resp->flags, kflags);
 	*enroll_response = resp;
 	return 0;
 }
