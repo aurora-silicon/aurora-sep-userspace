@@ -354,6 +354,20 @@ class FprintdVerifier(Verifier):
 POLKIT_ACTION = "org.aurora.fido.authenticate"
 
 
+def session_leader(sid):
+    """(pid, start time in clock ticks) of the session's leader, or None."""
+    try:
+        pid = int(subprocess.run(
+            ["loginctl", "show-session", sid, "-p", "Leader", "--value"],
+            capture_output=True, text=True, timeout=5).stdout.strip())
+        with open(f"/proc/{pid}/stat") as f:
+            stat = f.read()
+        # Fields after the ")" of comm: state is field 3, starttime field 22.
+        return pid, int(stat.rsplit(")", 1)[1].split()[19])
+    except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+        return None
+
+
 class PolkitPassword:
     """The user's password through the polkit agent of the seat0 session."""
 
@@ -374,7 +388,15 @@ class PolkitPassword:
         done = []
         try:
             bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
-            subject = ("unix-session", {"session-id": GLib.Variant("s", sid)})
+            # A unix-process subject (the session leader): polkitd's rules
+            # engine aborts on unix-session subjects (polkit 127, push_subject).
+            leader = session_leader(sid)
+            if leader is None:
+                return UNAVAILABLE
+            pid, start = leader
+            subject = ("unix-process", {"pid": GLib.Variant("u", pid),
+                                        "start-time": GLib.Variant("t", start),
+                                        "uid": GLib.Variant("i", _uid)})
             details = {"polkit.message": f"Use your password: {prompt.title()}",
                        "aurora.fido.rp": display_rp(prompt.rp)}
             log.info("asking %s for the password: %s", user, prompt.title())
