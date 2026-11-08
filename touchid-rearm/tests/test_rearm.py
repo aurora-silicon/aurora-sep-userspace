@@ -242,13 +242,22 @@ class BootTest(unittest.TestCase):
     def state(self):
         return self.device.read_text().strip()
 
-    def test_default_is_touch_id_from_the_first_login(self):
+    def test_default_waits_for_the_password_as_macos(self):
+        # No file, as macOS after a restart.
         out = self.run_helper('--boot')
         self.assertEqual(out.returncode, 0)
-        self.assertEqual(self.state(), 'unlocked 0 1')
+        self.assertEqual(self.state(), 'required')
+        self.assertIn('password after boot: yes', self.run_helper('--status').stdout)
+
+    def test_shipped_file_keeps_the_default(self):
+        self.conf.write_text((Path(__file__).resolve().parent.parent / 'touchid.conf').read_text())
+        self.assertEqual(self.run_helper('--boot').returncode, 0)
+        self.assertEqual(self.state(), 'required')
+
+    def test_missing_key_keeps_the_default(self):
         self.conf.write_text('# nothing set\n')
         self.assertEqual(self.run_helper('--boot').returncode, 0)
-        self.assertEqual(self.state(), 'unlocked 0 1')
+        self.assertEqual(self.state(), 'required')
 
     def test_no_keeps_touch_id_from_the_first_login(self):
         self.conf.write_text('require_password_after_boot = no\n')

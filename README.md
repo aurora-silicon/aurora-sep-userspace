@@ -64,7 +64,8 @@ the password again before it asks the driver to re-arm. See
 [touchid-rearm/README.md](touchid-rearm/README.md). `make -C touchid-rearm check`
 tests it against real libpam stacks.
 It also applies the "Touch ID after a restart" setting (`/etc/aurora/touchid.conf`,
-`require_password_after_boot`).
+`require_password_after_boot`): by default, as on macOS, the first login or unlock
+after boot needs the password; `no` gives Touch ID from the first login.
 
 ## SEP-sealed LUKS2 unlock
 

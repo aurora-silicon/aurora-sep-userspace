@@ -55,14 +55,18 @@ rebooting with the same `apple_sep.os_uuid_hi/lo` identity.
 ## Touch ID after a restart
 
 macOS does not take Touch ID after a restart until the password has been
-entered once. Here that is a choice, in `/etc/aurora/touchid.conf`:
+entered once, and neither does Aurora by default. The login screen, lock
+screen or `sudo` then says "Your password is required to enable Touch ID."
+and asks for the password; Touch ID works after it. To have Touch ID from
+the first login instead, set it in `/etc/aurora/touchid.conf`:
 
-    # no (default): Touch ID works from the first login after boot.
-    # yes: the first login or unlock after boot needs the password.
+    # yes (default, also when the line is missing): the first login or
+    #      unlock after boot needs the password, as on macOS.
+    # no:  Touch ID works from the first login after boot.
     require_password_after_boot = no
 
 `aurora-touchid-boot.service` reads it once per boot, before the display
-manager, user sessions and fprintd start. With `yes` it runs
+manager, user sessions and fprintd start. With `yes` (or no setting) it runs
 `aurora-touchid-rearm --boot`, which asks the driver
 (`SEP_BIO_REQUIRE_PASSWORD`) to refuse every verify, without a capture,
 until the first password authentication; that password reaches the driver
@@ -108,7 +112,7 @@ module goes after the last auth line.
 | `pam_aurora_touchid.c` | `pam_aurora_touchid.so` in the PAM module directory |
 | `aurora-touchid-rearm.c` | `/usr/libexec/aurora-touchid-rearm` |
 | `aurora-touchid-rearm.socket`, `aurora-touchid-rearm@.service` | systemd units; enable the socket |
-| `aurora-touchid-boot.service` | systemd unit; enable it (it does nothing with the default setting) |
+| `aurora-touchid-boot.service` | systemd unit; enable it (without it Touch ID works from the first login whatever the setting) |
 | `touchid.conf` | `/etc/aurora/touchid.conf` |
 | `aurora-touchid-rearm.pam` | `/usr/lib/pam.d/aurora-touchid-rearm` (or `/etc/pam.d`) |
 | `rearm-proto.h` | the request and answer format |
