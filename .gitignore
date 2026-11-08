@@ -1,3 +1,9 @@
 /luks/libcryptsetup-token-aurora-sep.so
 /luks/aurora-sep-cryptenroll
 /luks/test/
+/fido/aurora-fido-seal
+/fido/aurora-fidod
+/fido/aurora-fido.service.out
+/fido/test/
+__pycache__/
+/fido/aurora-fido
