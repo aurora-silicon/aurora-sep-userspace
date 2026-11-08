@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SPDX-License-Identifier: MIT -->
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <vendor>Aurora Silicon</vendor>
+  <vendor_url>https://github.com/aurora-silicon/aurora-sep-userspace</vendor_url>
+  <!-- aurora-fidod asks this for a security-key request made under the
+       touchid-or-password policy when Touch ID did not match, is locked out
+       or is unavailable: the user's own password, asked every time (never kept). -->
+  <action id="org.aurora.fido.authenticate">
+    <description>Approve a security key request with your password</description>
+    <message>Touch ID did not work. Enter your password to approve the security key request.</message>
+    <icon_name>auth-fingerprint-symbolic</icon_name>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_self</allow_active>
+    </defaults>
+  </action>
+</policyconfig>
