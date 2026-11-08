@@ -1,12 +1,13 @@
 Name:		fprintd
 Version:	1.94.5
-Release:	99%{?dist}.aurora1
+Release:	99%{?dist}.aurora2
 Summary:	D-Bus service for Fingerprint reader access
 
 # man page is GFDL-1.1-or-later
 License:	GPL-2.0-or-later AND GFDL-1.1-or-later
 Source0:	https://gitlab.freedesktop.org/libfprint/fprintd/-/archive/v%{version}/fprintd-v%{version}.tar.gz
 Patch0:	0001-preserve-print-on-device-delete-failure.patch
+Patch1:	0002-report-lockout-and-fall-back-to-the-password.patch
 Source1:	test_account_gate.py
 Url:		http://www.freedesktop.org/wiki/Software/fprint/fprintd
 
@@ -27,6 +28,7 @@ BuildRequires:	python3-dbusmock
 BuildRequires:	python3-libpamtest
 Provides:	fprintd(aurora-sep) = 1
 Requires:	libfprint(aurora-sep) >= 5
+Requires:	libfprint(aurora-sep-lockout)
 
 
 %description
@@ -64,6 +66,13 @@ fingerprint readers access.
 %autosetup -S git -n %{name}-v%{version}
 
 %build
+# 0002 needs FP_DEVICE_ERROR_LOCKED_OUT (0x102 in libfprint aurora10's 0008).
+# Build against any libfprint-devel, as the per-package CI does with stock
+# headers; at run time the Requires below brings in the libfprint that
+# reports it.
+if ! grep -q FP_DEVICE_ERROR_LOCKED_OUT %{_includedir}/libfprint-2/fp-device.h; then
+  export CFLAGS="%{optflags} -DFP_DEVICE_ERROR_LOCKED_OUT=0x102"
+fi
 %meson -Dgtk_doc=true -Dpam=true -Dpam_modules_dir=%{_libdir}/security
 %meson_build
 
@@ -105,5 +114,9 @@ fi
 %{_datadir}/dbus-1/interfaces/net.reactivated.Fprint.Manager.xml
 
 %changelog
+* Sun Nov 08 2026 Ryan Murray <ryan@aurorasilicon.org> - 1.94.5-99.aurora2
+- Report a reader lockout as verify-lockout; pam_fprintd then asks for the
+  password at once
+
 * Tue Oct 27 2026 Aurora Silicon contributors - 1.94.5-99.aurora1
 - Keep local fingerprint records when deletion from the device fails
