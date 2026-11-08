@@ -17,6 +17,10 @@ and user verification are the same touch. fprintd does the match, as it does
 for sudo and the login screen. fprintd itself only answers "this finger
 matches"; it cannot act as a security key, which is why this daemon exists.
 
+Credit: the idea of presenting the Secure Enclave and Touch ID as a built-in
+security key came from Erik ([@erikwb](https://github.com/erikwb)) on the
+Aurora Discord.
+
 ## How it works
 
 | piece | what it does |
