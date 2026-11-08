@@ -164,8 +164,15 @@ class Notifier:
     def show(self, uid, title, body, timeout_s):
         if not self.enabled or uid is None:
             return None
-        if not os.path.exists(f"/run/user/{uid}/bus"):
+        # The unit's capability bounding set has no CAP_DAC_*, so root cannot
+        # look inside /run/user/<uid> (0700): only a clear "no such file" skips.
+        try:
+            os.stat(f"/run/user/{uid}/bus")
+        except FileNotFoundError:
+            log.info("no session bus for uid %d; no notification", uid)
             return None
+        except OSError:
+            pass
         try:
             r = self._as_user(uid, [
                 "notify-send", "--print-id", "--app-name=Touch ID",
@@ -174,12 +181,12 @@ class Notifier:
                 "--hint=int:transient:1", title, html.escape(body)])
             nid = r.stdout.strip()
             if r.returncode != 0 or not nid.isdigit():
-                log.debug("notify-send failed: %s", r.stderr.strip())
+                log.warning("notification for uid %d failed: %s", uid, r.stderr.strip())
                 return None
-            log.debug("notification %s shown to uid %d", nid, uid)
+            log.info("notification %s shown to uid %d", nid, uid)
             return uid, int(nid)
         except (OSError, subprocess.SubprocessError, KeyError, ValueError) as e:
-            log.debug("notification failed: %s", e)
+            log.warning("notification for uid %d failed: %s", uid, e)
             return None
 
     def close(self, handle):
@@ -354,17 +361,41 @@ class FprintdVerifier(Verifier):
 POLKIT_ACTION = "org.aurora.fido.authenticate"
 
 
-def session_leader(sid):
-    """(pid, start time in clock ticks) of the session's leader, or None."""
+def _start_time(pid, proc="/proc"):
+    with open(f"{proc}/{pid}/stat") as f:
+        stat = f.read()
+    # Fields after the ")" of comm: state is field 3, starttime field 22.
+    return int(stat.rsplit(")", 1)[1].split()[19])
+
+
+def session_process(sid, uid, proc="/proc"):
+    """(pid, start time) of the user's own oldest process in session sid, or None.
+
+    polkit authenticates the subject's user and finds the agent from the
+    subject's session, so the subject must be a process of uid inside the
+    session's scope (the leader is gdm's root session worker).
+    """
+    scope = f"/session-{sid}.scope"
+    best = None
+    for name in os.listdir(proc):
+        if not name.isdigit():
+            continue
+        try:
+            with open(f"{proc}/{name}/cgroup") as f:
+                if scope not in f.read():
+                    continue
+            if os.stat(f"{proc}/{name}").st_uid != uid:
+                continue
+            pid = int(name)
+            if best is None or pid < best:
+                best = pid
+        except OSError:
+            continue
+    if best is None:
+        return None
     try:
-        pid = int(subprocess.run(
-            ["loginctl", "show-session", sid, "-p", "Leader", "--value"],
-            capture_output=True, text=True, timeout=5).stdout.strip())
-        with open(f"/proc/{pid}/stat") as f:
-            stat = f.read()
-        # Fields after the ")" of comm: state is field 3, starttime field 22.
-        return pid, int(stat.rsplit(")", 1)[1].split()[19])
-    except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+        return best, _start_time(best, proc)
+    except (OSError, ValueError, IndexError):
         return None
 
 
@@ -388,12 +419,14 @@ class PolkitPassword:
         done = []
         try:
             bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
-            # A unix-process subject (the session leader): polkitd's rules
-            # engine aborts on unix-session subjects (polkit 127, push_subject).
-            leader = session_leader(sid)
-            if leader is None:
+            # A unix-process subject (the user's process in the session):
+            # polkitd's rules engine aborts on unix-session subjects (polkit
+            # 127, push_subject).
+            sub = session_process(sid, _uid)
+            if sub is None:
+                log.warning("no process of %s in session %s for the password dialog", user, sid)
                 return UNAVAILABLE
-            pid, start = leader
+            pid, start = sub
             subject = ("unix-process", {"pid": GLib.Variant("u", pid),
                                         "start-time": GLib.Variant("t", start),
                                         "uid": GLib.Variant("i", _uid)})

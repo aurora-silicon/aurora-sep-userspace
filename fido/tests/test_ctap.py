@@ -1133,6 +1133,48 @@ class PolicyTest(unittest.TestCase):
             daemon.policy_of(cfg)
 
 
+class SessionTest(unittest.TestCase):
+    def test_polkit_subject_is_the_users_process_in_the_session(self):
+        tmp = tempfile.TemporaryDirectory()
+        try:
+            me = os.getuid()
+            def proc(pid, cgroup, start):
+                d = os.path.join(tmp.name, str(pid))
+                os.makedirs(d)
+                with open(os.path.join(d, "cgroup"), "w") as f:
+                    f.write(cgroup)
+                with open(os.path.join(d, "stat"), "w") as f:
+                    f.write(f"{pid} (a b) S " + " ".join(["0"] * 18) + f" {start} 0\n")
+            proc(900, "0::/user.slice/user-1000.slice/user@1000.service/app.slice\n", 5)
+            proc(1279, "0::/user.slice/user-1000.slice/session-1.scope\n", 1018)
+            proc(2000, "0::/user.slice/user-1000.slice/session-1.scope\n", 3000)
+            proc(1500, "0::/user.slice/user-1000.slice/session-12.scope\n", 7)
+            os.makedirs(os.path.join(tmp.name, "self"))
+            self.assertEqual(touchid.session_process("1", me, tmp.name), (1279, 1018))
+            self.assertEqual(touchid.session_process("12", me, tmp.name), (1500, 7))
+            self.assertIsNone(touchid.session_process("1", me + 1, tmp.name))
+            self.assertIsNone(touchid.session_process("3", me, tmp.name))
+        finally:
+            tmp.cleanup()
+
+    def test_notifier_tries_when_the_bus_is_not_visible_to_root(self):
+        n = touchid.Notifier(True)
+        calls = []
+        n._as_user = lambda uid, argv: calls.append(argv) or type(
+            "R", (), {"returncode": 0, "stdout": "7\n", "stderr": ""})()
+        real = os.stat
+        def fake_stat(path, *a, **k):
+            if str(path).startswith("/run/user/"):
+                raise PermissionError(13, "denied")
+            return real(path, *a, **k)
+        os.stat = fake_stat
+        try:
+            self.assertEqual(n.show(4242, "t", "b", 3), (4242, 7))
+        finally:
+            os.stat = real
+        self.assertEqual(calls[0][0], "notify-send")
+
+
 class PolicyVerifierTest(unittest.TestCase):
     def test_password_only_behind_a_failed_touch_and_only_if_allowed(self):
         touch, pw = StubVerifier(touchid.NO_MATCH), StubVerifier(touchid.MATCH)
