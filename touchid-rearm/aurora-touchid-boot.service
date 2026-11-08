@@ -2,8 +2,11 @@
 [Unit]
 Description=Touch ID after a restart (require_password_after_boot)
 Documentation=file:///usr/share/doc/aurora-touchid-rearm/README.md
-# Before the first login can offer Touch ID: the greeter, text logins and
-# fprintd itself.
+# After the Secure Enclave driver is up and has restored the fingerprints
+# (aurora-sep-ready.service, from the distribution's aurora-sep package), and
+# before anything can offer Touch ID: fprintd, the greeter, text logins.
+Wants=aurora-sep-ready.service
+After=aurora-sep-ready.service
 Before=display-manager.service systemd-user-sessions.service fprintd.service
 
 [Service]
