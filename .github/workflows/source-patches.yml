@@ -75,6 +75,22 @@ jobs:
       - name: Shell syntax
         run: sh -n luks/tests/hw-loop-test.sh && sh -n luks/tests/test-luks.sh
 
+  sk-provider:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build and test dependencies
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkgconf openssh-client openssh-server git
+      - name: Build and test the OpenSSH provider (software keys stand in for the SEP)
+        run: |
+          make -C sk
+          make -C sk check
+          make -C sk install DESTDIR=$PWD/dest
+          test -f dest/usr/lib/libaurora-sep-sk.so
+          test -f dest/usr/lib/udev/rules.d/70-aurora-sep-key.rules
+      - name: Shell syntax
+        run: sh -n sk/tests/test-sk.sh
+
   luks-token-fedora:
     runs-on: ubuntu-latest
     container: fedora:45

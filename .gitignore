@@ -1,3 +1,5 @@
 /luks/libcryptsetup-token-aurora-sep.so
 /luks/aurora-sep-cryptenroll
 /luks/test/
+sk/libaurora-sep-sk.so
+sk/test/

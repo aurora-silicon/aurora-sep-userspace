@@ -1,0 +1,3 @@
+# /dev/sep-key: Secure Enclave P-256 keys. Members of sep-key may create keys
+# and sign with handles they hold (interface v1 has no enclave-side policy).
+KERNEL=="sep-key", SUBSYSTEM=="misc", GROUP="sep-key", MODE="0660"
