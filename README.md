@@ -1,7 +1,8 @@
 # aurora-sep-userspace
 
-Fedora packaging of libfprint for Apple Touch ID on Aurora Silicon kernels, and
-SEP-sealed LUKS2 unlock (`luks/`).
+Fedora packaging of libfprint for Apple Touch ID on Aurora Silicon kernels,
+SEP-sealed LUKS2 unlock (`luks/`), and an OpenSSH security-key provider for keys that live in the
+Secure Enclave (`sk/`, [docs/ssh-sk.md](docs/ssh-sk.md)).
 
 The kernel side is the `apple_sep` driver in
 [aurora-silicon/linux](https://github.com/aurora-silicon/linux) (`aurora-wip`).

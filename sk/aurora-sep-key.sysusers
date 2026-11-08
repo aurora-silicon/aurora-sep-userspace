@@ -1,0 +1,2 @@
+# Users allowed to use Secure Enclave keys (/dev/sep-key).
+g sep-key -
