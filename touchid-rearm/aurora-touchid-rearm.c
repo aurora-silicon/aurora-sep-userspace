@@ -30,8 +30,9 @@
  *            login. With "require_password_after_boot = yes" in
  *            /etc/aurora/touchid.conf it asks the driver to refuse Touch ID
  *            until the first password since boot (SEP_BIO_REQUIRE_PASSWORD),
- *            as macOS does after a restart. The default, "no", leaves Touch
- *            ID working from the first login.
+ *            as macOS does after a restart. That is the default, also when
+ *            the file or the key is missing; "no" leaves Touch ID working
+ *            from the first login.
  *  --status  prints what the driver reports: locked or not, why, and the
  *            failed matches since the last match or password.
  */
@@ -456,19 +457,20 @@ static int serve(char *req, size_t len, uid_t peer)
 }
 
 /*
- * The value of "require_password_after_boot" in the configuration: 0 for no
- * (also when the file or the key is missing), 1 for yes, -1 when the file
- * says something else, which --boot treats as yes: a setting meant to
- * tighten Touch ID must not loosen it by a typo.
+ * The value of "require_password_after_boot" in the configuration: 1 for yes
+ * (also when the file or the key is missing: macOS's behaviour is the
+ * default), 0 for no, -1 when the file says something else, which --boot
+ * treats as yes: a setting meant to tighten Touch ID must not loosen it by a
+ * typo.
  */
 static int conf_require_password(void)
 {
 	char line[256];
-	int value = 0;
+	int value = 1;
 	FILE *f = fopen(conf_file(), "r");
 
 	if (!f)
-		return 0;
+		return 1;
 	while (fgets(line, sizeof(line), f)) {
 		char *p = line, *key, *val, *end;
 
