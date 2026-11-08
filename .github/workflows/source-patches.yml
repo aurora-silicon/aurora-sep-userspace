@@ -107,7 +107,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y python3-cryptography fido2-tools libfido2-1 openssh-client \
-            libpam-u2f pamu2fcfg pamtester cryptsetup-bin systemd-cryptsetup
+            libpam-u2f pamu2fcfg pamtester cryptsetup-bin
+          # systemd-cryptenroll and its FIDO2 token plugin: in 'systemd' on noble, split out later.
+          sudo apt-get install -y systemd-cryptsetup || true
       - name: Unit tests (software keys, scripted Touch ID)
         run: make -C fido check
       - name: uhid device with libfido2, OpenSSH, pam_u2f and systemd-cryptenroll

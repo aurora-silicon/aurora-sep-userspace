@@ -164,9 +164,17 @@ if command -v systemd-cryptenroll >/dev/null && command -v cryptsetup >/dev/null
 		if PASSWORD=test-passphrase systemd-cryptenroll --fido2-device="$dev" \
 			--fido2-with-client-pin=no "$loopdev" >"$work/enroll.out" 2>&1 </dev/null; then
 			ok "systemd-cryptenroll --fido2-device"
-			if cryptsetup open --token-only "$loopdev" aurora-fido-test 2>"$work/err" </dev/null; then
-				ok "LUKS2 volume opens with the security key (systemd-fido2 token)"
+			plugin=$(find /usr/lib /usr/lib64 -name libcryptsetup-token-systemd-fido2.so 2>/dev/null | head -1)
+			attach=$(find /usr/lib/systemd /lib/systemd -maxdepth 1 -name systemd-cryptsetup 2>/dev/null | head -1)
+			if [ -n "$plugin" ] && cryptsetup open --token-only "$loopdev" aurora-fido-test 2>"$work/err" </dev/null; then
+				ok "LUKS2 volume opens with the security key (cryptsetup, systemd-fido2 token)"
 				cryptsetup close aurora-fido-test
+			elif [ -n "$attach" ] && "$attach" attach aurora-fido-test "$loopdev" - \
+				"fido2-device=$dev,headless=true" >>"$work/err" 2>&1 </dev/null; then
+				ok "LUKS2 volume opens with the security key (systemd-cryptsetup attach)"
+				cryptsetup close aurora-fido-test
+			elif [ -z "$plugin" ] && [ -z "$attach" ]; then
+				sk "no systemd FIDO2 token plugin or systemd-cryptsetup to open the volume"
 			else
 				no "token open: $(cat "$work/err")"
 			fi
