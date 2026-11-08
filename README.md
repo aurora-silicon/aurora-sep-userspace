@@ -1,6 +1,7 @@
 # aurora-sep-userspace
 
-Fedora packaging of libfprint for Apple Touch ID on Aurora Silicon kernels.
+Fedora packaging of libfprint for Apple Touch ID on Aurora Silicon kernels, and
+SEP-sealed LUKS2 unlock (`luks/`).
 
 The kernel side is the `apple_sep` driver in
 [aurora-silicon/linux](https://github.com/aurora-silicon/linux) (`aurora-wip`).
@@ -14,7 +15,7 @@ It is developed on the MacBook Neo (J700, A18 Pro).
 ## What is here
 
 `libfprint/` holds Fedora's `libfprint-1.94.100-1.fc45` spec, rebuilt as
-`libfprint-1.94.100-1.fc45.aurora7` with the `aurora` driver. The build replaces
+`libfprint-1.94.100-1.fc45.aurora9` with the `aurora` driver. The build replaces
 Fedora's libfprint in place, so fprintd needs no `LD_LIBRARY_PATH` and nothing is
 installed under `/usr/local`. The package provides both `libfprint(aurora-sep) = 4` and `= 5`.
 
@@ -25,8 +26,9 @@ installed under `/usr/local`. The package provides both `libfprint(aurora-sep) =
 | `0002-aurora-report-unusable-captures-as-retries.patch` | reports unusable captures (kernel status RETRY) as libfprint retries during enrolment, verify and identify, so fprintd asks for another touch; fails a rejected enrolment with a reason |
 | `0003-hide-lid-covered-readers-while-the-lid-is-closed.patch` | the Touch ID sensor is in the power button, which a closed lid covers: libfprint drops the reader while the lid is closed and probes it again when it opens (details below) |
 | `0004-aurora-refuse-unbound-enrollment.patch` | resolves the Unix account and finger, prepares an empty Linux owner context, maps persistence refusals, avoids full-slot garbage collection, and logs single-verify and identify-gallery UUID mismatches |
+| `0007-aurora-name-retry-causes-and-keep-waiting.patch` | maps the kernel's retry cause (`guidance` next to a retry: CENTER, TOO_FAST, CLEAN, LIFT_AND_MOVE) onto `FP_DEVICE_RETRY_CENTER_FINGER`, `_TOO_FAST`, `_REMOVE_FINGER`, so fprintd shows a specific prompt; starts the match again silently after a no-finger capture timeout (>= 5 s), as a macOS prompt keeps waiting |
+| `0006-aurora-report-finger-lift-and-lockout.patch` | reports `SEP_BIO_GUIDANCE_LIFT` (the last touch's finger is still down; the kernel arms the next capture when it is lifted) as finger present, and names the Touch ID lockout status (8) in failures |
 | `0005-aurora-support-v4-and-v5.patch` | accepts only v4 and v5, uses the 136-byte legacy enrol request on v4 and the 144-byte account-bound request plus PREPARE_ENROL on v5; v5 errors never fall back to v4 |
-| `0006-aurora-report-the-touch-id-lockout.patch` | adds `FP_DEVICE_ERROR_LOCKED_OUT` and reports the kernel's Touch ID lockout (status LOCKOUT) with it, so fprintd sends the user to the password instead of retrying |
 | `aurora_fprintd_lid.te` | SELinux policy permitting fprintd to read the lid switch |
 | `fprintd-aurora-touchid.conf` | fprintd drop-in: `DeviceAllow=/dev/sep-bio rw` for the reader, and `DeviceAllow=char-input r` so libfprint can read the lid switch (a deliberate widening: fprintd can read every input device) |
 | `apple-sep.h` | a build-time copy of the kernel UAPI header, because distribution kernel headers do not ship it yet |
@@ -61,6 +63,26 @@ macOS does: a PAM module straight after pam_unix and a root service that checks
 the password again before it asks the driver to re-arm. See
 [touchid-rearm/README.md](touchid-rearm/README.md). `make -C touchid-rearm check`
 tests it against real libpam stacks.
+It also applies the "Touch ID after a restart" setting (`/etc/aurora/touchid.conf`,
+`require_password_after_boot`).
+
+## SEP-sealed LUKS2 unlock
+
+`luks/` holds `aurora-sep-cryptenroll` and the libcryptsetup token plugin
+`libcryptsetup-token-aurora-sep.so`. Together they unlock a LUKS2 volume with
+this Mac's Secure Enclave, the way `systemd-cryptenroll --tpm2-device=auto`
+does with a TPM, and keep the passphrase keyslot for recovery. The keyslot
+secret is wrapped with AES-256-CCM by a kernel `trusted` key that the
+`apple_sep` driver seals, and the AES key stays in the kernel (AF_ALG by key
+serial). Nothing is enrolled by default. See [docs/luks-sep.md](docs/luks-sep.md).
+
+    make -C luks && sudo make -C luks install
+    make -C luks check      # kernel user keys stand in for the SEP
+
+It needs libcryptsetup (2.4 or newer, with external tokens) and json-c. The
+checks need root on kernels with `af_alg_restrict`, which let only
+CAP_SYS_ADMIN or CAP_NET_ADMIN bind `ccm(aes)` through AF_ALG.
+`luks/tests/hw-loop-test.sh` is the hardware test on a loop file.
 
 ## Clamshell mode
 
@@ -107,7 +129,7 @@ package in the Fedora build environment, then:
 
 ## Install
 
-    sudo dnf install ./libfprint-1.94.100-1.fc45.aurora7.aarch64.rpm ./fprintd-1.94.5-99.fc45.aurora1.aarch64.rpm ./fprintd-pam-1.94.5-99.fc45.aurora1.aarch64.rpm ./aurora-sep-*.noarch.rpm
+    sudo dnf install ./libfprint-1.94.100-1.fc45.aurora9.aarch64.rpm ./fprintd-1.94.5-99.fc45.aurora1.aarch64.rpm ./fprintd-pam-1.94.5-99.fc45.aurora1.aarch64.rpm ./aurora-sep-*.noarch.rpm
     sudo dnf versionlock add libfprint
 
 Reboot afterwards to apply the package and unit changes. The SEP driver attaches
@@ -138,6 +160,7 @@ top of it, or keep the version lock.
 - `libfprint/apple-sep.h` is the kernel UAPI header,
   `GPL-2.0 WITH Linux-syscall-note OR MIT` (`LICENSES/GPL-2.0-only.txt`,
   `LICENSES/Linux-syscall-note.txt`, `LICENSES/MIT.txt`).
+- `luks/` is MIT.
 - Everything else here is MIT.
 
 ## Qualification

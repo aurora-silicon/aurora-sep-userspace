@@ -1,0 +1,56 @@
+.\" SPDX-License-Identifier: MIT
+.TH AURORA-SEP-CRYPTENROLL 8 "2026" "aurora-sep-userspace" "System Administration"
+.SH NAME
+aurora-sep-cryptenroll \- unlock a LUKS2 volume with the Mac's Secure Enclave
+.SH SYNOPSIS
+.B aurora-sep-cryptenroll
+[\fB\-\-wipe\-slot=sep\fR] [\fB\-\-unlock\-key\-file=\fIFILE\fR] \fIDEVICE\fR
+.br
+.B aurora-sep-cryptenroll
+\fB\-\-remove\fR | \fB\-\-test\fR | \fB\-\-status\fR \fIDEVICE\fR
+.SH DESCRIPTION
+Adds a keyslot to a LUKS2 volume whose secret is sealed by this Mac's Secure
+Enclave (SEP), like
+.B systemd-cryptenroll \-\-tpm2-device=auto
+does with a TPM. The secret is stored in an \fBaurora-sep\fR LUKS2 token,
+encrypted with an AES key that the kernel's \fBtrusted\fR key type seals
+through the \fBapple_sep\fR driver. Only the same Mac, running Linux under the
+same SEP OS identity, can unseal it.
+.PP
+cryptsetup and systemd-cryptsetup try the token automatically through
+.IR libcryptsetup-token-aurora-sep.so .
+If the SEP refuses, they ask for a passphrase as usual.
+.PP
+Enrolling needs an existing passphrase, which is kept. Removing never leaves
+a volume without a keyslot that is not bound to the SEP.
+.SH OPTIONS
+.TP
+.BI \-\-unlock\-key\-file= FILE
+Existing passphrase or key file that authorizes the enrolment. Without it the
+\fBPASSWORD\fR environment variable is used, else a prompt on the terminal.
+.TP
+.B \-\-wipe\-slot=sep
+After the new enrolment is proven, remove older SEP enrolments.
+.TP
+.B \-\-remove
+Remove every SEP keyslot and token.
+.TP
+.B \-\-test
+Unseal each SEP token and check that it opens its keyslot. Nothing is activated.
+.TP
+.B \-\-status
+List SEP tokens, their keyslots and how many other keyslots exist.
+.SH ENVIRONMENT
+.TP
+.B AURORA_SEP_WAIT
+Seconds the token plugin waits for the SEP key store at boot (default 60).
+.SH EXAMPLES
+.nf
+aurora-sep-cryptenroll /dev/nvme0n1p11
+echo "data UUID=... none luks" >> /etc/crypttab
+.fi
+.SH SEE ALSO
+.BR cryptsetup (8),
+.BR systemd-cryptenroll (1),
+.BR crypttab (5),
+.BR keyctl (1)

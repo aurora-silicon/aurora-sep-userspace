@@ -17,8 +17,6 @@ BuildRequires:	gcc-c++
 BuildRequires:	git
 BuildRequires:	pam-devel
 BuildRequires:	libfprint-devel >= 1.94.0
-# FP_DEVICE_ERROR_LOCKED_OUT
-BuildRequires:	libfprint(aurora-sep-lockout)
 BuildRequires:	polkit-devel
 BuildRequires:	gtk-doc
 BuildRequires:	gettext
@@ -68,6 +66,13 @@ fingerprint readers access.
 %autosetup -S git -n %{name}-v%{version}
 
 %build
+# 0002 needs FP_DEVICE_ERROR_LOCKED_OUT (0x102 in libfprint aurora10's 0008).
+# Build against any libfprint-devel, as the per-package CI does with stock
+# headers; at run time the Requires below brings in the libfprint that
+# reports it.
+if ! grep -q FP_DEVICE_ERROR_LOCKED_OUT %{_includedir}/libfprint-2/fp-device.h; then
+  export CFLAGS="%{optflags} -DFP_DEVICE_ERROR_LOCKED_OUT=0x102"
+fi
 %meson -Dgtk_doc=true -Dpam=true -Dpam_modules_dir=%{_libdir}/security
 %meson_build
 
@@ -109,7 +114,7 @@ fi
 %{_datadir}/dbus-1/interfaces/net.reactivated.Fprint.Manager.xml
 
 %changelog
-* Tue Nov 03 2026 Ryan Murray <ryan@aurorasilicon.org> - 1.94.5-99.aurora2
+* Sun Nov 08 2026 Ryan Murray <ryan@aurorasilicon.org> - 1.94.5-99.aurora2
 - Report a reader lockout as verify-lockout; pam_fprintd then asks for the
   password at once
 
