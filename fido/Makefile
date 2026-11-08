@@ -6,8 +6,9 @@ PKG_CONFIG ?= pkg-config
 PYTHON ?= python3
 CFLAGS ?= -O2 -g
 CFLAGS += -std=gnu11 -Wall -Wextra -Werror=implicit-function-declaration \
-	-D_FORTIFY_SOURCE=2 -fstack-protector-strong -I../luks
-DEPS_CFLAGS = $(shell $(PKG_CONFIG) --cflags json-c)
+	-D_FORTIFY_SOURCE=2 -fstack-protector-strong
+# Kept out of CFLAGS so that distribution builds can pass their own CFLAGS.
+DEPS_CFLAGS = -I../luks $(shell $(PKG_CONFIG) --cflags json-c)
 DEPS_LIBS = $(shell $(PKG_CONFIG) --libs json-c)
 
 PREFIX ?= /usr
