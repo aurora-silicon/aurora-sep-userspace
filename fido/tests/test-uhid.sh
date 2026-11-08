@@ -8,6 +8,7 @@
 #
 #   sudo tests/test-uhid.sh            all checks
 #   sudo KEEP=1 tests/test-uhid.sh     keep the work dir for a look afterwards
+#   sudo KEYS=sep tests/test-uhid.sh   keys in the Secure Enclave (/dev/sep-key)
 set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 work=$(mktemp -d "${TMPDIR:-/var/tmp}/aurora-fido-uhid.XXXXXX")
@@ -37,7 +38,7 @@ command -v fido2-token >/dev/null || { echo "needs fido2-tools (libfido2)"; exit
 dev=
 start() {   # start TOUCH_MODE
 	stop
-	python3 "$here/run-stub-daemon.py" --state-dir "$work/state" --touch "$1" \
+	python3 "$here/run-stub-daemon.py" --state-dir "$work/state" --touch "$1" --keys "${KEYS:-stub}" \
 		>>"$work/daemon.log" 2>&1 &
 	pid=$!
 	dev=
@@ -153,20 +154,28 @@ else
 	sk "no ssh-keygen"
 fi
 
-# pam_u2f, through pamtester.
+# pam_u2f: register with pamu2fcfg, authenticate through PAM (pamtester, or
+# tests/pam-auth.py where pamtester is not packaged). pamu2fcfg accepts self
+# attestation from pam-u2f 1.1.1 on.
 pamlib=$(find /usr/lib /lib /usr/lib64 -name pam_u2f.so 2>/dev/null | head -1)
-if [ -n "$pamlib" ] && command -v pamu2fcfg >/dev/null && command -v pamtester >/dev/null; then
-	if pamu2fcfg -u root -o pam://aurora-test -i pam://aurora-test >"$work/u2f_keys" 2>"$work/err" </dev/null; then
-		ok "pamu2fcfg registers"
-		printf 'auth required %s authfile=%s origin=pam://aurora-test appid=pam://aurora-test cue\n' \
-			"$pamlib" "$work/u2f_keys" >/etc/pam.d/aurora-fido-test
-		pamtester aurora-fido-test root authenticate >"$work/pam.out" 2>&1 </dev/null &&
-			ok "pam_u2f authenticates (pamtester)" || no "pam_u2f: $(cat "$work/pam.out")"
+u2fver=$(pamu2fcfg --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+if [ -z "$pamlib" ] || ! command -v pamu2fcfg >/dev/null; then
+	sk "pam_u2f/pamu2fcfg not installed"
+elif [ "$(printf '%s\n1.1.1\n' "$u2fver" | sort -V | head -1)" != 1.1.1 ]; then
+	sk "pamu2fcfg $u2fver cannot verify self attestation (needs pam-u2f 1.1.1 or newer)"
+elif pamu2fcfg -u root -o pam://aurora-test -i pam://aurora-test >"$work/u2f_keys" 2>"$work/err" </dev/null; then
+	ok "pamu2fcfg $u2fver registers"
+	printf 'auth required %s authfile=%s origin=pam://aurora-test appid=pam://aurora-test cue\n' \
+		"$pamlib" "$work/u2f_keys" >/etc/pam.d/aurora-fido-test
+	if command -v pamtester >/dev/null; then
+		pamauth=(pamtester aurora-fido-test root authenticate)
 	else
-		no "pamu2fcfg: $(cat "$work/err")"
+		pamauth=(python3 "$here/pam-auth.py" aurora-fido-test root)
 	fi
+	"${pamauth[@]}" >"$work/pam.out" 2>&1 </dev/null &&
+		ok "pam_u2f authenticates ($(basename "${pamauth[0]}"))" || no "pam_u2f: $(cat "$work/pam.out")"
 else
-	sk "pam_u2f/pamu2fcfg/pamtester not installed"
+	no "pamu2fcfg: $(cat "$work/err")"
 fi
 
 # systemd-cryptenroll on a LUKS2 loop file.
@@ -218,7 +227,7 @@ fido2-assert -G -p -i "$work/as.in" -o /dev/null "$dev" 2>"$work/err" &&
 		no "timeout: unexpected error $(cat "$work/err")"
 }
 stop
-grep -q "TEST HARNESS" "$work/daemon.log" && ok "harness says it uses software keys" || no "harness warning missing"
+grep -q "TEST HARNESS" "$work/daemon.log" && ok "harness says what keys it uses: $(grep -m1 -o 'TEST HARNESS: .*' "$work/daemon.log")" || no "harness warning missing"
 
 echo
 echo "uhid: $pass passed, $fail failed, $skip skipped"

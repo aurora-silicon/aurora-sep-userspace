@@ -117,6 +117,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(prog="aurora-fidod")
     ap.add_argument("--config", default=CONFIG)
     ap.add_argument("--state-dir", default=STATE_DIR)
+    ap.add_argument("--seal-helper", default=SEAL_HELPER)
     ap.add_argument("-v", "--verbose", action="store_true")
     a = ap.parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if a.verbose else logging.INFO,
@@ -137,7 +138,8 @@ def main(argv=None):
         return 1
     os.umask(0o077)
     try:
-        auth, u = build(cfg, a.state_dir, backend, verifier, SealedSecret(a.state_dir))
+        auth, u = build(cfg, a.state_dir, backend, verifier,
+                        SealedSecret(a.state_dir, a.seal_helper))
     except (RuntimeError, OSError, subprocess.SubprocessError) as e:
         log.error("cannot open the sealed master secret: %s", e)
         return 1
