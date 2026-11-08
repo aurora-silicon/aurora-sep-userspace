@@ -394,12 +394,15 @@ class Authenticator:
             raise CtapError(ERR_NO_CREDENTIALS)
 
         verified = token_uv
-        present = token_up
+        present = token_up and up    # up=false: UP stays clear even with a token
         if (up and not token_up) or uv:
             self.ask(ctx, touchid.Prompt("sign-in", rp_id))
             verified = True
             present = up
-        if auth_param is not None:
+        # CTAP 2.1/2.2 getAssertion: the token's flags and permissions are used up
+        # only when the response carries UP. A silent pre-flight (up=false, as
+        # Firefox sends before the real request) must leave the token usable.
+        if auth_param is not None and present:
             self.token.consumed_by_mc_ga()
 
         hs = ext.get("hmac-secret")

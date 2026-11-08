@@ -351,6 +351,32 @@ class Ctap2Test(unittest.TestCase):
         self.assertEqual(st, 0)
         self.assertEqual(len(self.rig.verifier.prompts), n + 1)
 
+    def test_token_survives_silent_preflight(self):
+        # Firefox: getPinUvAuthToken (one touch), a silent up=false getAssertion
+        # with the token to filter the allow list, then the real getAssertion.
+        st, r = self.rig.make()
+        cid = parse_auth_data(r[2])["cred_id"]
+        allow = [{"type": "public-key", "id": cid}]
+        plat = Platform(self.rig)
+        st, tok = plat.token(pinuv.PERM_GA, "example.com")
+        self.assertEqual(st, 0)
+        n = len(self.rig.verifier.prompts)
+        st, a = self.rig.call(ctap2.CMD_GET_ASSERTION, {
+            1: "example.com", 2: CDH, 3: allow, 5: {"up": False},
+            6: plat.auth(tok, CDH), 7: 2})
+        self.assertEqual(st, 0)
+        self.assertFalse(parse_auth_data(a[2])["flags"] & ctap2.FLAG_UP)
+        st, a = self.rig.call(ctap2.CMD_GET_ASSERTION, {
+            1: "example.com", 2: CDH, 3: allow, 6: plat.auth(tok, CDH), 7: 2})
+        self.assertEqual(st, 0)
+        flags = parse_auth_data(a[2])["flags"]
+        self.assertTrue(flags & ctap2.FLAG_UP and flags & ctap2.FLAG_UV)
+        self.assertEqual(len(self.rig.verifier.prompts), n)    # still one touch
+        # The real ceremony used the token up.
+        st, _ = self.rig.call(ctap2.CMD_GET_ASSERTION, {
+            1: "example.com", 2: CDH, 3: allow, 6: plat.auth(tok, CDH), 7: 2})
+        self.assertEqual(st, E.ERR_PIN_AUTH_INVALID)
+
     def test_token_bad_param_and_rp(self):
         plat = Platform(self.rig, version=1)
         _, tok = plat.token(pinuv.PERM_MC, "example.com")
