@@ -23,6 +23,7 @@ jobs:
           git apply ../libfprint/0005-aurora-support-v4-and-v5.patch
           git apply ../libfprint/0006-aurora-report-finger-lift-and-lockout.patch
           git apply ../libfprint/0007-aurora-name-retry-causes-and-keep-waiting.patch
+          git apply ../libfprint/0008-aurora-report-the-touch-id-lockout-as-locked-out.patch
           python3 ../libfprint/test_interface.py libfprint/drivers/aurora/aurora.c ../libfprint/apple-sep.h
           grep -q '^#define SEP_BIO_IFACE_VERSION  5' ../libfprint/apple-sep.h
       - name: Check biometric ioctl ABI sizes
@@ -32,6 +33,7 @@ jobs:
           _Static_assert(sizeof(struct sep_bio_enrol_start) == 144, "enrol ABI");
           _Static_assert(sizeof(struct sep_bio_enclave_list) == 520, "list ABI");
           _Static_assert(sizeof(struct sep_bio_delete) == 16, "delete ABI");
+          _Static_assert(sizeof(struct sep_bio_lockout) == 16, "lockout ABI");
           int main(void) { return 0; }
           EOF
           cc -Wall -Werror -I. abi.c -o abi
@@ -43,6 +45,7 @@ jobs:
           cd fprintd-v1.94.5
           git init -q
           git apply ../fprintd/0001-preserve-print-on-device-delete-failure.patch
+          git apply ../fprintd/0002-report-lockout-and-fall-back-to-the-password.patch
           python3 -m py_compile tests/fprintd.py
           python3 ../fprintd/test_account_gate.py src/device.c
 
@@ -145,6 +148,7 @@ jobs:
           git apply ../libfprint/0005-aurora-support-v4-and-v5.patch
           git apply ../libfprint/0006-aurora-report-finger-lift-and-lockout.patch
           git apply ../libfprint/0007-aurora-name-retry-causes-and-keep-waiting.patch
+          git apply ../libfprint/0008-aurora-report-the-touch-id-lockout-as-locked-out.patch
           install -Dm644 ../libfprint/apple-sep.h aurora-uapi/linux/apple-sep.h
           CFLAGS="-I$(pwd)/aurora-uapi" meson setup build -Ddrivers=aurora,virtual_device,virtual_device_storage -Dintrospection=true -Ddoc=false -Dinstalled-tests=false -Dudev_rules=disabled -Dudev_hwdb=disabled
           meson compile -C build
@@ -156,6 +160,7 @@ jobs:
           cd fprintd-v1.94.5
           git init -q
           git apply ../fprintd/0001-preserve-print-on-device-delete-failure.patch
+          git apply ../fprintd/0002-report-lockout-and-fall-back-to-the-password.patch
           PKG_CONFIG_PATH=/usr/local/lib64/pkgconfig meson setup build -Dpam=false -Dman=false -Dsystemd=false -Dgtk_doc=false
           meson compile -C build
       - name: Run failed-delete fprintd regression cases
@@ -169,3 +174,13 @@ jobs:
             FPrintdVirtualDeviceStorageClaimedTest.test_delete_enrolled_fingers_device_error \
             FPrintdVirtualDeviceStorageClaimedTest.test_delete_enrolled_fingers2_device_error \
             FPrintdVirtualDeviceStorageClaimedTest.test_delete_enrolled_finger_device_error
+
+  touchid-rearm:
+    runs-on: ubuntu-latest
+    container: fedora:45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: dnf -y install make gcc pam-devel python3
+      - name: Build and test the PAM re-arm module and service
+        run: make -C touchid-rearm check
