@@ -33,6 +33,7 @@ jobs:
           _Static_assert(sizeof(struct sep_bio_enrol_start) == 144, "enrol ABI");
           _Static_assert(sizeof(struct sep_bio_enclave_list) == 520, "list ABI");
           _Static_assert(sizeof(struct sep_bio_delete) == 16, "delete ABI");
+          _Static_assert(sizeof(struct sep_bio_lockout) == 16, "lockout ABI");
           int main(void) { return 0; }
           EOF
           cc -Wall -Werror -I. abi.c -o abi
@@ -143,3 +144,13 @@ jobs:
             FPrintdVirtualDeviceStorageClaimedTest.test_delete_enrolled_fingers_device_error \
             FPrintdVirtualDeviceStorageClaimedTest.test_delete_enrolled_fingers2_device_error \
             FPrintdVirtualDeviceStorageClaimedTest.test_delete_enrolled_finger_device_error
+
+  touchid-rearm:
+    runs-on: ubuntu-latest
+    container: fedora:45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: dnf -y install make gcc pam-devel python3
+      - name: Build and test the PAM re-arm module and service
+        run: make -C touchid-rearm check

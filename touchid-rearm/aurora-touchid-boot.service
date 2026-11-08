@@ -1,0 +1,36 @@
+# SPDX-License-Identifier: GPL-2.0-only
+[Unit]
+Description=Touch ID after a restart (require_password_after_boot)
+Documentation=file:///usr/share/doc/aurora-touchid-rearm/README.md
+# After the Secure Enclave driver is up and has restored the fingerprints
+# (aurora-sep-ready.service, from the distribution's aurora-sep package), and
+# before anything can offer Touch ID: fprintd, the greeter, text logins.
+Wants=aurora-sep-ready.service
+After=aurora-sep-ready.service
+Before=display-manager.service systemd-user-sessions.service fprintd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/libexec/aurora-touchid-rearm --boot
+# It reports to syslog; the terminal lines are for --boot run by hand.
+StandardOutput=null
+# Waits up to 30 s for the Secure Enclave driver's re-arm node.
+TimeoutStartSec=45
+CapabilityBoundingSet=CAP_SYS_ADMIN
+NoNewPrivileges=yes
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

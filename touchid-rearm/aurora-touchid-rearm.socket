@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: GPL-2.0-only
+[Unit]
+Description=Touch ID re-arm after a password authentication
+Documentation=file:///usr/share/doc/aurora-touchid-rearm/README.md
+
+[Socket]
+# pam_aurora_touchid connects from every PAM stack that accepted a password,
+# lock screens running as the user among them. The service checks the
+# caller and the password itself.
+ListenStream=/run/aurora-touchid-rearm.sock
+SocketMode=0666
+Accept=yes
+MaxConnections=8
+
+[Install]
+WantedBy=sockets.target
