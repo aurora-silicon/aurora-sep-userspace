@@ -24,7 +24,9 @@ jobs:
           git apply ../libfprint/0006-aurora-report-finger-lift-and-lockout.patch
           git apply ../libfprint/0007-aurora-name-retry-causes-and-keep-waiting.patch
           git apply ../libfprint/0008-aurora-report-the-touch-id-lockout-as-locked-out.patch
+          git apply ../libfprint/0009-aurora-say-why-touch-id-needs-the-password.patch
           python3 ../libfprint/test_interface.py libfprint/drivers/aurora/aurora.c ../libfprint/apple-sep.h
+          python3 ../libfprint/test_lockout_reason.py libfprint/drivers/aurora/aurora.c
           grep -q '^#define SEP_BIO_IFACE_VERSION  5' ../libfprint/apple-sep.h
       - name: Check biometric ioctl ABI sizes
         run: |
@@ -34,6 +36,8 @@ jobs:
           _Static_assert(sizeof(struct sep_bio_enclave_list) == 520, "list ABI");
           _Static_assert(sizeof(struct sep_bio_delete) == 16, "delete ABI");
           _Static_assert(sizeof(struct sep_bio_lockout) == 16, "lockout ABI");
+          _Static_assert(SEP_BIO_LOCKOUT_FLAG_AFTER_BOOT == 2, "after-boot flag");
+          _Static_assert(SEP_BIO_LOCKOUT_FLAG_FAILED_ATTEMPTS == 4, "failed-attempts flag");
           int main(void) { return 0; }
           EOF
           cc -Wall -Werror -I. abi.c -o abi
@@ -46,6 +50,7 @@ jobs:
           git init -q
           git apply ../fprintd/0001-preserve-print-on-device-delete-failure.patch
           git apply ../fprintd/0002-report-lockout-and-fall-back-to-the-password.patch
+          git apply ../fprintd/0003-say-why-the-reader-needs-the-password.patch
           python3 -m py_compile tests/fprintd.py
           python3 ../fprintd/test_account_gate.py src/device.c
 
@@ -136,7 +141,8 @@ jobs:
         run: |
           dnf -y install curl tar git gcc gcc-c++ meson ninja-build rpm-build pkgconf-pkg-config \
             glib2-devel libgusb-devel libgudev-devel polkit-devel gettext \
-            gobject-introspection-devel python3-gobject python3-dbusmock python3-cairo
+            gobject-introspection-devel python3-gobject python3-dbusmock python3-cairo \
+            pam-devel pam_wrapper python3-libpamtest systemd-devel
       - name: Parse package specs
         run: |
           rpmspec -P libfprint/libfprint.spec >/dev/null
@@ -155,8 +161,9 @@ jobs:
           git apply ../libfprint/0006-aurora-report-finger-lift-and-lockout.patch
           git apply ../libfprint/0007-aurora-name-retry-causes-and-keep-waiting.patch
           git apply ../libfprint/0008-aurora-report-the-touch-id-lockout-as-locked-out.patch
+          git apply ../libfprint/0009-aurora-say-why-touch-id-needs-the-password.patch
           install -Dm644 ../libfprint/apple-sep.h aurora-uapi/linux/apple-sep.h
-          CFLAGS="-I$(pwd)/aurora-uapi" meson setup build -Ddrivers=aurora,virtual_device,virtual_device_storage -Dintrospection=true -Ddoc=false -Dinstalled-tests=false -Dudev_rules=disabled -Dudev_hwdb=disabled
+          CFLAGS="-I$(pwd)/aurora-uapi" meson setup build -Ddrivers=aurora,virtual_image,virtual_device,virtual_device_storage -Dintrospection=true -Ddoc=false -Dinstalled-tests=false -Dudev_rules=disabled -Dudev_hwdb=disabled
           meson compile -C build
           meson install -C build
       - name: Build patched fprintd
@@ -167,7 +174,8 @@ jobs:
           git init -q
           git apply ../fprintd/0001-preserve-print-on-device-delete-failure.patch
           git apply ../fprintd/0002-report-lockout-and-fall-back-to-the-password.patch
-          PKG_CONFIG_PATH=/usr/local/lib64/pkgconfig meson setup build -Dpam=false -Dman=false -Dsystemd=false -Dgtk_doc=false
+          git apply ../fprintd/0003-say-why-the-reader-needs-the-password.patch
+          PKG_CONFIG_PATH=/usr/local/lib64/pkgconfig meson setup build -Dpam=true -Dman=false -Dsystemd=false -Dgtk_doc=false
           meson compile -C build
       - name: Run failed-delete fprintd regression cases
         env:
@@ -180,6 +188,18 @@ jobs:
             FPrintdVirtualDeviceStorageClaimedTest.test_delete_enrolled_fingers_device_error \
             FPrintdVirtualDeviceStorageClaimedTest.test_delete_enrolled_fingers2_device_error \
             FPrintdVirtualDeviceStorageClaimedTest.test_delete_enrolled_finger_device_error
+      - name: Run password-reason fprintd and pam_fprintd cases
+        env:
+          GI_TYPELIB_PATH: /usr/local/lib64/girepository-1.0
+          LD_LIBRARY_PATH: /usr/local/lib64
+        run: |
+          cd fprintd-v1.94.5
+          export FPRINT_BUILD_DIR="$PWD/build/src" TOPSRCDIR="$PWD"
+          python3 tests/fprintd.py \
+            FPrintdVirtualDeviceVerificationTests.test_verify_error_locked_out \
+            FPrintdVirtualDeviceVerificationTests.test_verify_error_password_required \
+            FPrintdVirtualDeviceVerificationTests.test_verify_error_password_required_after_boot
+          meson test -C build --print-errorlogs --suite test_pam_fprintd
 
   touchid-rearm:
     runs-on: ubuntu-latest
