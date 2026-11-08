@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note OR MIT */
 /*
- * /dev/sep-key interface version 1, as in the Aurora kernel's
+ * /dev/sep-key interface (versions 1 and 2), as in the Aurora kernel's
  * include/uapi/linux/apple-sep.h. Kept here so the provider builds without
  * the kernel headers installed; the sizes are checked at compile time.
  */
@@ -60,6 +60,11 @@ _Static_assert(sizeof(struct sep_key_info) == 16, "sep_key_info ABI");
 _Static_assert(sizeof(struct sep_key_create) == 2124, "sep_key_create ABI");
 _Static_assert(sizeof(struct sep_key_sign) == 2164, "sep_key_sign ABI");
 _Static_assert(sizeof(struct sep_key_public) == 2124, "sep_key_public ABI");
+
+#ifndef SEP_KEY_CREATE_BIOMETRY_CURRENT_SET
+/* Version 2: signing needs a Touch ID match the enclave itself checks. */
+#define SEP_KEY_CREATE_BIOMETRY_CURRENT_SET 0x1
+#endif
 
 #define SEP_KEY_DEVICE "/dev/sep-key"
 

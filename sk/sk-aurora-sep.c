@@ -15,11 +15,13 @@
  *   ECDSA-P256( SHA-256( SHA-256(application) || flags || counter || SHA-256(data) ) )
  * The enclave signs that outer digest.
  *
- * User presence: interface version 1 of /dev/sep-key has no enclave-enforced
- * policy. When a key asks for presence (the default for ecdsa-sk keys), this
- * provider asks for a Touch ID match with fprintd-verify before signing and
- * reports presence only after it succeeded. That check runs on the host, not
- * in the enclave; see docs/ssh-sk.md for what that does and does not stop.
+ * User presence: on a kernel with /dev/sep-key version 2, a key that asks for
+ * presence or verification (the default for ecdsa-sk keys) is made with
+ * SEP_KEY_CREATE_BIOMETRY_CURRENT_SET. The enclave then refuses every
+ * signature without a fresh Touch ID match of a currently enrolled finger,
+ * which the kernel runs inside the sign call. On a version 1 kernel the
+ * provider falls back to asking fprintd-verify on the host, which root can
+ * bypass. docs/ssh-sk.md has the details.
  */
 
 #include <errno.h>
@@ -105,7 +107,22 @@ static int device_error(int err)
 	}
 }
 
-static int backend_create(uint8_t pub[SEP_KEY_PUB_LEN], uint8_t **handle, size_t *handle_len)
+/* SEP_KEY_CREATE_* bits the kernel accepts; 0 on a version 1 kernel. */
+static uint32_t backend_create_flags(void)
+{
+	struct sep_key_info info = { 0 };
+	int fd = open_device();
+
+	if (fd < 0)
+		return 0;
+	if (ioctl(fd, SEP_KEY_GET_INFO, &info) != 0)
+		info.flags_supported = 0;
+	close(fd);
+	return info.version >= 2 ? info.flags_supported : 0;
+}
+
+static int backend_create(uint8_t pub[SEP_KEY_PUB_LEN], uint8_t **handle, size_t *handle_len,
+			  uint32_t flags)
 {
 	struct sep_key_create *req;
 	int fd, ret;
@@ -118,6 +135,7 @@ static int backend_create(uint8_t pub[SEP_KEY_PUB_LEN], uint8_t **handle, size_t
 		close(fd);
 		return SSH_SK_ERR_GENERAL;
 	}
+	req->flags = flags;
 	if (ioctl(fd, SEP_KEY_CREATE, req) != 0) {
 		ret = device_error(errno);
 		dbg("SEP_KEY_CREATE: %s", strerror(errno));
@@ -163,6 +181,10 @@ static int backend_sign(const uint8_t *handle, size_t handle_len, const uint8_t 
 	memcpy(req->handle, handle, handle_len);
 	memcpy(req->digest, digest, 32);
 	if (ioctl(fd, SEP_KEY_SIGN, req) != 0) {
+		if (errno == EACCES)
+			say("no Touch ID match; the Secure Enclave did not sign");
+		else if (errno == ETIMEDOUT)
+			say("no touch in time; the Secure Enclave did not sign");
 		ret = device_error(errno);
 		dbg("SEP_KEY_SIGN: %s", strerror(errno));
 		goto out;
@@ -190,7 +212,13 @@ out:
 /* Test handle: "TSTK" || private scalar (32) || public point (65). Never shipped. */
 #define TEST_HANDLE_LEN (4 + 32 + SEP_KEY_PUB_LEN)
 
-static int backend_create(uint8_t pub[SEP_KEY_PUB_LEN], uint8_t **handle, size_t *handle_len)
+static uint32_t backend_create_flags(void)
+{
+	return 0;
+}
+
+static int backend_create(uint8_t pub[SEP_KEY_PUB_LEN], uint8_t **handle, size_t *handle_len,
+			  uint32_t flags)
 {
 	EVP_PKEY *pkey = EVP_EC_gen("P-256");
 	BIGNUM *priv = NULL;
@@ -198,6 +226,7 @@ static int backend_create(uint8_t pub[SEP_KEY_PUB_LEN], uint8_t **handle, size_t
 	uint8_t *h = NULL;
 	int ret = SSH_SK_ERR_GENERAL;
 
+	(void)flags;
 	if (!pkey)
 		return ret;
 	if (!EVP_PKEY_get_octet_string_param(pkey, OSSL_PKEY_PARAM_ENCODED_PUBLIC_KEY, pub,
@@ -268,6 +297,16 @@ out:
 #endif
 
 /* ---------- user presence ---------- */
+
+/*
+ * Whether the handle is a /dev/sep-key version 2 biometric key: the enclave
+ * itself refuses to sign without a fresh Touch ID match, so no host check is
+ * needed. Handle layout: "SEPK", version, flags (bit 0), ...
+ */
+static int enclave_enforced(const uint8_t *handle, size_t len)
+{
+	return len > 12 && memcmp(handle, "SEPK", 4) == 0 && handle[4] == 1 && (handle[5] & 1);
+}
 
 /*
  * 0 when presence was shown, -1 when it was refused or could not be asked.
@@ -364,6 +403,7 @@ SK_EXPORT int sk_enroll(uint32_t alg, const uint8_t *challenge, size_t challenge
 {
 	struct sk_enroll_response *resp;
 	uint8_t pub[SEP_KEY_PUB_LEN];
+	uint32_t kflags;
 	int ret;
 
 	(void)challenge;
@@ -384,7 +424,15 @@ SK_EXPORT int sk_enroll(uint32_t alg, const uint8_t *challenge, size_t challenge
 	resp = calloc(1, sizeof(*resp));
 	if (!resp)
 		return SSH_SK_ERR_GENERAL;
-	ret = backend_create(pub, &resp->key_handle, &resp->key_handle_len);
+	/*
+	 * A key that wants presence or verification gets the enclave-enforced
+	 * Touch ID policy when the kernel offers it.
+	 */
+	kflags = 0;
+	if ((flags & (SSH_SK_USER_PRESENCE_REQD | SSH_SK_USER_VERIFICATION_REQD)) &&
+	    (backend_create_flags() & SEP_KEY_CREATE_BIOMETRY_CURRENT_SET))
+		kflags = SEP_KEY_CREATE_BIOMETRY_CURRENT_SET;
+	ret = backend_create(pub, &resp->key_handle, &resp->key_handle_len, kflags);
 	if (ret != 0) {
 		free(resp);
 		return ret;
@@ -399,8 +447,9 @@ SK_EXPORT int sk_enroll(uint32_t alg, const uint8_t *challenge, size_t challenge
 	resp->public_key_len = SEP_KEY_PUB_LEN;
 	/* What every signature will ask for: presence and/or verification. */
 	resp->flags = flags & (SSH_SK_USER_PRESENCE_REQD | SSH_SK_USER_VERIFICATION_REQD);
-	dbg("enrolled %s, handle %zu bytes, flags 0x%02x", application,
-	    resp->key_handle_len, resp->flags);
+	dbg("enrolled %s, handle %zu bytes, flags 0x%02x, %s", application,
+	    resp->key_handle_len, resp->flags,
+	    kflags ? "Touch ID enforced by the Secure Enclave" : "no enclave policy");
 	*enroll_response = resp;
 	return 0;
 }
@@ -425,8 +474,15 @@ SK_EXPORT int sk_sign(uint32_t alg, const uint8_t *data, size_t data_len,
 	if (alg != SSH_SK_ECDSA)
 		return SSH_SK_ERR_UNSUPPORTED;
 	if (flags & (SSH_SK_USER_PRESENCE_REQD | SSH_SK_USER_VERIFICATION_REQD)) {
-		if (ask_presence(application) != 0)
+		if (enclave_enforced(key_handle, key_handle_len)) {
+			const char *mode = getenv("AURORA_SEP_SK_PRESENCE");
+
+			if (mode && strcmp(mode, "deny") == 0)
+				return SSH_SK_ERR_GENERAL;
+			say("touch Touch ID to sign with your Secure Enclave key (%s)", application);
+		} else if (ask_presence(application) != 0) {
 			return SSH_SK_ERR_GENERAL;
+		}
 		sig_flags = flags & (SSH_SK_USER_PRESENCE_REQD | SSH_SK_USER_VERIFICATION_REQD);
 	}
 	if (sha256(application, strlen(application), apphash) != 0 ||
