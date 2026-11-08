@@ -127,7 +127,7 @@ jobs:
           git apply ../libfprint/0008-aurora-report-the-touch-id-lockout-as-locked-out.patch
           git apply ../libfprint/0009-aurora-say-why-touch-id-needs-the-password.patch
           install -Dm644 ../libfprint/apple-sep.h aurora-uapi/linux/apple-sep.h
-          CFLAGS="-I$(pwd)/aurora-uapi" meson setup build -Ddrivers=aurora,virtual_device,virtual_device_storage -Dintrospection=true -Ddoc=false -Dinstalled-tests=false -Dudev_rules=disabled -Dudev_hwdb=disabled
+          CFLAGS="-I$(pwd)/aurora-uapi" meson setup build -Ddrivers=aurora,virtual_image,virtual_device,virtual_device_storage -Dintrospection=true -Ddoc=false -Dinstalled-tests=false -Dudev_rules=disabled -Dudev_hwdb=disabled
           meson compile -C build
           meson install -C build
       - name: Build patched fprintd
