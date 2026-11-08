@@ -89,15 +89,18 @@ CAP_SYS_ADMIN or CAP_NET_ADMIN bind `ccm(aes)` through AF_ALG.
 `fido/` holds `aurora-fidod`, a root daemon that creates a virtual FIDO HID
 device through `/dev/uhid` and speaks CTAP 2.1 and CTAP1/U2F, for WebAuthn and
 passkeys in Firefox and Chromium, SSH `ecdsa-sk` keys, pam_u2f and
-`systemd-cryptenroll --fido2-device`. Credentials are P-256 keys inside the
-Secure Enclave (`/dev/sep-key`), and every operation that needs the user asks
-for a Touch ID match through fprintd. Attestation is self or none: nothing
-here can prove Apple hardware to a website. Until the enclave itself enforces
-a biometric access control on the keys, the touch is checked by the daemon in
-software, so root can sign without one; the keys still never leave the
-enclave. See [docs/fido.md](docs/fido.md).
+`systemd-cryptenroll --fido2-device`. It is opt in: installed off, turned on
+with `sudo aurora-fido enable` and off with `sudo aurora-fido disable`;
+`aurora-fido status` says which key store it uses. Credentials are P-256 keys
+inside the Secure Enclave (`/dev/sep-key`) when the kernel has it, and keys
+sealed by the Secure Enclave otherwise (root on the Mac can copy those; the
+status line says so). Every operation that needs the user asks for a Touch ID
+match through fprintd. Attestation is self or none: nothing here can prove
+Apple hardware to a website. Until the enclave itself enforces a biometric
+access control on the keys, the touch is checked by the daemon in software,
+so root can sign without one. See [docs/fido.md](docs/fido.md).
 
-    make -C fido && sudo make -C fido install
+    make -C fido && sudo make -C fido install && sudo aurora-fido enable
     make -C fido check                 # unit tests, software stand-ins
     sudo make -C fido check-uhid       # libfido2, OpenSSH, pam_u2f, cryptenroll on a uhid device
 

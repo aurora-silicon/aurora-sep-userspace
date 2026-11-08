@@ -1,0 +1,10 @@
+#!/usr/bin/python3 -I
+# SPDX-License-Identifier: MIT
+# aurora-fido enable|disable|status: the Touch ID security key, opt in.
+import sys
+
+sys.path.insert(0, "@PYDIR@")
+from aurora_fido import cli, daemon  # noqa: E402
+
+daemon.SEAL_HELPER = "@LIBEXECDIR@/aurora-fido-seal"
+sys.exit(cli.main())

@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: MIT
 [Unit]
-Description=Touch ID security key (FIDO2/U2F with Secure Enclave keys)
+Description=Touch ID security key (FIDO2/U2F)
 Documentation=file:///usr/share/doc/aurora-fido/fido.md
-# /dev/sep-key comes from the apple_sep driver; without it there is no key store.
-ConditionPathExists=/dev/sep-key
-After=aurora-sep.service dbus.service systemd-logind.service
+# Opt in: installed disabled. `aurora-fido enable` turns it on, `aurora-fido
+# disable` off. Keys go into the Secure Enclave through /dev/sep-key when the
+# kernel has it, otherwise they are sealed by it (aurora-fido status says which).
+After=aurora-sep.service dbus.service systemd-logind.service fprintd.service
 Wants=aurora-sep.service
 
 [Service]
@@ -14,6 +15,8 @@ Restart=on-failure
 RestartSec=5
 StateDirectory=aurora-fido
 StateDirectoryMode=0700
+RuntimeDirectory=aurora-fido
+RuntimeDirectoryMode=0755
 ConfigurationDirectory=aurora-fido
 UMask=0077
 DevicePolicy=closed

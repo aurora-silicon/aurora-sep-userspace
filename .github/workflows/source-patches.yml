@@ -97,6 +97,10 @@ jobs:
           make -C fido
           make -C fido install DESTDIR=$PWD/dest
           test -x dest/usr/libexec/aurora-fido/aurora-fidod
+          test -x dest/usr/bin/aurora-fido
+          grep -q '^disable aurora-fido.service' dest/usr/lib/systemd/system-preset/90-aurora-fido.preset
+          grep -q 'aurora-fido-seal' dest/usr/bin/aurora-fido
+          ! grep -rqiE 'demo|test harness' dest/usr/libexec/aurora-fido dest/usr/lib/aurora-fido dest/usr/bin/aurora-fido dest/usr/lib/systemd
           test -x dest/usr/libexec/aurora-fido/aurora-fido-seal
           test -f dest/usr/lib/aurora-fido/aurora_fido/ctap2.py
           test -f dest/usr/lib/systemd/system/aurora-fido.service
@@ -120,6 +124,8 @@ jobs:
           sudo modprobe uhid || { sudo apt-get install -y "linux-modules-extra-$(uname -r)" && sudo modprobe uhid; }
           sudo modprobe -a hid-generic hidraw 2>/dev/null || true
           sudo make -C fido check-uhid
+      - name: uhid device on the shipped sealed key store
+        run: sudo KEYS=sealed make -C fido check-uhid
 
   build:
     runs-on: ubuntu-latest

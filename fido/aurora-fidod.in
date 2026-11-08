@@ -4,6 +4,7 @@
 import sys
 
 sys.path.insert(0, "@PYDIR@")
-from aurora_fido.daemon import main  # noqa: E402
+from aurora_fido import daemon  # noqa: E402
 
-sys.exit(main())
+daemon.SEAL_HELPER = "@LIBEXECDIR@/aurora-fido-seal"
+sys.exit(daemon.main())

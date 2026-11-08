@@ -20,7 +20,9 @@ s1=$("$seal" unseal <"$work/rec" | cat)
 [ ${#s1} -eq 128 ] && ok "unseal gives 64 bytes (hex)" || no "unseal: ${#s1}"
 s2=$("$seal" unseal <"$work/rec" | cat)
 [ "$s1" = "$s2" ] && ok "unseal is stable" || no "unseal differs"
-sed 's/^ct \(..\)/ct ff/' "$work/rec" >"$work/t"
+# Change the first ciphertext byte (to 00 if it already is ff).
+sed -e '/^ct ff/{s/^ct ff/ct 00/;b' -e '}' -e 's/^ct \(..\)/ct ff/' "$work/rec" >"$work/t"
+cmp -s "$work/rec" "$work/t" && no "tamper did not change the record"
 "$seal" unseal <"$work/t" >/dev/null 2>&1 && no "tampered record opened" || ok "tampered record refused"
 sed 's/^id \(..\)/id 00/' "$work/rec" >"$work/t"
 "$seal" unseal <"$work/t" >/dev/null 2>&1 && no "record with another id opened" || ok "record bound to its id"

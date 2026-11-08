@@ -52,6 +52,14 @@ FLAG_ED = 0x80
 AAGUID = bytes.fromhex("a0f1d0e5aa5b4a7e9c51f1d0a0c0de01")
 
 RESET_WINDOW = 10.0
+# A request that Touch ID just refused (wrong finger, lockout) and that the
+# client sends again unchanged is refused again without a new prompt for
+# this long. OpenSSH does that: it takes OPERATION_DENIED for "PIN required"
+# and signs the same data once more. A hardware key with built-in UV that
+# has refused a match does not hand out new tries to a replay either, and
+# each extra prompt would spend Touch ID misses towards the lockout. Any new
+# request (new challenge) gets a normal prompt.
+REFUSAL_REPLAY_WINDOW = 30.0
 NEXT_ASSERTION_WINDOW = 30.0
 MAX_USER_FIELD = 64
 
@@ -132,6 +140,7 @@ class Authenticator:
         self.lock = threading.Lock()
         self._next = None                 # getNextAssertion state
         self._cm = None                   # credential management enumeration state
+        self._refused = None              # (request digest, when) of the last refusal
 
     # -- plumbing ---------------------------------------------------------------
 
@@ -180,9 +189,33 @@ class Authenticator:
             return bytes([ERR_OTHER])
         return b"\x00" + (cbor.encode(resp) if resp is not None else b"")
 
-    def ask(self, ctx, prompt):
-        """Touch ID; returns normally on a match, raises the CTAP error otherwise."""
+    @staticmethod
+    def request_digest(*parts):
+        """A digest that names one request (command, RP, client data, credential list)."""
+        h = hashlib.sha256()
+        for part in parts:
+            b = part if isinstance(part, bytes) else str(part).encode()
+            h.update(len(b).to_bytes(4, "big") + b)
+        return h.digest()
+
+    def ask(self, ctx, prompt, request=None):
+        """Touch ID; returns normally on a match, raises the CTAP error otherwise.
+
+        request: request_digest() of the operation; a replay of one that was
+        just refused is refused again at once (REFUSAL_REPLAY_WINDOW).
+        """
+        now = self.clock()
+        if request is not None and self._refused is not None:
+            digest, when = self._refused
+            if digest == request and now - when <= REFUSAL_REPLAY_WINDOW:
+                log.info("%s: repeat of a request Touch ID refused %.1f s ago; "
+                         "refused again without a new prompt", prompt.title(), now - when)
+                raise CtapError(ERR_OPERATION_DENIED, "repeat of a refused request")
         result = self.verifier.verify(prompt, ctx.cancel, ctx.on_up_needed)
+        if result in (touchid.NO_MATCH, touchid.LOCKED) and request is not None:
+            self._refused = (request, self.clock())
+        elif result == touchid.MATCH:
+            self._refused = None
         if result == touchid.MATCH:
             return
         if ctx.cancel.is_set() or result == touchid.CANCELLED:
@@ -298,7 +331,7 @@ class Authenticator:
             raise CtapError(ERR_KEY_STORE_FULL)
 
         if not token_up:
-            self.ask(ctx, prompt)
+            self.ask(ctx, prompt, self.request_digest("mc", rp_hash, cdh, uid))
         if auth_param is not None:
             self.token.consumed_by_mc_ga()
 
@@ -396,7 +429,8 @@ class Authenticator:
         verified = token_uv
         present = token_up and up    # up=false: UP stays clear even with a token
         if (up and not token_up) or uv:
-            self.ask(ctx, touchid.Prompt("sign-in", rp_id))
+            self.ask(ctx, touchid.Prompt("sign-in", rp_id),
+                     self.request_digest("ga", rp_hash, cdh, *(allow or ())))
             verified = True
             present = up
         # CTAP 2.1/2.2 getAssertion: the token's flags and permissions are used up

@@ -5,24 +5,45 @@ A KeyBackend creates P-256 keys and signs SHA-256 digests with them. The
 daemon only ever holds an opaque key handle; what the handle means is the
 backend's business.
 
-SepKeyBackend is the only backend the daemon ships: /dev/sep-key from the
-apple_sep driver (lane SEPKEY), where the private half is an enclave ref-key
-that never leaves this Mac's Secure Enclave. The handle is the kernel's
-"SEPK" header plus the wrapped ref-key record; it is useless on any other Mac
-or any other Linux install on this one.
+Two backends ship, and KeyStore puts them together:
 
-The ioctl layout below follows SEPKEY's interface version 1 draft
-(drivers/soc/apple/key.rs). If the kernel reports another version the
-backend refuses to start instead of guessing.
+SepKeyBackend: /dev/sep-key from the apple_sep driver, where the private half
+is an enclave ref-key that never leaves this Mac's Secure Enclave. The handle
+is the kernel's "SEPK" header plus the wrapped ref-key record; it is useless
+on any other Mac or any other Linux install on this one. The ioctl layout
+follows the apple_sep key interface, versions 1 and 2 (drivers/soc/apple/
+key.rs; version 2 only adds a create flag this daemon does not set). If the
+kernel reports another version the backend refuses to start instead of
+guessing.
 
-Tests use a software backend from tests/stub.py. It is not installed and the
-daemon cannot select it.
+SealedKeyBackend: for kernels without /dev/sep-key. P-256 keys made by the
+daemon, whose private scalar is AES-256-GCM wrapped under a key derived from
+the master secret that this Mac's Secure Enclave seals. A copy of the disk is
+useless elsewhere, but the private key is in the daemon's memory while it
+signs, so root on this Mac can take a key away. docs/fido.md has the threat
+model; `aurora-fido status` says which store is in use.
+
+New credentials go to the Secure Enclave whenever /dev/sep-key works; a
+credential made earlier with a sealed key keeps working, since KeyStore picks
+the backend from the handle's magic.
+
+Tests also use a software backend from tests/stub.py. It is not installed and
+the daemon cannot select it.
 """
 
 import errno
 import fcntl
 import os
+import secrets
 import struct
+
+from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.asymmetric.utils import Prehashed
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 # Linux value; also defined here so the module imports on other systems.
 EKEYREJECTED = getattr(errno, "EKEYREJECTED", 129)
@@ -72,7 +93,8 @@ IOC_INFO = _ioc(_IOC_READ, _MAGIC, 0x20, _INFO.size)
 IOC_CREATE = _ioc(_IOC_READ | _IOC_WRITE, _MAGIC, 0x21, _CREATE.size)
 IOC_SIGN = _ioc(_IOC_READ | _IOC_WRITE, _MAGIC, 0x22, _SIGN.size)
 IOC_PUBLIC = _ioc(_IOC_READ | _IOC_WRITE, _MAGIC, 0x23, _PUBLIC.size)
-IFACE_VERSION = 1
+IFACE_VERSIONS = (1, 2)
+SEP_MAGIC = b"SEPK"
 
 assert (_INFO.size, _CREATE.size, _SIGN.size) == (16, 2124, 2164)
 
@@ -95,9 +117,11 @@ class SepKeyBackend(KeyBackend):
         except OSError as e:
             raise BackendError(f"{path}: info ioctl failed: {e.strerror}") from e
         version, _flags, handle_max, _ = _INFO.unpack(buf)
-        if version != IFACE_VERSION:
-            raise BackendError(f"{path}: interface version {version}, "
-                               f"this daemon speaks {IFACE_VERSION}")
+        if version not in IFACE_VERSIONS:
+            os.close(self.fd)
+            raise BackendError(f"{path}: interface version {version}, this daemon "
+                               f"speaks {', '.join(map(str, IFACE_VERSIONS))}")
+        self.version = version
         self.handle_max = min(handle_max, _HANDLE_MAX)
 
     def _call(self, req, buf):
@@ -136,3 +160,127 @@ class SepKeyBackend(KeyBackend):
         buf = bytearray(_PUBLIC.pack(0, len(handle), b"", b"", handle))
         self._call(IOC_PUBLIC, buf)
         return _PUBLIC.unpack(buf)[2]
+
+
+SEALED_MAGIC = b"AFSK"
+_SEALED_VERSION = 1
+_SEALED_AAD = SEALED_MAGIC + bytes([_SEALED_VERSION])
+_SEALED_LEN = 4 + 1 + 12 + 32 + 16
+
+
+class SealedKeyBackend(KeyBackend):
+    """P-256 keys wrapped under a key derived from the SEP-sealed master secret.
+
+    Handle: "AFSK" | 0x01 | nonce[12] | AES-256-GCM(k, nonce, scalar[32],
+    aad = "AFSK" 0x01) (ct || tag), 65 bytes; k = HKDF-SHA256(master,
+    info "aurora-fido sealed keys v1"). A new master secret (reset) makes
+    every earlier handle unusable, like every credential ID.
+    """
+
+    name = "sealed"
+    non_extractable = False
+
+    def __init__(self, master=None):
+        self._aead = None
+        if master is not None:
+            self.rekey(master)
+
+    def rekey(self, master):
+        if len(master) != 64:
+            raise ValueError("master secret must be 64 bytes")
+        k = HKDF(algorithm=hashes.SHA256(), length=32, salt=None,
+                 info=b"aurora-fido sealed keys v1").derive(master)
+        self._aead = AESGCM(k)
+
+    def _need_key(self):
+        if self._aead is None:
+            raise BackendError("sealed key store has no master secret")
+
+    def create(self):
+        self._need_key()
+        priv = ec.generate_private_key(ec.SECP256R1())
+        scalar = priv.private_numbers().private_value.to_bytes(32, "big")
+        nonce = secrets.token_bytes(12)
+        handle = _SEALED_AAD + nonce + self._aead.encrypt(nonce, scalar, _SEALED_AAD)
+        return handle, self._point(priv)
+
+    @staticmethod
+    def _point(priv):
+        return priv.public_key().public_bytes(Encoding.X962, PublicFormat.UncompressedPoint)
+
+    def _priv(self, handle):
+        self._need_key()
+        if len(handle) != _SEALED_LEN or handle[:5] != _SEALED_AAD:
+            raise InvalidHandle("not a sealed key handle")
+        try:
+            scalar = self._aead.decrypt(handle[5:17], handle[17:], _SEALED_AAD)
+        except InvalidTag as e:
+            raise InvalidHandle("sealed key from another master secret") from e
+        return ec.derive_private_key(int.from_bytes(scalar, "big"), ec.SECP256R1())
+
+    def sign(self, handle, digest):
+        if len(digest) != DIGEST_LEN:
+            raise ValueError("digest must be 32 bytes")
+        return self._priv(handle).sign(digest, ec.ECDSA(Prehashed(hashes.SHA256())))
+
+    def public(self, handle):
+        return self._point(self._priv(handle))
+
+
+class KeyStore(KeyBackend):
+    """New keys from the primary backend; each handle signs with the backend that made it."""
+
+    def __init__(self, primary, sealed, sep=None):
+        self.primary = primary
+        self.sealed = sealed
+        self.sep = sep
+        self.name = primary.name
+        self.non_extractable = primary.non_extractable
+
+    def rekey(self, master):
+        self.sealed.rekey(master)
+
+    def _for(self, handle):
+        if handle[:4] == SEP_MAGIC:
+            if self.sep is None:
+                raise BackendError("this credential's key is in the Secure Enclave, and "
+                                   "/dev/sep-key is not available in this kernel")
+            return self.sep
+        if handle[:4] == SEALED_MAGIC:
+            return self.sealed
+        raise InvalidHandle("unknown key handle")
+
+    def create(self):
+        return self.primary.create()
+
+    def sign(self, handle, digest):
+        return self._for(handle).sign(handle, digest)
+
+    def public(self, handle):
+        return self._for(handle).public(handle)
+
+
+STORES = ("auto", "sep-key", "sealed")
+
+
+def open_store(store="auto", sep_path="/dev/sep-key"):
+    """(KeyStore, why /dev/sep-key is not used or None).
+
+    auto: the Secure Enclave when /dev/sep-key works, else sealed keys.
+    sep-key: the Secure Enclave or nothing (BackendError).
+    sealed: sealed keys for new credentials; SEP credentials still sign.
+    """
+    if store not in STORES:
+        raise BackendError(f"keys: store = {store!r}; use {', '.join(STORES)}")
+    sep, why = None, None
+    try:
+        sep = SepKeyBackend(sep_path)
+    except BackendError as e:
+        why = str(e)
+        if store == "sep-key":
+            raise
+    sealed = SealedKeyBackend()
+    primary = sep if (sep is not None and store != "sealed") else sealed
+    if store == "sealed" and sep is not None:
+        why = "keys: store = sealed in the config"
+    return KeyStore(primary, sealed, sep), why

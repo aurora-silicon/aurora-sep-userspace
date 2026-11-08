@@ -23,7 +23,7 @@ from cryptography.hazmat.primitives import hashes  # noqa: E402
 from cryptography.hazmat.primitives.asymmetric import ec  # noqa: E402
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat  # noqa: E402
 
-from aurora_fido import cbor, creds, ctap2, ctaphid, keys, pinuv, touchid, u2f  # noqa: E402
+from aurora_fido import backend, cbor, creds, ctap2, ctaphid, keys, pinuv, touchid, u2f  # noqa: E402
 from aurora_fido import errors as E  # noqa: E402
 from aurora_fido.daemon import build, load_config  # noqa: E402
 from stub import FileSecret, StubKeyBackend, StubVerifier  # noqa: E402
@@ -232,6 +232,7 @@ class Ctap2Test(unittest.TestCase):
                            (touchid.UNAVAILABLE, E.ERR_OPERATION_DENIED),
                            (touchid.TIMEOUT, E.ERR_USER_ACTION_TIMEOUT)):
             self.rig.verifier.mode = mode
+            self.rig.clock.t += ctap2.REFUSAL_REPLAY_WINDOW + 1   # not a replay
             st, _ = self.rig.make()
             self.assertEqual(st, code, mode)
         self.assertEqual(self.rig.backend.creates, 0)
@@ -253,6 +254,62 @@ class Ctap2Test(unittest.TestCase):
             1: "example.com", 2: CDH, 3: [{"type": "public-key", "id": cid}]})
         self.assertEqual(st, E.ERR_OPERATION_DENIED)
         self.assertEqual(self.rig.backend.signs, signs)
+
+    def _ga(self, cid, cdh=CDH):
+        return self.rig.call(ctap2.CMD_GET_ASSERTION, {
+            1: "example.com", 2: cdh, 3: [{"type": "public-key", "id": cid}]})[0]
+
+    def test_replayed_refusal_gets_no_new_prompt(self):
+        # OpenSSH signs the same data again after OPERATION_DENIED.
+        _, r = self.rig.make()
+        cid = parse_auth_data(r[2])["cred_id"]
+        n, signs = len(self.rig.verifier.prompts), self.rig.backend.signs
+        self.rig.verifier.mode = touchid.NO_MATCH
+        self.assertEqual(self._ga(cid), E.ERR_OPERATION_DENIED)
+        self.assertEqual(len(self.rig.verifier.prompts), n + 1)
+        self.rig.clock.t += 0.5
+        self.rig.verifier.mode = touchid.MATCH       # would match, but is never asked
+        self.assertEqual(self._ga(cid), E.ERR_OPERATION_DENIED)
+        self.assertEqual(len(self.rig.verifier.prompts), n + 1)
+        self.assertEqual(self.rig.backend.signs, signs)
+        # A new challenge is a new request: normal prompt.
+        self.assertEqual(self._ga(cid, hashlib.sha256(b"new").digest()), 0)
+        self.assertEqual(len(self.rig.verifier.prompts), n + 2)
+        # The match cleared the refusal: the old request may ask again.
+        self.assertEqual(self._ga(cid), 0)
+        self.assertEqual(len(self.rig.verifier.prompts), n + 3)
+
+    def test_replay_window_ends(self):
+        _, r = self.rig.make()
+        cid = parse_auth_data(r[2])["cred_id"]
+        n = len(self.rig.verifier.prompts)
+        self.rig.verifier.mode = touchid.LOCKED
+        self.assertEqual(self._ga(cid), E.ERR_OPERATION_DENIED)
+        self.rig.clock.t += ctap2.REFUSAL_REPLAY_WINDOW - 1
+        self.assertEqual(self._ga(cid), E.ERR_OPERATION_DENIED)
+        self.assertEqual(len(self.rig.verifier.prompts), n + 1)
+        self.rig.clock.t += 2
+        self.rig.verifier.mode = touchid.MATCH
+        self.assertEqual(self._ga(cid), 0)
+        self.assertEqual(len(self.rig.verifier.prompts), n + 2)
+
+    def test_timeout_and_cancel_are_not_refusals(self):
+        _, r = self.rig.make()
+        cid = parse_auth_data(r[2])["cred_id"]
+        n = len(self.rig.verifier.prompts)
+        self.rig.verifier.mode = touchid.TIMEOUT
+        self.assertEqual(self._ga(cid), E.ERR_USER_ACTION_TIMEOUT)
+        self.rig.verifier.mode = touchid.MATCH
+        self.assertEqual(self._ga(cid), 0)
+        self.assertEqual(len(self.rig.verifier.prompts), n + 2)
+
+    def test_replayed_make_credential_refusal(self):
+        self.rig.verifier.mode = touchid.NO_MATCH
+        self.assertEqual(self.rig.make()[0], E.ERR_OPERATION_DENIED)
+        self.assertEqual(self.rig.make()[0], E.ERR_OPERATION_DENIED)
+        self.assertEqual(len(self.rig.verifier.prompts), 1)
+        self.assertEqual(self.rig.make(uid=b"user-2")[0], E.ERR_OPERATION_DENIED)
+        self.assertEqual(len(self.rig.verifier.prompts), 2)
 
     def test_silent_assertion(self):
         _, r = self.rig.make()
@@ -702,6 +759,169 @@ class CtapHidTest(unittest.TestCase):
         self.send(cid, ctaphid.CMD_CANCEL, b"")
         c, cmd, data = read_msg(self.dev)
         self.assertEqual((c, cmd, data), (cid, ctaphid.CMD_CBOR, bytes([E.ERR_KEEPALIVE_CANCEL])))
+
+
+class FakeSep(StubKeyBackend):
+    """Stub keys in a "SEPK" handle, standing in for /dev/sep-key."""
+
+    name = "sep-key"
+    non_extractable = True
+
+    def create(self):
+        h, p = super().create()
+        return b"SEPK" + h, p
+
+    def sign(self, handle, digest):
+        return super().sign(handle[4:], digest)
+
+    def public(self, handle):
+        return super().public(handle[4:])
+
+
+class KeyStoreTest(unittest.TestCase):
+    def test_sealed_keys(self):
+        m = os.urandom(64)
+        b = backend.SealedKeyBackend(m)
+        h, point = b.create()
+        self.assertEqual(len(h), 65)
+        self.assertEqual(h[:5], b"AFSK\x01")
+        self.assertEqual(b.public(h), point)
+        d = hashlib.sha256(b"m").digest()
+        pub = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), point)
+        from cryptography.hazmat.primitives.asymmetric.utils import Prehashed
+        pub.verify(b.sign(h, d), d, ec.ECDSA(Prehashed(hashes.SHA256())))
+        bad = bytearray(h)
+        bad[30] ^= 1
+        with self.assertRaises(backend.InvalidHandle):
+            b.sign(bytes(bad), d)
+        with self.assertRaises(backend.InvalidHandle):
+            backend.SealedKeyBackend(os.urandom(64)).sign(h, d)
+        with self.assertRaises(backend.InvalidHandle):
+            b.sign(h[:-1], d)
+        with self.assertRaises(backend.BackendError):
+            backend.SealedKeyBackend().create()
+
+    def test_store_dispatch_by_handle(self):
+        m = os.urandom(64)
+        sealed = backend.SealedKeyBackend(m)
+        old, _ = sealed.create()                        # made before /dev/sep-key
+        sep = FakeSep()
+        ks = backend.KeyStore(sep, sealed, sep)
+        self.assertEqual((ks.name, ks.non_extractable), ("sep-key", True))
+        new, _ = ks.create()
+        self.assertEqual(new[:4], b"SEPK")
+        d = hashlib.sha256(b"x").digest()
+        ks.sign(old, d)
+        ks.sign(new, d)
+        nosep = backend.KeyStore(sealed, sealed, None)
+        self.assertEqual((nosep.name, nosep.non_extractable), ("sealed", False))
+        with self.assertRaises(backend.BackendError):
+            nosep.sign(new, d)
+        with self.assertRaises(backend.InvalidHandle):
+            nosep.sign(b"STUB" + new[4:], d)
+
+    def test_open_store_without_sep_key(self):
+        missing = os.path.join(tempfile.gettempdir(), "no-such-sep-key")
+        ks, why = backend.open_store("auto", missing)
+        self.assertEqual(ks.name, "sealed")
+        self.assertIn("no-such-sep-key", why)
+        with self.assertRaises(backend.BackendError):
+            backend.open_store("sep-key", missing)
+        with self.assertRaises(backend.BackendError):
+            backend.open_store("software", missing)
+        ks, _ = backend.open_store("sealed", missing)
+        self.assertEqual(ks.name, "sealed")
+
+    def test_authenticator_on_sealed_store_and_reset(self):
+        tmp = tempfile.TemporaryDirectory()
+        try:
+            ks, _ = backend.open_store("sealed", os.path.join(tmp.name, "none"))
+            secret = FileSecret(os.path.join(tmp.name, "master"))
+            auth, _u = build(load_config(None), os.path.join(tmp.name, "state"), ks,
+                             StubVerifier(), secret)
+            def call(cmd, params=None):
+                r = auth.handle(bytes([cmd]) + (cbor.encode(params) if params else b""))
+                return r[0], (cbor.decode(r[1:]) if len(r) > 1 else None)
+            st, r = call(ctap2.CMD_MAKE_CREDENTIAL, {
+                1: CDH, 2: {"id": "example.com"}, 3: {"id": b"u"},
+                4: [{"type": "public-key", "alg": -7}]})
+            self.assertEqual(st, 0)
+            ad = parse_auth_data(r[2])
+            req = {1: "example.com", 2: CDH, 3: [{"type": "public-key", "id": ad["cred_id"]}]}
+            st, a = call(ctap2.CMD_GET_ASSERTION, req)
+            self.assertEqual(st, 0)
+            self.assertTrue(es256_ok(ad["point"], a[2] + CDH, a[3]))
+            # Restart: same sealed secret, the credential still signs.
+            auth2, _ = build(load_config(None), os.path.join(tmp.name, "state"),
+                             backend.open_store("sealed", "/nonexistent")[0],
+                             StubVerifier(), secret)
+            r2 = auth2.handle(bytes([ctap2.CMD_GET_ASSERTION]) + cbor.encode(req))
+            self.assertEqual(r2[0], 0)
+            # Reset: a new master secret; the old credential is gone.
+            st, _ = call(ctap2.CMD_RESET)
+            self.assertEqual(st, 0)
+            st, _ = call(ctap2.CMD_GET_ASSERTION, req)
+            self.assertEqual(st, E.ERR_NO_CREDENTIALS)
+        finally:
+            tmp.cleanup()
+
+    def test_status_file(self):
+        from aurora_fido import daemon
+        tmp = tempfile.TemporaryDirectory()
+        try:
+            run = os.path.join(tmp.name, "run")
+            ks, why = backend.open_store("auto", "/nonexistent-sep-key")
+            daemon.write_status(run, dict(daemon.key_store_info(ks, why), ready=True))
+            path = os.path.join(run, "status.json")
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o644)
+            import json
+            with open(path) as f:
+                st = json.load(f)
+            self.assertEqual(st["keys"], "sealed")
+            self.assertIn("root on this Mac can copy them", st["keys_detail"])
+        finally:
+            tmp.cleanup()
+
+
+class CliTest(unittest.TestCase):
+    def test_find_device(self):
+        from aurora_fido import cli
+        tmp = tempfile.TemporaryDirectory()
+        try:
+            for n, phys in (("hidraw0", "usb-0000:00:14.0-1/input0"), ("hidraw3", "aurora-fido")):
+                d = os.path.join(tmp.name, "class/hidraw", n, "device")
+                os.makedirs(d)
+                with open(os.path.join(d, "uevent"), "w") as f:
+                    f.write(f"HID_ID=0003:00001209:00000001\nHID_PHYS={phys}\n")
+            self.assertEqual(cli.find_device(tmp.name), "/dev/hidraw3")
+            self.assertIsNone(cli.find_device(os.path.join(tmp.name, "none")))
+        finally:
+            tmp.cleanup()
+
+    def test_render_says_state_and_threat_model(self):
+        from aurora_fido import cli
+        off = {"enabled": "disabled", "active": "inactive", "device": None, "keys": None,
+               "keys_if_enabled": "sealed", "ready": False, "version": "x"}
+        t = cli.render(off)
+        self.assertIn("Touch ID security key: off", t)
+        self.assertIn("sudo aurora-fido enable", t)
+        self.assertIn("root on this Mac can unwrap and copy the keys", t)
+        on = dict(off, enabled="enabled", active="active", device="/dev/hidraw5",
+                  keys="sep-key", keys_if_enabled="sep-key", ready=True)
+        t = cli.render(on)
+        self.assertIn("ON", t)
+        self.assertIn("/dev/hidraw5", t)
+        self.assertIn("cannot be copied off this Mac", t)
+        self.assertNotIn("enable", t.split("\n")[-2])
+        for word in ("demo", "TEST"):
+            self.assertNotIn(word, cli.render(off) + t)
+
+    def test_enable_and_disable_need_root(self):
+        from aurora_fido import cli
+        if os.geteuid() == 0:
+            self.skipTest("running as root")
+        self.assertEqual(cli.main(["enable"]), 1)
+        self.assertEqual(cli.main(["disable"]), 1)
 
 
 class PromptTest(unittest.TestCase):

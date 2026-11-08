@@ -8,6 +8,7 @@
 #
 #   sudo tests/test-uhid.sh            all checks
 #   sudo KEEP=1 tests/test-uhid.sh     keep the work dir for a look afterwards
+#   sudo KEYS=sealed tests/test-uhid.sh  the shipped sealed key store
 #   sudo KEYS=sep tests/test-uhid.sh   keys in the Secure Enclave (/dev/sep-key)
 set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
@@ -220,6 +221,13 @@ fido2-cred -M -i "$work/cred.in" -o /dev/null "$dev" es256 2>"$work/err" &&
 }
 fido2-assert -G -p -i "$work/as.in" -o /dev/null "$dev" 2>"$work/err" &&
 	no "assertion without a match" || ok "wrong finger: getAssertion refused ($(tail -1 "$work/err"))"
+# The same request again (OpenSSH retries a refused signature): refused at once, no new prompt.
+fido2-assert -G -p -i "$work/as.in" -o /dev/null "$dev" 2>"$work/err" &&
+	no "replayed assertion signed" || {
+	grep -q "refused again without a new prompt" "$work/daemon.log" &&
+		ok "replay of a refused request: refused again without a Touch ID prompt" ||
+		no "replay of a refused request asked Touch ID again"
+}
 start timeout || no "restart with a timing-out Touch ID"
 fido2-assert -G -p -i "$work/as.in" -o /dev/null "$dev" 2>"$work/err" &&
 	no "assertion after a timeout" || {

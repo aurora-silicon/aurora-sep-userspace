@@ -17,12 +17,14 @@ UNITDIR ?= $(PREFIX)/lib/systemd/system
 UDEVRULESDIR ?= $(PREFIX)/lib/udev/rules.d
 SYSCONFDIR ?= /etc
 DOCDIR ?= $(PREFIX)/share/doc/aurora-fido
+BINDIR ?= $(PREFIX)/bin
+PRESETDIR ?= $(PREFIX)/lib/systemd/system-preset
 
 SEAL := aurora-fido-seal
 SRC := aurora-fido-seal.c ../luks/sep-seal.c ../luks/sep-seal.h
 PY := $(wildcard aurora_fido/*.py)
 
-all: $(SEAL) aurora-fidod aurora-fido.service.out
+all: $(SEAL) aurora-fidod aurora-fido aurora-fido.service.out
 
 $(SEAL): $(SRC)
 	$(CC) $(CFLAGS) $(DEPS_CFLAGS) -fPIE -pie -Wl,-z,relro,-z,now -o $@ \
@@ -34,8 +36,8 @@ test/$(SEAL): $(SRC)
 	$(CC) $(CFLAGS) -DSEP_SEAL_TEST_USER_KEYS $(DEPS_CFLAGS) -o $@ \
 		aurora-fido-seal.c ../luks/sep-seal.c $(DEPS_LIBS)
 
-aurora-fidod: aurora-fidod.in
-	sed 's|@PYDIR@|$(PYDIR)|' $< > $@
+aurora-fidod aurora-fido: %: %.in
+	sed -e 's|@PYDIR@|$(PYDIR)|' -e 's|@LIBEXECDIR@|$(LIBEXECDIR)|' $< > $@
 	chmod 755 $@
 
 aurora-fido.service.out: aurora-fido.service
@@ -55,6 +57,8 @@ check-seal: test/$(SEAL)
 
 install: all
 	install -Dm755 aurora-fidod $(DESTDIR)$(LIBEXECDIR)/aurora-fidod
+	install -Dm755 aurora-fido $(DESTDIR)$(BINDIR)/aurora-fido
+	install -Dm644 90-aurora-fido.preset $(DESTDIR)$(PRESETDIR)/90-aurora-fido.preset
 	install -Dm755 $(SEAL) $(DESTDIR)$(LIBEXECDIR)/$(SEAL)
 	for f in $(PY); do install -Dm644 $$f $(DESTDIR)$(PYDIR)/$$f; done
 	install -Dm644 aurora-fido.service.out $(DESTDIR)$(UNITDIR)/aurora-fido.service
@@ -63,6 +67,6 @@ install: all
 	install -Dm644 ../docs/fido.md $(DESTDIR)$(DOCDIR)/fido.md
 
 clean:
-	rm -rf $(SEAL) test aurora-fidod aurora-fido.service.out aurora_fido/__pycache__ tests/__pycache__
+	rm -rf $(SEAL) test aurora-fidod aurora-fido aurora-fido.service.out aurora_fido/__pycache__ tests/__pycache__
 
 .PHONY: all check check-uhid check-seal install clean
