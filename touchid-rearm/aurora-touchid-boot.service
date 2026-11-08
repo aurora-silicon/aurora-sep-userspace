@@ -10,6 +10,8 @@ Before=display-manager.service systemd-user-sessions.service fprintd.service
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/libexec/aurora-touchid-rearm --boot
+# It reports to syslog; the terminal lines are for --boot run by hand.
+StandardOutput=null
 # Waits up to 30 s for the Secure Enclave driver's re-arm node.
 TimeoutStartSec=45
 CapabilityBoundingSet=CAP_SYS_ADMIN
