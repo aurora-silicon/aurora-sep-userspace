@@ -10,6 +10,7 @@
  *   aurora-sep-fde reset-password  --uid N [--recovery-key-file R --new-file P] DEVICE
  *   aurora-sep-fde test     [--password-file P | --recovery-key-file R] [--name MAPPING] DEVICE
  *   aurora-sep-fde remove-passphrase --unlock-key-file F DEVICE
+ *   aurora-sep-fde gate-check --uid N [--password-file P] DEVICE
  *   aurora-sep-fde status   DEVICE
  *
  * Root only (the key-bag ioctls are on the root-only re-arm node). Secrets
@@ -465,6 +466,51 @@ refuse:
 	return -EPERM;
 }
 
+/*
+ * The enclave's own gate, for hardware qualification: with the bag LOCKED the
+ * enclave must refuse to open the sealed secret; after the password unlocks
+ * it, the same request must succeed. The secret is compared to nothing and
+ * never printed; it is wiped at once.
+ */
+static int cmd_gate_check(struct crypt_device *cd, const struct opts *o)
+{
+	uint8_t out[SEP_FDE_SECRET_BYTES];
+	char pw[SECRET_MAX];
+	struct fde_state st;
+	struct fde_token t;
+	size_t plen = 0, n = 0;
+	int locked_r, open_r, r;
+
+	if (find_token(cd, o->uid, SEP_FDE_ROLE_USER, &t) < 0)
+		return -ENOENT;
+	r = get_secret(o->password_file, "Password: ", 0, pw, &plen);
+	if (r)
+		goto out;
+	if (fde_bag_state(t.uid, &st) < 0 && fde_bag_import(t.uid, t.bag, t.bag_len) < 0) {
+		r = -EPERM;
+		goto out;
+	}
+	fde_bag_lock(t.uid);
+	locked_r = fde_unseal(t.uid, t.record, t.record_len, t.sealed, t.sealed_len,
+			      out, sizeof(out), &n);
+	sep_wipe(out, sizeof(out));
+	printf("gate: unseal with the bag locked: %s\n",
+	       locked_r ? "REFUSED by the enclave (correct)" : "OPENED (gate FAILED)");
+	r = fde_bag_unlock(t.uid, pw, plen);
+	open_r = r ? r : fde_unseal(t.uid, t.record, t.record_len, t.sealed, t.sealed_len,
+				    out, sizeof(out), &n);
+	sep_wipe(out, sizeof(out));
+	fde_bag_lock(t.uid);
+	printf("gate: unseal after the password unlocked the bag: %s\n",
+	       open_r ? "refused (FAILED)" : "opened (correct)");
+	r = (locked_r && !open_r) ? 0 : -EIO;
+	printf("gate-check: %s\n", r ? "FAIL" : "PASS");
+out:
+	sep_wipe(pw, sizeof(pw));
+	fde_token_free(&t);
+	return r;
+}
+
 static int cmd_status(struct crypt_device *cd)
 {
 	int found = 0;
@@ -549,6 +595,8 @@ int main(int argc, char **argv)
 		r = cmd_test(cd, &o);
 	else if (!strcmp(o.cmd, "remove-passphrase"))
 		r = cmd_remove_passphrase(cd, &o);
+	else if (!strcmp(o.cmd, "gate-check"))
+		r = cmd_gate_check(cd, &o);
 	else if (!strcmp(o.cmd, "status"))
 		r = cmd_status(cd);
 	else

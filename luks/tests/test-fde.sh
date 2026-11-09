@@ -41,6 +41,7 @@ if try "$F" test --password-file "$T/pw" "$img"; then pass "right password after
 
 reboot_mac
 if try "$F" test --password-file "$T/pw" "$img"; then pass "opens after a reboot (bag loaded from the token)"; else fail "after reboot"; fi
+if "$F" gate-check --uid 60200 --password-file "$T/pw" "$img" | grep -q 'gate-check: PASS'; then pass "enclave refuses to unseal while the bag is locked, opens after unlock"; else fail "gate-check"; fi
 
 if try "$F" recovery --uid 60201 --unlock-key-file "$T/pass" --recovery-key-file "$T/rk" "$img"; then pass "enroll recovery key"; else fail "enroll recovery"; fi
 grep -Eq '^[A-Z2-9]{4}(-[A-Z2-9]{4}){5}$' "$T/rk" && pass "recovery key format XXXX-XXXX-XXXX-XXXX-XXXX-XXXX" || fail "recovery key format"
