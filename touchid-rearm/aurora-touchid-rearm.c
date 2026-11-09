@@ -94,6 +94,7 @@ struct sep_bio_rearm {
 #define REARM_DEVICE   "/dev/sep-bio-rearm"
 #define FPRINT_DIR     "/var/lib/fprint"
 #define CONF_FILE      "/etc/aurora/touchid.conf"
+#define PLATFORM_DIR   "/sys/bus/platform/devices"
 /* How long --boot waits for the driver to register its re-arm node. */
 #define BOOT_WAIT_S    30
 
@@ -195,6 +196,7 @@ static int pam_open(const char *user, const struct pam_conv *conv, pam_handle_t 
 }
 
 #define fprint_dir() test_env("AURORA_REARM_TEST_FPRINT_DIR", FPRINT_DIR)
+#define platform_dir() test_env("AURORA_REARM_TEST_PLATFORM", PLATFORM_DIR)
 #else
 static enum lock_state lockout_state(unsigned *failures, unsigned *flags)
 {
@@ -268,6 +270,7 @@ static const char *device_path(void)
 }
 
 #define fprint_dir() FPRINT_DIR
+#define platform_dir() PLATFORM_DIR
 #define conf_file() CONF_FILE
 #endif
 
@@ -506,6 +509,29 @@ static int conf_require_password(void)
 	return value;
 }
 
+/*
+ * Whether the kernel created a Secure Enclave device at all. On a SoC or
+ * board without an apple_sep profile the module enables nothing ("no platform
+ * profile for this SoC; the SEP stays disabled"), so the re-arm node can never
+ * appear and waiting for it only holds the boot.
+ */
+static int sep_device_present(void)
+{
+	DIR *d = opendir(platform_dir());
+	struct dirent *e;
+	int found = 0;
+
+	if (!d)
+		return 1; /* cannot tell: keep the old wait */
+	while (!found && (e = readdir(d))) {
+		size_t len = strlen(e->d_name);
+
+		found = len > 4 && strcmp(e->d_name + len - 4, ".sep") == 0;
+	}
+	closedir(d);
+	return found;
+}
+
 static int boot(void)
 {
 	int want = conf_require_password();
@@ -520,7 +546,8 @@ static int boot(void)
 		syslog(LOG_WARNING, "%s: require_password_after_boot is neither yes nor no; asking for the password after boot",
 		       conf_file());
 	/* The driver registers the node when the Secure Enclave comes up. */
-	for (int i = 0; i < BOOT_WAIT_S * 10 && stat(device_path(), &st) < 0; i++)
+	for (int i = 0; i < BOOT_WAIT_S * 10 && sep_device_present() &&
+			stat(device_path(), &st) < 0; i++)
 		usleep(100000);
 	if (require_password() < 0) {
 		if (errno == ENOENT) {
