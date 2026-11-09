@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -229,8 +230,12 @@ class BootTest(unittest.TestCase):
         self.device = self.tmp / 'device'
         self.conf = self.tmp / 'touchid.conf'
         self.device.write_text('unlocked 0 1\n')
+        # A Mac whose kernel enabled its Secure Enclave has a *.sep device.
+        self.platform = self.tmp / 'platform'
+        (self.platform / '2c3800000.sep').mkdir(parents=True)
         self.env = dict(os.environ, AURORA_REARM_TEST_DEVICE=str(self.device),
-                        AURORA_REARM_TEST_CONF=str(self.conf))
+                        AURORA_REARM_TEST_CONF=str(self.conf),
+                        AURORA_REARM_TEST_PLATFORM=str(self.platform))
 
     def tearDown(self):
         self.tmpdir.cleanup()
@@ -291,6 +296,18 @@ class BootTest(unittest.TestCase):
         self.conf.write_text('require_password_after_boot = yes\n')
         self.device.unlink()
         out = self.run_helper('--status')
+        self.assertEqual(out.returncode, 0)
+        self.assertIn('no Touch ID', out.stdout)
+
+    def test_boot_does_not_wait_without_a_secure_enclave(self):
+        # No SEP profile for this SoC: no *.sep device, so the re-arm node
+        # can never appear. --boot must not hold the boot for its 30 s wait.
+        self.conf.write_text('require_password_after_boot = yes\n')
+        (self.platform / '2c3800000.sep').rmdir()
+        self.device.unlink()
+        start = time.monotonic()
+        out = self.run_helper('--boot')
+        self.assertLess(time.monotonic() - start, 5)
         self.assertEqual(out.returncode, 0)
         self.assertIn('no Touch ID', out.stdout)
 
