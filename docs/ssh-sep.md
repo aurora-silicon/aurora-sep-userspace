@@ -2,6 +2,21 @@
 
 `aurora-sep-ssh` gives you an SSH key that opens only on this Mac and signs only after a Touch ID match. It's the Linux counterpart of a Secure Enclave SSH key on macOS (Secretive and similar tools). It uses only standard OpenSSH pieces: an encrypted key file, `ssh-agent`, `ssh-add -c` and `SSH_ASKPASS`. `ssh`, `git`, `ssh-keygen -Y sign` and anything else that talks to `SSH_AUTH_SOCK` work unchanged.
 
+## sk or ssh
+
+This repository has two ways to keep an SSH key behind the Secure Enclave. Prefer `sk/` where it works:
+
+| | `sk/` (`ecdsa-sk`, [ssh-sk.md](ssh-sk.md)) | `ssh/` (this page) |
+| --- | --- | --- |
+| Private key | made in the enclave, never leaves it; the enclave signs | ordinary ed25519 key file; its passphrase is sealed to the enclave |
+| Touch ID | enforced by the enclave (`/dev/sep-key` version 2) | checked by `fprintd-verify` in the agent's askpass, not by the enclave |
+| Key type | `sk-ecdsa-sha2-nistp256@openssh.com` only | ed25519 (`aurora-sep-ssh keygen`) |
+| Servers | need OpenSSH 8.2 or later and accept `-sk` keys | any SSH server, and services that accept only plain key types |
+| Kernel | `/dev/sep-key` | the `trusted` key type with the `apple_sep` source |
+
+Use `ssh/` when a server or service does not accept `-sk` keys, when you need an Ed25519 key, or
+on a kernel without `/dev/sep-key`. Otherwise use `sk/`: its key cannot be copied off the Mac, even by root.
+
 ## Try it
 
     aurora-sep-ssh keygen                  # ~/.ssh/id_ed25519_sep (+ .pub, .sep)

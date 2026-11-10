@@ -1,0 +1,42 @@
+# SPDX-License-Identifier: MIT
+[Unit]
+Description=Touch ID security key (FIDO2/U2F)
+Documentation=file:///usr/share/doc/aurora-fido/fido.md
+# Opt in: installed disabled. `aurora-fido enable` turns it on, `aurora-fido
+# disable` off. Keys go into the Secure Enclave through /dev/sep-key when the
+# kernel has it, otherwise they are sealed by it (aurora-fido status says which).
+After=aurora-sep.service dbus.service systemd-logind.service fprintd.service
+Wants=aurora-sep.service
+
+[Service]
+Type=simple
+ExecStart=@LIBEXECDIR@/aurora-fidod
+Restart=on-failure
+RestartSec=5
+StateDirectory=aurora-fido
+StateDirectoryMode=0700
+RuntimeDirectory=aurora-fido
+RuntimeDirectoryMode=0755
+ConfigurationDirectory=aurora-fido
+UMask=0077
+DevicePolicy=closed
+DeviceAllow=/dev/uhid rw
+DeviceAllow=/dev/sep-key rw
+PrivateNetwork=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+# AF_ALG + the kernel keyring: the master secret is unsealed with the SEP trusted key.
+RestrictAddressFamilies=AF_UNIX AF_ALG AF_NETLINK
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SETUID CAP_SETGID
+
+[Install]
+WantedBy=multi-user.target

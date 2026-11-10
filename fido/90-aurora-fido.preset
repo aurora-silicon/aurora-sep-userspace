@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: MIT
+# The Touch ID security key is opt in: installed off. Turn it on with
+# `sudo aurora-fido enable`.
+disable aurora-fido.service

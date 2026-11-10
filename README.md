@@ -1,8 +1,11 @@
 # aurora-sep-userspace
 
 Fedora packaging of libfprint for Apple Touch ID on Aurora Silicon kernels,
-SEP-sealed LUKS2 unlock (`luks/`), and SSH keys sealed to the Secure Enclave
-with Touch ID for every use (`ssh/`, [docs/ssh-sep.md](docs/ssh-sep.md)).
+SEP-sealed LUKS2 unlock (`luks/`), and two ways to keep SSH keys behind the
+Secure Enclave: an OpenSSH security-key provider for keys that live in the
+enclave (`sk/`, [docs/ssh-sk.md](docs/ssh-sk.md)), and ordinary key files whose
+passphrase is sealed to the enclave with Touch ID for every use (`ssh/`,
+[docs/ssh-sep.md](docs/ssh-sep.md)). [Which one to use](docs/ssh-sep.md#sk-or-ssh)
 
 The kernel side is the `apple_sep` driver in
 [aurora-silicon/linux](https://github.com/aurora-silicon/linux) (`aurora-wip`).
@@ -48,11 +51,25 @@ virtual-device regression tests. This is a required companion package:
 libfprint reports the device error, but stock fprintd 1.94.5 still deletes its
 own file. Build the patched fprintd RPM after the aurora libfprint RPM, then
 install both before relying on failed-delete recovery.
+`fprintd/0002-report-lockout-and-fall-back-to-the-password.patch` reports
+`FP_DEVICE_ERROR_LOCKED_OUT` as the new verify result `verify-lockout`; pam_fprintd
+then tells the user to use the password and returns at once.
 `fprintd/test_account_gate.py` compiles the patched account gate with a
 fake passwd lookup and covers missing entries, lookup errors, invalid uid and
 name mismatch without a device operation.
 The spec is based on [Fedora's f45 fprintd spec](https://src.fedoraproject.org/rpms/fprintd/blob/f45/f/fprintd.spec);
 the patch targets [fprintd v1.94.5](https://gitlab.freedesktop.org/libfprint/fprintd/-/tags/v1.94.5).
+
+## Touch ID lockout
+
+`touchid-rearm/` ends a Touch ID lockout after a password authentication, as
+macOS does: a PAM module straight after pam_unix and a root service that checks
+the password again before it asks the driver to re-arm. See
+[touchid-rearm/README.md](touchid-rearm/README.md). `make -C touchid-rearm check`
+tests it against real libpam stacks.
+It also applies the "Touch ID after a restart" setting (`/etc/aurora/touchid.conf`,
+`require_password_after_boot`): by default, as on macOS, the first login or unlock
+after boot needs the password; `no` gives Touch ID from the first login.
 
 ## SEP-sealed LUKS2 unlock
 
@@ -71,6 +88,26 @@ It needs libcryptsetup (2.4 or newer, with external tokens) and json-c. The
 checks need root on kernels with `af_alg_restrict`, which let only
 CAP_SYS_ADMIN or CAP_NET_ADMIN bind `ccm(aes)` through AF_ALG.
 `luks/tests/hw-loop-test.sh` is the hardware test on a loop file.
+
+## Touch ID security key (FIDO2/U2F)
+
+`fido/` holds `aurora-fidod`, a root daemon that creates a virtual FIDO HID
+device through `/dev/uhid` and speaks CTAP 2.1 and CTAP1/U2F, for WebAuthn and
+passkeys in Firefox and Chromium, SSH `ecdsa-sk` keys, pam_u2f and
+`systemd-cryptenroll --fido2-device`. It is opt in: installed off, turned on
+with `sudo aurora-fido enable` and off with `sudo aurora-fido disable`;
+`aurora-fido status` says which key store it uses. Credentials are P-256 keys
+inside the Secure Enclave (`/dev/sep-key`) when the kernel has it, and keys
+sealed by the Secure Enclave otherwise (root on the Mac can copy those; the
+status line says so). Every operation that needs the user asks for a Touch ID
+match through fprintd. Attestation is self or none: nothing here can prove
+Apple hardware to a website. Until the enclave itself enforces a biometric
+access control on the keys, the touch is checked by the daemon in software,
+so root can sign without one. See [docs/fido.md](docs/fido.md).
+
+    make -C fido && sudo make -C fido install && sudo aurora-fido enable
+    make -C fido check                 # unit tests, software stand-ins
+    sudo make -C fido check-uhid       # libfido2, OpenSSH, pam_u2f, cryptenroll on a uhid device
 
 ## Clamshell mode
 
@@ -149,6 +186,7 @@ top of it, or keep the version lock.
   `GPL-2.0 WITH Linux-syscall-note OR MIT` (`LICENSES/GPL-2.0-only.txt`,
   `LICENSES/Linux-syscall-note.txt`, `LICENSES/MIT.txt`).
 - `luks/` is MIT.
+- `fido/` is MIT.
 - Everything else here is MIT.
 
 ## Qualification

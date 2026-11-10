@@ -3,3 +3,11 @@
 /luks/test/
 /ssh/aurora-sep-ssh-seal
 /ssh/test/
+sk/libaurora-sep-sk.so
+sk/test/
+/fido/aurora-fido-seal
+/fido/aurora-fidod
+/fido/aurora-fido.service.out
+/fido/test/
+__pycache__/
+/fido/aurora-fido
