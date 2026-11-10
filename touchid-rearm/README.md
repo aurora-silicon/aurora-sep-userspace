@@ -65,8 +65,9 @@ the first login instead, set it in `/etc/aurora/touchid.conf`:
     # no:  Touch ID works from the first login after boot.
     require_password_after_boot = no
 
-`aurora-touchid-boot.service` reads it once per boot, before the display
-manager, user sessions and fprintd start. With `yes` (or no setting) it runs
+`aurora-touchid-boot.service` reads it once per boot, before fprintd
+starts. Every login, unlock and sudo reaches the reader through fprintd, so
+the display manager and user sessions do not wait for it. With `yes` (or no setting) it runs
 `aurora-touchid-rearm --boot`, which asks the driver
 (`SEP_BIO_REQUIRE_PASSWORD`) to refuse every verify, without a capture,
 until the first password authentication; that password reaches the driver

@@ -1,6 +1,8 @@
 /luks/libcryptsetup-token-aurora-sep.so
 /luks/aurora-sep-cryptenroll
 /luks/test/
+/ssh/aurora-sep-ssh-seal
+/ssh/test/
 sk/libaurora-sep-sk.so
 sk/test/
 /fido/aurora-fido-seal
