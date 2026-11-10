@@ -1,4 +1,4 @@
-From aa152739b5bdbcc7256679947926577986edf391 Mon Sep 17 00:00:00 2001
+From f14023b06ace38c276f1e30373a03558eb0d4145 Mon Sep 17 00:00:00 2001
 From: Ryan Murray <ryan@aurorasilicon.org>
 Date: Tue, 10 Nov 2026 16:58:13 +1100
 Subject: [PATCH] fprintd: don't ask for a finger the reader will not take
@@ -15,21 +15,67 @@ needs the password, start the verify as before, so it ends with the reader's
 own reason, but don't emit VerifyFingerSelected: front-ends then show only
 the password message.
 
+fp_device_get_password_required() is looked up at run time, so fprintd
+still builds against a libfprint without it and then behaves as before.
+
 Assisted-by: LLM
 Signed-off-by: Ryan Murray <ryan@aurorasilicon.org>
 ---
- src/device.c                              |  15 ++++-
+ src/device.c                              |  43 +++++++++++++-
  src/net.reactivated.Fprint.Device.xml     |   5 ++
  tests/__pycache__/fprintd.cpython-314.pyc | Bin 0 -> 238371 bytes
  tests/fprintd.py                          |  67 +++++++++++++++++++++-
- 4 files changed, 84 insertions(+), 3 deletions(-)
+ 4 files changed, 112 insertions(+), 3 deletions(-)
  create mode 100644 tests/__pycache__/fprintd.cpython-314.pyc
 
 diff --git a/src/device.c b/src/device.c
-index 9b4cc8b..17710f3 100644
+index 9b4cc8b..4ec69e5 100644
 --- a/src/device.c
 +++ b/src/device.c
-@@ -1664,7 +1664,9 @@ fprint_device_verify_start (FprintDBusDevice      *dbus_dev,
+@@ -22,6 +22,7 @@
+ 
+ #include <glib/gi18n.h>
+ #include <gio/gio.h>
++#include <gmodule.h>
+ #include <polkit/polkit.h>
+ #include <fprint.h>
+ 
+@@ -1653,6 +1654,34 @@ identify_cb (FpDevice *dev, GAsyncResult *res, void *user_data)
+     }
+ }
+ 
++typedef gboolean (*PasswordRequiredFunc) (FpDevice *device,
++                                          GError  **reason);
++
++/* fp_device_get_password_required() comes with libfprint's Aurora patches
++ * and may be missing from the libfprint fprintd was built against, so look it
++ * up in the one it runs with. Without it, no device needs the password first. */
++static gboolean
++device_password_required (FpDevice *dev, GError **reason)
++{
++  static PasswordRequiredFunc password_required = NULL;
++  static gsize resolved = 0;
++
++  if (g_once_init_enter (&resolved))
++    {
++      GModule *self = g_module_open (NULL, 0);
++      gpointer symbol = NULL;
++
++      if (self && g_module_symbol (self, "fp_device_get_password_required", &symbol))
++        password_required = (PasswordRequiredFunc) symbol;
++      g_debug ("fp_device_get_password_required() %s",
++               password_required ? "found" : "not available");
++      /* The main program's module stays open for the process */
++      g_once_init_leave (&resolved, 1);
++    }
++
++  return password_required != NULL && password_required (dev, reason);
++}
++
+ static gboolean
+ fprint_device_verify_start (FprintDBusDevice      *dbus_dev,
+                             GDBusMethodInvocation *invocation,
+@@ -1664,7 +1693,9 @@ fprint_device_verify_start (FprintDBusDevice      *dbus_dev,
    g_autoptr(GPtrArray) gallery = NULL;
    g_autoptr(SessionData) session = NULL;
    g_autoptr(GError) error = NULL;
@@ -39,22 +85,21 @@ index 9b4cc8b..17710f3 100644
  
    if (!_fprint_device_check_claimed (rdev, invocation, &error))
      {
-@@ -1713,6 +1715,14 @@ fprint_device_verify_start (FprintDBusDevice      *dbus_dev,
+@@ -1713,6 +1744,13 @@ fprint_device_verify_start (FprintDBusDevice      *dbus_dev,
          }
      }
  
 +  /* A device that refuses to match until the password ends this verify
 +   * with that reason and never waits for a finger: don't ask for one. */
-+  password_required = fp_device_get_password_required (priv->dev,
-+                                                       &password_reason);
++  password_required = device_password_required (priv->dev, &password_reason);
 +  if (password_required)
 +    g_debug ("device %d needs the password first: %s", priv->id,
-+             password_reason->message);
++             password_reason ? password_reason->message : "no reason given");
 +
    if (fp_device_has_feature (priv->dev, FP_DEVICE_FEATURE_IDENTIFY) &&
        finger == FP_FINGER_UNKNOWN)
      {
-@@ -1765,8 +1775,9 @@ fprint_device_verify_start (FprintDBusDevice      *dbus_dev,
+@@ -1765,8 +1803,9 @@ fprint_device_verify_start (FprintDBusDevice      *dbus_dev,
  
    /* Emit VerifyFingerSelected telling the front-end which finger
     * we selected for auth */

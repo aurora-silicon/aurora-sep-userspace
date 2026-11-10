@@ -33,8 +33,7 @@ Requires:	libfprint(aurora-sep) >= 5
 Requires:	libfprint(aurora-sep-lockout)
 # FP_DEVICE_ERROR_PASSWORD_REQUIRED{,_AFTER_BOOT} (0003)
 Requires:	libfprint(aurora-sep-password-reasons)
-# fp_device_get_password_required() (0004)
-BuildRequires:	libfprint-devel >= 1.94.100-1.aurora12
+# fp_device_get_password_required() (0004), looked up at run time
 Requires:	libfprint(aurora-sep-password-required)
 
 
