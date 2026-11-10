@@ -13,6 +13,9 @@ would, against the enclave double the image carries.
   tampered   the enclave refuses the user token: the prompt comes back and the
              recovery key typed there opens (its own token)
 
+The VM gets 2 GiB: the recovery key's offline keyslot uses the distribution
+default PBKDF (argon2id, up to 1 GiB when enrolled on a large machine).
+
 Usage: run-vm-pw.py <dir from run-all.sh> [builder ...]
 """
 import os
@@ -38,7 +41,7 @@ def boot(builder, kind, image, answers, timeout=240):
     log_path = os.path.join(D, f"serial-pw-{builder}-{kind}-{os.path.basename(image)}.log")
     cmdline = (f"console=ttyS0 rd.luks.name={UUID}=root root=/dev/mapper/root rw "
                f"init=/sbin/vm-init systemd.show_status=1 loglevel=4 panic=-1")
-    qemu = ["qemu-system-x86_64", "-enable-kvm", "-cpu", "host", "-m", "1024", "-smp", "2",
+    qemu = ["qemu-system-x86_64", "-enable-kvm", "-cpu", "host", "-m", "2048", "-smp", "2",
             "-display", "none", "-monitor", "none", "-serial", "stdio", "-no-reboot",
             "-kernel", os.path.join(D, f"vmlinuz-{builder}"),
             "-initrd", os.path.join(D, f"initrd-{builder}-{kind}.img"),
