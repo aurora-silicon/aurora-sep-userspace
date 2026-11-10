@@ -107,6 +107,22 @@ int fde_token_parse(const char *json, struct fde_token *t)
 	s = jstr(o, "aurora_sep_label");
 	snprintf(t->label, sizeof(t->label), "%s", s ? s : "");
 	t->offline_keyslot = -1;
+	t->owner = -1;
+	t->linux_uid = -1;
+	if (json_object_object_get_ex(o, "aurora_sep_owner", &v)) {
+		if (!json_object_is_type(v, json_type_boolean))
+			goto out;
+		t->owner = json_object_get_boolean(v) ? 1 : 0;
+	}
+	if (json_object_object_get_ex(o, "aurora_sep_linux_uid", &v)) {
+		if (!json_object_is_type(v, json_type_int))
+			goto out;
+		t->linux_uid = json_object_get_int64(v);
+		if (t->linux_uid < 0 || t->linux_uid > UINT32_MAX)
+			goto out;
+	}
+	s = jstr(o, "aurora_sep_user");
+	snprintf(t->user, sizeof(t->user), "%s", s ? s : "");
 	if (json_object_object_get_ex(o, "aurora_sep_offline_keyslot", &v)) {
 		if (!json_object_is_type(v, json_type_int))
 			goto out;
@@ -148,12 +164,18 @@ char *fde_token_build(const struct fde_token *t)
 		return NULL;
 	json_object_object_add(o, "type", json_object_new_string(SEP_SEAL_TOKEN_TYPE));
 	json_object_object_add(o, "keyslots", json_object_new_array());
-	json_object_object_add(o, "aurora_sep_version", json_object_new_int(2));
+	json_object_object_add(o, "aurora_sep_version", json_object_new_int(3));
 	json_object_object_add(o, "aurora_sep_mode", json_object_new_string(SEP_FDE_MODE));
 	json_object_object_add(o, "aurora_sep_role", json_object_new_string(t->role));
 	json_object_object_add(o, "aurora_sep_uid", json_object_new_int64(t->uid));
 	if (t->label[0])
 		json_object_object_add(o, "aurora_sep_label", json_object_new_string(t->label));
+	if (!strcmp(t->role, SEP_FDE_ROLE_USER) && t->owner >= 0)
+		json_object_object_add(o, "aurora_sep_owner", json_object_new_boolean(t->owner));
+	if (t->linux_uid >= 0)
+		json_object_object_add(o, "aurora_sep_linux_uid", json_object_new_int64(t->linux_uid));
+	if (t->user[0])
+		json_object_object_add(o, "aurora_sep_user", json_object_new_string(t->user));
 	if (t->offline_keyslot >= 0)
 		json_object_object_add(o, "aurora_sep_offline_keyslot",
 				       json_object_new_int(t->offline_keyslot));
@@ -745,6 +767,9 @@ int fde_bag_create(uint32_t uid, const char *pw, size_t n)
 		return -ENODEV;
 	if (!n || n > SEP_FDE_PASSWORD_MAX)
 		return -EINVAL;
+	/* As the enclave: no second bag under a uid it holds until reboot. */
+	if (live_bag(uid, bag) == 0)
+		return -EACCES;
 	ver = get_u32("ver", uid) + 1;
 	make_bag(uid, ver, pw, n, bag);
 	put_u32("ver", uid, ver);
@@ -1000,8 +1025,8 @@ int fde_open_token(const struct fde_token *t, const char *pw, size_t pw_len,
 	return 0;
 }
 
-int fde_enroll(uint32_t uid, const char *role, const char *pw, size_t pw_len,
-	       const uint8_t secret[SEP_FDE_SECRET_BYTES], struct fde_token *t)
+int fde_enroll_in_bag(uint32_t uid, const char *role, const char *pw, size_t pw_len,
+		      const uint8_t secret[SEP_FDE_SECRET_BYTES], struct fde_token *t)
 {
 	uint8_t check[SEP_FDE_SECRET_BYTES];
 	size_t n = 0;
@@ -1009,11 +1034,10 @@ int fde_enroll(uint32_t uid, const char *role, const char *pw, size_t pw_len,
 
 	memset(t, 0, sizeof(*t));
 	t->offline_keyslot = -1;
+	t->owner = -1;
+	t->linux_uid = -1;
 	t->uid = uid;
 	snprintf(t->role, sizeof(t->role), "%s", role);
-	r = fde_bag_create(uid, pw, pw_len);
-	if (r)
-		return r;
 	r = fde_bag_unlock(uid, pw, pw_len);
 	if (r)
 		goto fail;
@@ -1040,4 +1064,16 @@ fail:
 	fde_bag_lock(uid);
 	fde_token_free(t);
 	return r;
+}
+
+int fde_enroll(uint32_t uid, const char *role, const char *pw, size_t pw_len,
+	       const uint8_t secret[SEP_FDE_SECRET_BYTES], struct fde_token *t)
+{
+	int r;
+
+	memset(t, 0, sizeof(*t));
+	r = fde_bag_create(uid, pw, pw_len);
+	if (r)
+		return r;
+	return fde_enroll_in_bag(uid, role, pw, pw_len, secret, t);
 }

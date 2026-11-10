@@ -51,6 +51,12 @@ struct fde_token {
 	 * key without the enclave (-1: none), so a Mac whose SEP cannot answer
 	 * never locks its owner out. */
 	int offline_keyslot;
+	/* User tokens: 1 owner (may add, remove and reset other users), 0 not,
+	 * -1 written before owners existed (treated as an owner). */
+	int owner;
+	/* The Linux account the token belongs to (user tokens; -1 unknown). */
+	int64_t linux_uid;
+	char user[64];
 };
 
 struct fde_state {
@@ -97,6 +103,13 @@ int fde_open_token(const struct fde_token *t, const char *pw, size_t pw_len,
  */
 int fde_enroll(uint32_t uid, const char *role, const char *pw, size_t pw_len,
 	       const uint8_t secret[SEP_FDE_SECRET_BYTES], struct fde_token *t);
+
+/*
+ * As fde_enroll, under a bag the enclave already holds for uid (another
+ * volume of the same user): pw must unlock it.
+ */
+int fde_enroll_in_bag(uint32_t uid, const char *role, const char *pw, size_t pw_len,
+		      const uint8_t secret[SEP_FDE_SECRET_BYTES], struct fde_token *t);
 
 /*
  * Wait up to wait_s seconds for the enclave's re-arm node at early boot (the

@@ -10,6 +10,7 @@ trap 'rm -rf "$T"' EXIT
 export AURORA_SEP_TOKEN_DIR="$B"
 MAC_A=$T/mac-a; MAC_B=$T/mac-b; mkdir -p "$MAC_A" "$MAC_B"
 export AURORA_SEP_FDE_MOCK="$MAC_A"
+export AURORA_SEP_FDE_CONF="$T/fde.conf" AURORA_SEP_FDE_VOLUMES="$T/fde-volumes"
 CS0="cryptsetup --disable-locks --batch-mode"
 CS="$CS0 --external-tokens-path $B"
 F="$B/aurora-sep-fde"
@@ -18,7 +19,7 @@ pass() { echo "PASS $1"; }
 fail() { echo "FAIL $1"; fails=$((fails + 1)); }
 try() { if "$@" >"$T/out" 2>&1; then return 0; else cat "$T/out" >&2; return 1; fi; }
 no() { if "$@" >"$T/out" 2>&1; then cat "$T/out" >&2; return 1; else return 0; fi; }
-attempts() { "$F" status "$1" | sed -n "s/.*${2:-user, bag uid 60200}.*failed attempts \([0-9]*\).*/\1/p"; }
+attempts() { "$F" status "$1" | sed -n "s/.*${2:-bag uid 60200,}.*failed attempts \([0-9]*\).*/\1/p"; }
 reboot_mac() { rm -f "$AURORA_SEP_FDE_MOCK"/live-* "$AURORA_SEP_FDE_MOCK"/unlocked-*; }
 
 img=$T/img
@@ -58,7 +59,7 @@ if no "$F" remove-passphrase --unlock-key-file "$T/rk" "$img"; then pass "remove
 if try "$F" test --recovery-key-file "$T/rk-typed" "$img"; then pass "recovery key typed in lower case without dashes opens"; else fail "recovery key typed"; fi
 [ "$(attempts "$img")" = 0 ] && pass "recovery key never costs the user's bag an attempt" || fail "rk counted on user bag"
 "$F" test --password-file "$T/bad" "$img" >/dev/null 2>&1 || true
-[ "$(attempts "$img" 'recovery, bag uid 60201')" = 0 ] && pass "a password never costs the recovery bag an attempt" || fail "pw counted on recovery bag"
+[ "$(attempts "$img" 'bag uid 60201,')" = 0 ] && pass "a password never costs the recovery bag an attempt" || fail "pw counted on recovery bag"
 try "$F" test --password-file "$T/pw" "$img" || fail "reset the user count"
 
 cp "$img" "$T/img-before-change"
@@ -78,7 +79,7 @@ if AURORA_SEP_FDE_MOCK="$MAC_B" no "$F" test --recovery-key-file "$T/rk" "$T/img
 if try "$F" reset-password --uid 60200 --recovery-key-file "$T/rk" --new-file "$T/pw3" "$img"; then pass "reset password with the recovery key"; else fail "reset"; fi
 if try "$F" test --password-file "$T/pw3" "$img"; then pass "reset password opens"; else fail "reset password open"; fi
 if no "$F" test --password-file "$T/pw2" "$img"; then pass "forgotten password slot gone after reset"; else fail "old after reset"; fi
-n=$("$F" status "$img" | grep -c ' user, ')
+n=$("$F" status "$img" | grep -c ', user ')
 [ "$n" = 1 ] && pass "one password token after reset" || fail "password tokens $n"
 
 if try "$F" remove-passphrase --unlock-key-file "$T/pass" "$img"; then pass "remove the installer passphrase"; else fail "remove passphrase"; fi
