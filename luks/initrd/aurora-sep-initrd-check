@@ -1,0 +1,14 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# On the real root: say when the initramfs carries an old copy of the Secure
+# Enclave key store. A stale copy cannot unseal, so the root would keep asking
+# for its passphrase until the initramfs is rebuilt.
+set -u
+sums=/run/aurora-sep/initrd-keystore.sha256
+[ -s "$sums" ] || exit 0
+if sha256sum --status -c "$sums" 2>/dev/null; then
+    echo "aurora-sep: the initramfs key store copy matches /var/lib"
+    exit 0
+fi
+echo "<4>aurora-sep: the initramfs carries an old copy of the Secure Enclave key store; rebuild it (dracut -f, mkinitcpio -P or nixos-rebuild) so volumes sealed by the SEP unlock at boot" >&2
+exit 0

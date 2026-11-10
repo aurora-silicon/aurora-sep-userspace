@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: MIT
+[Unit]
+Description=Check the Secure Enclave key store copy in the initramfs
+Documentation=man:aurora-sep-cryptenroll(8)
+ConditionPathExists=/run/aurora-sep/initrd-keystore.sha256
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=@LIBEXECDIR@/aurora-sep-initrd-check
+
+[Install]
+WantedBy=multi-user.target

@@ -76,7 +76,9 @@ static int open_password_mode(struct crypt_device *cd, const char *json, const c
 		pw = rk;
 		pw_len = strlen(rk);
 	}
-	r = fde_open_token(&t, pw, pw_len, secret);
+	r = fde_wait_ready(wait_seconds());
+	if (!r)
+		r = fde_open_token(&t, pw, pw_len, secret);
 	sep_wipe(rk, sizeof(rk));
 	fde_token_free(&t);
 	if (r == -ENODEV || r == -ETIMEDOUT) {

@@ -16,6 +16,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <glob.h>
+#include <time.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <sys/random.h>
@@ -104,6 +106,15 @@ int fde_token_parse(const char *json, struct fde_token *t)
 	snprintf(t->role, sizeof(t->role), "%s", s);
 	s = jstr(o, "aurora_sep_label");
 	snprintf(t->label, sizeof(t->label), "%s", s ? s : "");
+	t->offline_keyslot = -1;
+	if (json_object_object_get_ex(o, "aurora_sep_offline_keyslot", &v)) {
+		if (!json_object_is_type(v, json_type_int))
+			goto out;
+		uid = json_object_get_int64(v);
+		if (uid < 0 || uid > 31)
+			goto out;
+		t->offline_keyslot = (int)uid;
+	}
 	if (jhex(o, "aurora_sep_bag", BAG_MAX, &t->bag, &t->bag_len) ||
 	    jhex(o, "aurora_sep_record", RECORD_MAX, &t->record, &t->record_len) ||
 	    jhex(o, "aurora_sep_sealed", SEALED_MAX, &t->sealed, &t->sealed_len))
@@ -143,6 +154,9 @@ char *fde_token_build(const struct fde_token *t)
 	json_object_object_add(o, "aurora_sep_uid", json_object_new_int64(t->uid));
 	if (t->label[0])
 		json_object_object_add(o, "aurora_sep_label", json_object_new_string(t->label));
+	if (t->offline_keyslot >= 0)
+		json_object_object_add(o, "aurora_sep_offline_keyslot",
+				       json_object_new_int(t->offline_keyslot));
 	if (jset_hex(o, "aurora_sep_bag", t->bag, t->bag_len) ||
 	    jset_hex(o, "aurora_sep_record", t->record, t->record_len) ||
 	    jset_hex(o, "aurora_sep_sealed", t->sealed, t->sealed_len))
@@ -262,6 +276,54 @@ static int sep_ioctl(unsigned long cmd, void *arg)
 	r = ioctl(fd, cmd, arg) < 0 ? -errno : 0;
 	close(fd);
 	return r;
+}
+
+/*
+ * At early boot the password is typed while the enclave may still be coming
+ * up: the re-arm node appears when the key store opens (with apple_sep
+ * keystore_only=2 in the initrd, or after the full attach). Wait only while
+ * a SEP driver is there and its key store is not decided; once it reads
+ * "open" the node follows within the same bring-up step.
+ */
+static int sep_driver_present(void)
+{
+	glob_t g = { 0 };
+	int found;
+
+	if (access("/sys/module/apple_sep", F_OK) == 0)
+		return 1;
+	found = glob("/sys/bus/platform/devices/*.sep", GLOB_NOSORT, NULL, &g) == 0 &&
+		g.gl_pathc > 0;
+	globfree(&g);
+	return found;
+}
+
+int fde_wait_ready(int wait_s)
+{
+	struct timespec step = { 0, 250 * 1000 * 1000 };
+	long tries = (long)wait_s * 4, open_grace = 8;
+
+	for (;;) {
+		if (access(SEP_FDE_DEV, F_OK) == 0)
+			return 0;
+		if (!sep_driver_present())
+			return -ENODEV;
+		switch (sep_keystore_state()) {
+		case SEP_KEYSTORE_CLOSED:
+			return -ENODEV;
+		case SEP_KEYSTORE_OPEN:
+			/* A driver without the initrd user-bag phase never
+			 * publishes the node here. */
+			if (open_grace-- <= 0)
+				return -ENODEV;
+			break;
+		default:
+			break;
+		}
+		if (tries-- <= 0)
+			return -ETIMEDOUT;
+		nanosleep(&step, NULL);
+	}
 }
 
 static int secret_req(unsigned long cmd, uint32_t uid, const char *pw, size_t n)
@@ -443,6 +505,13 @@ int fde_unseal(uint32_t uid, const uint8_t *record, size_t record_len,
 
 #else
 /* ---- test double (SEP_FDE_MOCK) ---------------------------------------- */
+
+/* The double is always ready unless a test says this "Mac" has no SEP. */
+int fde_wait_ready(int wait_s)
+{
+	(void)wait_s;
+	return getenv("AURORA_SEP_FDE_MOCK_NOSEP") ? -ENODEV : 0;
+}
 
 /* SHA-256 (FIPS 180-4), small and slow; the double needs a PRF and a MAC. */
 struct sha { uint32_t h[8]; uint8_t b[64]; uint64_t n; size_t l; };
@@ -939,6 +1008,7 @@ int fde_enroll(uint32_t uid, const char *role, const char *pw, size_t pw_len,
 	int r;
 
 	memset(t, 0, sizeof(*t));
+	t->offline_keyslot = -1;
 	t->uid = uid;
 	snprintf(t->role, sizeof(t->role), "%s", role);
 	r = fde_bag_create(uid, pw, pw_len);

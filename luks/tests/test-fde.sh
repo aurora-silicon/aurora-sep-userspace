@@ -30,7 +30,7 @@ printf 'wrong horse' > "$T/bad"
 printf 'new staple password' > "$T/pw2"
 printf 'after reset password' > "$T/pw3"
 $CS0 luksFormat --type luks2 --pbkdf pbkdf2 --pbkdf-force-iterations 1000 \
-	--luks2-metadata-size 64k --luks2-keyslots-size 1m "$img" "$T/pass"
+	--luks2-metadata-size 64k --luks2-keyslots-size 2m "$img" "$T/pass"
 
 if try "$F" enroll --uid 60200 --label tester --unlock-key-file "$T/pass" --password-file "$T/pw" "$img"; then pass "enroll password"; else fail "enroll password"; fi
 if $CS luksDump "$img" | grep -q 'Sealed by:   Apple Secure Enclave (user key bag)'; then pass "plugin dump hook (password mode)"; else fail "dump hook"; fi
@@ -48,6 +48,13 @@ if try "$F" recovery --uid 60201 --unlock-key-file "$T/pass" --recovery-key-file
 grep -Eq '^[A-Z2-9]{4}(-[A-Z2-9]{4}){5}$' "$T/rk" && pass "recovery key format XXXX-XXXX-XXXX-XXXX-XXXX-XXXX" || fail "recovery key format"
 if try "$F" test --recovery-key-file "$T/rk" "$img"; then pass "recovery key opens"; else fail "recovery key"; fi
 tr 'A-Z' 'a-z' < "$T/rk" | tr -d '-' > "$T/rk-typed"
+# Never a brick: the recovery key also opens a plain keyslot, with no token
+# plugin and no enclave at all (what the passphrase prompt does when the SEP
+# cannot answer).
+if cryptsetup --disable-locks --batch-mode --disable-external-tokens open --test-passphrase \
+	--key-file "$T/rk" "$img"; then pass "recovery key opens its offline keyslot without the SEP"; else fail "offline recovery keyslot"; fi
+"$F" status "$img" | grep -q 'offline recovery keyslot [0-9]' && pass "status shows the offline recovery keyslot" || fail "status offline keyslot"
+if no "$F" remove-passphrase --unlock-key-file "$T/rk" "$img"; then pass "remove-passphrase keeps the offline recovery keyslot"; else fail "offline keyslot removed"; fi
 if try "$F" test --recovery-key-file "$T/rk-typed" "$img"; then pass "recovery key typed in lower case without dashes opens"; else fail "recovery key typed"; fi
 [ "$(attempts "$img")" = 0 ] && pass "recovery key never costs the user's bag an attempt" || fail "rk counted on user bag"
 "$F" test --password-file "$T/bad" "$img" >/dev/null 2>&1 || true

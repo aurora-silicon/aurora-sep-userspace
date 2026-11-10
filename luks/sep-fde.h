@@ -47,6 +47,10 @@ struct fde_token {
 	size_t record_len;
 	uint8_t *sealed;
 	size_t sealed_len;
+	/* Recovery tokens: the plain LUKS2 keyslot that takes the same recovery
+	 * key without the enclave (-1: none), so a Mac whose SEP cannot answer
+	 * never locks its owner out. */
+	int offline_keyslot;
 };
 
 struct fde_state {
@@ -93,6 +97,14 @@ int fde_open_token(const struct fde_token *t, const char *pw, size_t pw_len,
  */
 int fde_enroll(uint32_t uid, const char *role, const char *pw, size_t pw_len,
 	       const uint8_t secret[SEP_FDE_SECRET_BYTES], struct fde_token *t);
+
+/*
+ * Wait up to wait_s seconds for the enclave's re-arm node at early boot (the
+ * key store can take most of a minute on some Macs). 0 when it is there,
+ * -ENODEV when this machine has no SEP driver or its key store stayed closed,
+ * -ETIMEDOUT otherwise.
+ */
+int fde_wait_ready(int wait_s);
 
 int fde_recovery_key_new(char out[SEP_FDE_RK_LEN + 1]);
 /* Canonical form of a typed recovery key (case, spaces and dashes ignored);

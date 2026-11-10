@@ -1,0 +1,106 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# mkinitcpio install hook: open LUKS2 volumes that carry an aurora-sep token
+# with the Mac's Secure Enclave from the initrd, the root volume included.
+# Needs a systemd-based image: HOOKS=(base systemd ... aurora-sep sd-encrypt ...).
+
+: "${AURORA_SEP_INITRD_DIR:=/usr/lib/aurora-sep/initrd}"
+
+_aurora_sep_kernel_ok() {
+    modinfo -k "$KERNELVERSION" -F parm apple_sep 2>/dev/null | grep -q '^keystore_only:'
+}
+
+_aurora_sep_kernel_user_bags() {
+    modinfo -k "$KERNELVERSION" -F parm apple_sep 2>/dev/null | grep -q '^keystore_only:.*per-user key bags'
+}
+
+# Password-mode volumes (aurora-sep-fde) named in /etc/crypttab.initramfs, or
+# AURORA_SEP_PASSWORD_UNLOCK=yes in mkinitcpio.conf for volumes this host
+# cannot see (an installer target, an image file).
+_aurora_sep_wants_user_bags() {
+    local name dev rest
+    [[ ${AURORA_SEP_PASSWORD_UNLOCK:-} == yes ]] && return 0
+    [[ -r /etc/crypttab.initramfs ]] || return 1
+    while read -r name dev rest; do
+        [[ -z $name || $name == \#* ]] && continue
+        case $dev in
+        UUID=*) dev=/dev/disk/by-uuid/${dev#UUID=} ;;
+        PARTUUID=*) dev=/dev/disk/by-partuuid/${dev#PARTUUID=} ;;
+        esac
+        cryptsetup luksDump --dump-json-metadata "$dev" 2>/dev/null |
+            grep -Eq '"aurora_sep_mode":[[:space:]]*"password"' && return 0
+    done </etc/crypttab.initramfs
+    return 1
+}
+
+build() {
+    local plugin=/usr/lib/cryptsetup/libcryptsetup-token-aurora-sep.so f mode=1 sums=""
+
+    if [[ ! -e $plugin ]]; then
+        error "aurora-sep: $plugin is missing"
+        return 1
+    fi
+    add_binary "$plugin"
+    add_file "$AURORA_SEP_INITRD_DIR/aurora-sep-cryptsetup.conf" \
+        /usr/lib/systemd/system/systemd-cryptsetup@.service.d/aurora-sep.conf
+    # AES-256-CCM through AF_ALG, by key serial. '?' skips what is built in.
+    add_module 'algif_aead?'
+    add_module 'ccm?'
+    add_module 'ctr?'
+    add_module 'aes-ce-ccm?'
+    add_module 'aes-ce-cipher?'
+
+    # Without the key-store-only phase a driver loaded here could not finish
+    # its attach on the real root (the SEP takes one attach per boot).
+    if ! _aurora_sep_kernel_ok; then
+        warning "aurora-sep: apple_sep in $KERNELVERSION has no key-store-only phase; volumes sealed by the Secure Enclave will ask for their passphrase in the initrd"
+        return 0
+    fi
+    if _aurora_sep_wants_user_bags; then
+        if _aurora_sep_kernel_user_bags; then
+            mode=2
+        else
+            warning "aurora-sep: apple_sep in $KERNELVERSION cannot unlock a user's key bag in the initrd; volumes sealed to a password will ask for their passphrase or recovery key there"
+        fi
+    fi
+    if [[ ! -s /var/lib/aurora-sep-keybag.bin && $mode == 1 ]]; then
+        warning "aurora-sep: this system has no Secure Enclave key store in /var/lib yet; volumes sealed by it will ask for their passphrase in the initrd"
+        return 0
+    fi
+
+    add_module apple_sep
+    # Read-only copies of the key store at the paths the driver reads. Only
+    # this Mac's SEP under this Linux OS identity can use them.
+    for f in /var/lib/aurora-sep-keybag.bin /var/lib/aurora-sep-refkey.bin \
+        /var/lib/aurora-sep-refkey-v2.bin; do
+        [[ -s $f ]] || continue
+        add_file "$f" "$f" 0600
+        sums+="$(sha256sum <"$f" | cut -d' ' -f1)  $f"$'\n'
+    done
+    add_dir /usr/lib/aurora-sep
+    printf '%s' "$sums" >"$BUILDROOT/usr/lib/aurora-sep/initrd-keystore.sha256"
+    printf 'AURORA_SEP_KEYSTORE_ONLY=%s\n' "$mode" >"$BUILDROOT/usr/lib/aurora-sep/initrd.conf"
+
+    add_file "$AURORA_SEP_INITRD_DIR/aurora-sep-initrd-load" \
+        /usr/lib/aurora-sep/aurora-sep-initrd-load 0755
+    add_binary mkdir
+    add_binary modinfo
+    add_file "$AURORA_SEP_INITRD_DIR/aurora-sep-initrd.service" \
+        /usr/lib/systemd/system/aurora-sep-initrd.service
+    add_symlink /usr/lib/systemd/system/cryptsetup-pre.target.wants/aurora-sep-initrd.service \
+        ../aurora-sep-initrd.service
+    # cryptsetup-pre.target is passive; the unit pulls it in (Wants=) once
+    # sysinit.target starts the unit.
+    add_symlink /usr/lib/systemd/system/sysinit.target.wants/aurora-sep-initrd.service \
+        ../aurora-sep-initrd.service
+}
+
+help() {
+    cat <<HELPEOF
+Opens LUKS2 volumes enrolled with aurora-sep-cryptenroll through the Mac's
+Secure Enclave in the initrd, the root volume included. Use it with the
+systemd and sd-encrypt hooks, before sd-encrypt. Every volume keeps its
+passphrase, which systemd-cryptsetup asks for when the Secure Enclave cannot
+unseal the token.
+HELPEOF
+}

@@ -40,6 +40,24 @@
 /* Seconds to wait for the SEP trusted-key source to register at boot. */
 #define SEP_SEAL_WAIT_DEFAULT	60
 
+/*
+ * The apple_sep driver's key store state, from its diag/keystore attribute:
+ * "unknown" while the SEP is still bringing it up, then "open" or "closed".
+ * ABSENT: no such attribute (no driver loaded, or a kernel without it).
+ */
+#define SEP_KEYSTORE_GLOB	"/sys/bus/platform/drivers/apple_sep/*/diag/keystore"
+enum {
+	SEP_KEYSTORE_ABSENT,
+	SEP_KEYSTORE_UNKNOWN,
+	SEP_KEYSTORE_OPEN,
+	SEP_KEYSTORE_CLOSED,
+};
+int sep_keystore_state(void);
+#ifdef SEP_SEAL_TEST_USER_KEYS
+/* Tests point the reader at a fake sysfs tree. */
+void sep_set_keystore_glob(const char *pattern);
+#endif
+
 struct sep_sealed {
 	char *blob_hex;				/* sealed AES key, from the kernel */
 	uint8_t iv[SEP_SEAL_IV_BYTES];

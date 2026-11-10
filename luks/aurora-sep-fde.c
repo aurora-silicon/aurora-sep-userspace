@@ -5,7 +5,7 @@
  * password unlocks; a recovery key is a second bag with its own keyslot.
  *
  *   aurora-sep-fde enroll   --uid N [--label NAME] --unlock-key-file F [--password-file P] DEVICE
- *   aurora-sep-fde recovery --uid N --unlock-key-file F [--recovery-key-file OUT] DEVICE
+ *   aurora-sep-fde recovery --uid N --unlock-key-file F [--recovery-key-file OUT] [--sep-only] DEVICE
  *   aurora-sep-fde change-password --uid N [--old-file O --new-file P] DEVICE
  *   aurora-sep-fde reset-password  --uid N [--recovery-key-file R --new-file P] DEVICE
  *   aurora-sep-fde test     [--password-file P | --recovery-key-file R] [--name MAPPING] DEVICE
@@ -40,7 +40,7 @@ struct opts {
 	const char *cmd, *device, *unlock_key_file, *password_file, *old_file, *new_file,
 		*recovery_key_file, *label, *name;
 	long uid;
-	int quiet;
+	int quiet, sep_only;
 };
 
 static void die_usage(void)
@@ -226,6 +226,45 @@ static int verify_slot(struct crypt_device *cd, int ks, const uint8_t secret[SEP
 	return r < 0 ? r : 0;
 }
 
+static int replace_token(struct crypt_device *cd, int tok, const struct fde_token *t);
+
+/*
+ * The recovery key also opens a plain LUKS2 keyslot (the distribution's
+ * default PBKDF), so the volume opens at the passphrase prompt when this
+ * Mac's SEP cannot answer at all (no driver, a refused key store, another OS
+ * identity after a reinstall). The key has about 120 bits of entropy, so an
+ * offline slot does not weaken it. --sep-only leaves it out (FileVault's
+ * strict form: every unlock goes through the enclave).
+ */
+static int add_offline_recovery_slot(struct crypt_device *cd, long uid, const char *existing,
+				     size_t elen, const char *rk)
+{
+	struct fde_token t;
+	int tok, ks, r;
+
+	r = crypt_set_pbkdf_type(cd, NULL);
+	if (r < 0)
+		return r;
+	ks = crypt_keyslot_add_by_passphrase(cd, CRYPT_ANY_SLOT, existing, elen, rk, strlen(rk));
+	if (ks < 0)
+		return ks;
+	r = crypt_activate_by_passphrase(cd, NULL, ks, rk, strlen(rk), 0);
+	tok = find_token(cd, uid, SEP_FDE_ROLE_RECOVERY, &t);
+	if (r >= 0 && tok >= 0) {
+		t.offline_keyslot = ks;
+		r = replace_token(cd, tok, &t);
+	} else if (r >= 0) {
+		r = tok;
+	}
+	if (tok >= 0)
+		fde_token_free(&t);
+	if (r < 0) {
+		crypt_keyslot_destroy(cd, ks);
+		return r;
+	}
+	return ks;
+}
+
 static int cmd_enroll(struct crypt_device *cd, const struct opts *o, int recovery)
 {
 	uint8_t secret[SEP_FDE_SECRET_BYTES];
@@ -278,6 +317,18 @@ static int cmd_enroll(struct crypt_device *cd, const struct opts *o, int recover
 	r = verify_slot(cd, ks, secret);
 	if (r)
 		goto out;
+	if (recovery && !o->sep_only) {
+		int oks = add_offline_recovery_slot(cd, o->uid, existing, elen, rk);
+
+		if (oks < 0) {
+			r = oks;
+			fprintf(stderr, "aurora-sep-fde: adding the offline recovery keyslot failed (%s)\n",
+				strerror(-r));
+			goto out;
+		}
+		if (!o->quiet)
+			printf("offline recovery keyslot %d (opens at the passphrase prompt without the SEP)\n", oks);
+	}
 	if (recovery) {
 		if (o->recovery_key_file) {
 			int fd = open(o->recovery_key_file, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
@@ -473,6 +524,15 @@ static int cmd_remove_passphrase(struct crypt_device *cd, const struct opts *o)
 			fprintf(stderr, "aurora-sep-fde: keyslot %d belongs to a token; not removing it\n", ks);
 			return -EBUSY;
 		}
+	if (find_token(cd, -1, SEP_FDE_ROLE_RECOVERY, &t) >= 0) {
+		int offline = t.offline_keyslot;
+
+		fde_token_free(&t);
+		if (offline == ks) {
+			fprintf(stderr, "aurora-sep-fde: keyslot %d is the offline recovery keyslot; not removing it\n", ks);
+			return -EBUSY;
+		}
+	}
 	r = crypt_keyslot_destroy(cd, ks);
 	if (!r && !o->quiet)
 		printf("removed passphrase keyslot %d\n", ks);
@@ -574,6 +634,8 @@ static int cmd_status(struct crypt_device *cd)
 		printf("token %d: keyslot %d, %s, bag uid %u%s%s, bag %zu B, record %zu B, sealed %zu B",
 		       tok, token_keyslot(cd, tok), t.role, t.uid, t.label[0] ? " " : "", t.label,
 		       t.bag_len, t.record_len, t.sealed_len);
+		if (t.offline_keyslot >= 0)
+			printf(", offline recovery keyslot %d", t.offline_keyslot);
 		if (fde_bag_state(t.uid, &st) == 0)
 			printf(", enclave: bag state %u, failed attempts %u\n", st.bag_state, st.failed_attempts);
 		else
@@ -597,6 +659,7 @@ int main(int argc, char **argv)
 		{ "recovery-key-file", required_argument, NULL, 'r' },
 		{ "name", required_argument, NULL, 'N' },
 		{ "quiet", no_argument, NULL, 'q' },
+		{ "sep-only", no_argument, NULL, 'S' },
 		{ NULL, 0, NULL, 0 },
 	};
 	struct opts o = { .uid = -1 };
@@ -618,6 +681,7 @@ int main(int argc, char **argv)
 		case 'r': o.recovery_key_file = optarg; break;
 		case 'N': o.name = optarg; break;
 		case 'q': o.quiet = 1; break;
+		case 'S': o.sep_only = 1; break;
 		default: die_usage();
 		}
 	}
