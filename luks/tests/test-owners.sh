@@ -159,7 +159,7 @@ tok=$($CS0 luksDump --dump-json-metadata "$T/dmg.img" | python3 -c 'import json,
 $CS0 token export --token-id "$tok" "$T/dmg.img" >"$T/tok.json"
 python3 - "$T/tok.json" <<'PY'
 import json,sys
-p=sys.argv[1]; d=json.load(open(p)); d["aurora_sep_bag"]="zz"+d["aurora_sep_bag"][2:]; json.dump(d,open(p,"w"))
+p=sys.argv[1]; d=json.load(open(p)); d["aurora_sep_bag64"]="!!"+d["aurora_sep_bag64"][2:]; json.dump(d,open(p,"w"))
 PY
 $CS0 token remove --token-id "$tok" "$T/dmg.img"
 if $CS0 token import --external-tokens-path "$B" --token-id "$tok" --json-file "$T/tok.json" "$T/dmg.img" 2>/dev/null; then :; else

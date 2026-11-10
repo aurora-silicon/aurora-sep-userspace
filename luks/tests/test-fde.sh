@@ -91,13 +91,27 @@ tok=$($CS luksDump --dump-json-metadata "$img" | python3 -c 'import json,sys; d=
 $CS token export --token-id "$tok" "$img" > "$T/tok.json"
 python3 - "$T/tok.json" <<'PY'
 import json,sys
-p=sys.argv[1]; d=json.load(open(p)); s=d["aurora_sep_sealed"]
-d["aurora_sep_sealed"]=s[:40]+("0" if s[40]!="0" else "1")+s[41:]; json.dump(d,open(p,"w"))
+p=sys.argv[1]; d=json.load(open(p)); s=d["aurora_sep_sealed64"]
+d["aurora_sep_sealed64"]=s[:40]+("0" if s[40]!="0" else "1")+s[41:]; json.dump(d,open(p,"w"))
 PY
 cp "$img" "$T/img-tamper"
 $CS token remove --token-id "$tok" "$T/img-tamper"
 $CS token import --token-id "$tok" --json-file "$T/tok.json" "$T/img-tamper"
 if no "$F" test --password-file "$T/pw3" "$T/img-tamper"; then pass "tampered sealed secret refused"; else fail "tamper opened"; fi
+
+# Tokens written before base64 (hex fields) still open.
+cp "$img" "$T/img-hex"
+$CS token export --token-id "$tok" "$img" >"$T/tok64.json"
+python3 - "$T/tok64.json" <<'PY2'
+import base64,json,sys
+p=sys.argv[1]; d=json.load(open(p))
+for k in ("bag","record","sealed"):
+    d["aurora_sep_"+k]=base64.b64decode(d.pop("aurora_sep_%s64"%k)).hex()
+json.dump(d,open(p,"w"))
+PY2
+$CS token remove --token-id "$tok" "$T/img-hex"
+$CS token import --token-id "$tok" --json-file "$T/tok64.json" "$T/img-hex"
+if try "$F" test --password-file "$T/pw3" "$T/img-hex"; then pass "a token in the old hex form still opens"; else fail "hex token"; fi
 
 echo "test-fde: $fails failure(s)"
 [ "$fails" = 0 ]

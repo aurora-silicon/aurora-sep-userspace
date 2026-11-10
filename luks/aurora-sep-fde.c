@@ -338,6 +338,9 @@ static const char *errname(int r)
 	case -EEXIST: return "already enrolled";
 	case -EBUSY: return "that is the last owner of this volume";
 	case -ENODEV: return "no Secure Enclave key store";
+	case -ENOSPC: return "the volume's LUKS2 metadata area is full; each password token takes about "
+			     "3 KB, so volumes for several users need a larger area "
+			     "(cryptsetup luksFormat --luks2-metadata-size 256k)";
 	default: return strerror(-r);
 	}
 }

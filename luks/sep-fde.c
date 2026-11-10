@@ -75,6 +75,73 @@ static int jhex(struct json_object *o, const char *key, size_t max, uint8_t **ou
 	return 0;
 }
 
+/*
+ * Base64 (RFC 4648, padded). A wrapped user bag is about 1.5 KB; in hex a
+ * token took about 4 KB, so the default 16 KiB LUKS2 metadata area held only
+ * two of them. Tokens written as hex ("aurora_sep_bag") still parse.
+ */
+static const char b64_alphabet[] =
+	"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+static int b64_val(char c)
+{
+	const char *p = c ? strchr(b64_alphabet, c) : NULL;
+
+	return p ? (int)(p - b64_alphabet) : -1;
+}
+
+static int jb64(struct json_object *o, const char *key, size_t max, uint8_t **out, size_t *len)
+{
+	const char *s = jstr(o, key);
+	size_t n, pad = 0, olen, j = 0;
+
+	if (!s)
+		return -EINVAL;
+	n = strlen(s);
+	if (n == 0 || n % 4)
+		return -EINVAL;
+	if (s[n - 1] == '=')
+		pad++;
+	if (s[n - 2] == '=')
+		pad++;
+	olen = n / 4 * 3 - pad;
+	if (olen == 0 || olen > max)
+		return -EINVAL;
+	*out = malloc(olen);
+	if (!*out)
+		return -ENOMEM;
+	for (size_t i = 0; i < n; i += 4) {
+		int v[4];
+		uint32_t w;
+
+		for (int k = 0; k < 4; k++) {
+			v[k] = (s[i + k] == '=' && i + 4 == n && k >= 2) ? 0 : b64_val(s[i + k]);
+			if (v[k] < 0)
+				goto bad;
+		}
+		w = (uint32_t)v[0] << 18 | (uint32_t)v[1] << 12 | (uint32_t)v[2] << 6 | (uint32_t)v[3];
+		for (int k = 0; k < 3 && j < olen; k++)
+			(*out)[j++] = (uint8_t)(w >> (16 - 8 * k));
+	}
+	*len = olen;
+	return 0;
+bad:
+	free(*out);
+	*out = NULL;
+	return -EINVAL;
+}
+
+/* "<key>64" in base64, or "<key>" in hex (tokens written before 0.3). */
+static int jbin(struct json_object *o, const char *key, size_t max, uint8_t **out, size_t *len)
+{
+	char k64[64];
+
+	snprintf(k64, sizeof(k64), "%s64", key);
+	if (jstr(o, k64))
+		return jb64(o, k64, max, out, len);
+	return jhex(o, key, max, out, len);
+}
+
 int fde_token_parse(const char *json, struct fde_token *t)
 {
 	struct json_object *o, *v;
@@ -131,9 +198,9 @@ int fde_token_parse(const char *json, struct fde_token *t)
 			goto out;
 		t->offline_keyslot = (int)uid;
 	}
-	if (jhex(o, "aurora_sep_bag", BAG_MAX, &t->bag, &t->bag_len) ||
-	    jhex(o, "aurora_sep_record", RECORD_MAX, &t->record, &t->record_len) ||
-	    jhex(o, "aurora_sep_sealed", SEALED_MAX, &t->sealed, &t->sealed_len))
+	if (jbin(o, "aurora_sep_bag", BAG_MAX, &t->bag, &t->bag_len) ||
+	    jbin(o, "aurora_sep_record", RECORD_MAX, &t->record, &t->record_len) ||
+	    jbin(o, "aurora_sep_sealed", SEALED_MAX, &t->sealed, &t->sealed_len))
 		goto out;
 	r = 0;
 out:
@@ -143,15 +210,28 @@ out:
 	return r;
 }
 
-static int jset_hex(struct json_object *o, const char *key, const uint8_t *b, size_t n)
+static int jset_b64(struct json_object *o, const char *key, const uint8_t *b, size_t n)
 {
-	char *h = malloc(2 * n + 1);
+	char *e = malloc((n + 2) / 3 * 4 + 1);
+	size_t j = 0;
 
-	if (!h)
+	if (!e)
 		return -ENOMEM;
-	sep_hex_encode(b, n, h, 2 * n + 1);
-	json_object_object_add(o, key, json_object_new_string(h));
-	free(h);
+	for (size_t i = 0; i < n; i += 3) {
+		uint32_t w = (uint32_t)b[i] << 16;
+
+		if (i + 1 < n)
+			w |= (uint32_t)b[i + 1] << 8;
+		if (i + 2 < n)
+			w |= b[i + 2];
+		e[j++] = b64_alphabet[w >> 18 & 63];
+		e[j++] = b64_alphabet[w >> 12 & 63];
+		e[j++] = i + 1 < n ? b64_alphabet[w >> 6 & 63] : '=';
+		e[j++] = i + 2 < n ? b64_alphabet[w & 63] : '=';
+	}
+	e[j] = '\0';
+	json_object_object_add(o, key, json_object_new_string(e));
+	free(e);
 	return 0;
 }
 
@@ -179,9 +259,9 @@ char *fde_token_build(const struct fde_token *t)
 	if (t->offline_keyslot >= 0)
 		json_object_object_add(o, "aurora_sep_offline_keyslot",
 				       json_object_new_int(t->offline_keyslot));
-	if (jset_hex(o, "aurora_sep_bag", t->bag, t->bag_len) ||
-	    jset_hex(o, "aurora_sep_record", t->record, t->record_len) ||
-	    jset_hex(o, "aurora_sep_sealed", t->sealed, t->sealed_len))
+	if (jset_b64(o, "aurora_sep_bag64", t->bag, t->bag_len) ||
+	    jset_b64(o, "aurora_sep_record64", t->record, t->record_len) ||
+	    jset_b64(o, "aurora_sep_sealed64", t->sealed, t->sealed_len))
 		goto out;
 	out = strdup(json_object_to_json_string_ext(o, JSON_C_TO_STRING_PLAIN));
 out:

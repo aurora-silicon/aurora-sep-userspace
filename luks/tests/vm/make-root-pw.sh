@@ -37,7 +37,7 @@ tok=$(cryptsetup luksDump --dump-json-metadata "$img" | python3 -c "
 import json,sys; t=json.load(sys.stdin)['tokens']
 print([k for k,v in t.items() if v.get('aurora_sep_role')=='user'][0])")
 cryptsetup token export --token-id "$tok" "$W/root-pw-tampered.img" |
-	python3 -c 'import json,sys; t=json.load(sys.stdin); s=t["aurora_sep_sealed"]; t["aurora_sep_sealed"]=s[:-1]+("0" if s[-1]!="0" else "1"); print(json.dumps(t))' \
+	python3 -c 'import json,sys; t=json.load(sys.stdin); s=t["aurora_sep_sealed64"]; t["aurora_sep_sealed64"]=s[:20]+("A" if s[20]!="A" else "B")+s[21:]; print(json.dumps(t))' \
 	>"$W/pw-tampered.json"
 cryptsetup --batch-mode token import --token-id "$tok" --token-replace --json-file "$W/pw-tampered.json" "$W/root-pw-tampered.img"
 echo "password-mode root ready"
