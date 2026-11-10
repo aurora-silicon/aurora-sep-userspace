@@ -10,7 +10,8 @@ would, against the enclave double the image carries.
   nosep      no SEP on this Mac: the password cannot be checked, systemd falls
              back to the passphrase prompt and the recovery key opens its
              offline keyslot (never a brick)
-  tampered   the enclave refuses the user token: passphrase prompt, recovery key
+  tampered   the enclave refuses the user token: the prompt comes back and the
+             recovery key typed there opens (its own token)
 
 Usage: run-vm-pw.py <dir from run-all.sh> [builder ...]
 """
@@ -117,9 +118,9 @@ for b in BUILDERS:
            "/dev/mapper/root" in root and order[:2] == ["PIN", "PASS"],
            f"prompts {order}; {root or 'no root'}; {log}")
 
-    order, root, log = boot(b, "pw", bad_img, [(PIN, PW), (PASS, RK)])
-    record(f"{b} enclave refuses the token: passphrase prompt, recovery key opens",
-           "/dev/mapper/root" in root and order[:2] == ["PIN", "PASS"],
+    order, root, log = boot(b, "pw", bad_img, [(PIN, PW), (PIN, loose)])
+    record(f"{b} enclave refuses the user token: asked again, the recovery key opens",
+           "/dev/mapper/root" in root and order[:2] == ["PIN", "PIN"] and "PASS" not in order,
            f"prompts {order}; {root or 'no root'}; {log}")
 
 fails = sum(1 for _, ok in results if not ok)

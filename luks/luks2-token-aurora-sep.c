@@ -66,6 +66,20 @@ static int open_password_mode(struct crypt_device *cd, const char *json, const c
 		fde_token_free(&t);
 		return -ENOANO;
 	}
+	/*
+	 * Without a usable enclave every password token must say so, whatever
+	 * the PIN looks like: one -ENOANO (from the token of the other role)
+	 * would make libcryptsetup report "PIN needed" and systemd ask again
+	 * forever, never reaching the passphrase prompt where the recovery
+	 * key's offline keyslot opens the volume.
+	 */
+	r = fde_wait_ready(wait_seconds());
+	if (r < 0) {
+		fde_token_free(&t);
+		crypt_logf(cd, CRYPT_LOG_VERBOSE,
+			  "aurora-sep: the Secure Enclave key store is not available\n");
+		return -EAGAIN;
+	}
 	is_rk = fde_recovery_key_normalize(pin, pin_size, rk) == 0;
 	if (is_rk != !strcmp(t.role, SEP_FDE_ROLE_RECOVERY)) {
 		fde_token_free(&t);
@@ -76,9 +90,7 @@ static int open_password_mode(struct crypt_device *cd, const char *json, const c
 		pw = rk;
 		pw_len = strlen(rk);
 	}
-	r = fde_wait_ready(wait_seconds());
-	if (!r)
-		r = fde_open_token(&t, pw, pw_len, secret);
+	r = fde_open_token(&t, pw, pw_len, secret);
 	sep_wipe(rk, sizeof(rk));
 	fde_token_free(&t);
 	if (r == -ENODEV || r == -ETIMEDOUT) {
