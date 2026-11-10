@@ -9,6 +9,7 @@
 set -eu
 src=$1 B=$2 pass=$3 W=$4
 export AURORA_SEP_FDE_MOCK=$W/mock AURORA_SEP_TOKEN_DIR=$B
+export AURORA_SEP_FDE_CONF=$W/fde.conf AURORA_SEP_FDE_VOLUMES=$W/fde-volumes
 rm -rf "$W/mock"; mkdir -p "$W/mock"
 img=$W/root-pw.img
 cp "$src" "$img"
@@ -17,6 +18,11 @@ cryptsetup --batch-mode token remove --token-id 0 "$img"
 printf 'vm user password' >"$W/pw"
 printf 'vm wrong password' >"$W/pw-bad"
 "$B/aurora-sep-fde" enroll --uid 60300 --label vm --unlock-key-file "$pass" --password-file "$W/pw" "$img"
+# A second volume owner, whose password then changes before boot.
+printf 'vm second old password' >"$W/pw2-old"
+printf 'vm second password' >"$W/pw2"
+"$B/aurora-sep-fde" enroll --uid 60302 --owner --label second --unlock-key-file "$pass" --password-file "$W/pw2-old" "$img"
+"$B/aurora-sep-fde" change-password --uid 60302 --old-file "$W/pw2-old" --new-file "$W/pw2" "$img"
 rm -f "$W/rk"
 "$B/aurora-sep-fde" recovery --uid 60301 --unlock-key-file "$pass" --recovery-key-file "$W/rk" "$img"
 # The FileVault end state: the installer passphrase goes (the recovery key

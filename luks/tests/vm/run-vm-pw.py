@@ -10,6 +10,9 @@ would, against the enclave double the image carries.
   nosep      no SEP on this Mac: the password cannot be checked, systemd falls
              back to the passphrase prompt and the recovery key opens its
              offline keyslot (never a brick)
+  second     a second volume owner's password opens root at the same prompt
+  changed    that owner's password changed before boot: the old one is refused,
+             the new one opens
   tampered   the enclave refuses the user token: the prompt comes back and the
              recovery key typed there opens (its own token)
 
@@ -28,6 +31,8 @@ D = sys.argv[1]
 BUILDERS = sys.argv[2:] or ["dracut"]
 PW = open(os.path.join(D, "pw")).read()
 BAD = open(os.path.join(D, "pw-bad")).read()
+PW2 = open(os.path.join(D, "pw2")).read()
+PW2_OLD = open(os.path.join(D, "pw2-old")).read()
 RK = open(os.path.join(D, "rk")).read().strip()
 UUID = open(os.path.join(D, "root.uuid")).read().strip()
 PIN = b"token PIN"
@@ -114,6 +119,16 @@ for b in BUILDERS:
     order, root, log = boot(b, "pw", img, [(PIN, loose)])
     record(f"{b} recovery key at the token prompt opens root",
            "/dev/mapper/root" in root and "PASS" not in order,
+           f"prompts {order}; {root or 'no root'}; {log}")
+
+    order, root, log = boot(b, "pw", img, [(PIN, PW2)])
+    record(f"{b} a second volume owner's password opens root",
+           "/dev/mapper/root" in root and order[:1] == ["PIN"] and "PASS" not in order,
+           f"prompts {order}; {root or 'no root'}; {log}")
+
+    order, root, log = boot(b, "pw", img, [(PIN, PW2_OLD), (PIN, PW2)])
+    record(f"{b} changed password: the old one refused, the new one opens",
+           "/dev/mapper/root" in root and order[:2] == ["PIN", "PIN"] and "PASS" not in order,
            f"prompts {order}; {root or 'no root'}; {log}")
 
     order, root, log = boot(b, "pwnosep", img, [(PIN, PW), (PASS, RK)])
