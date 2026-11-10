@@ -1,0 +1,177 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+#
+# aurora-sep-ssh: SSH keys that only open on this Mac, and only with Touch ID.
+#
+# The private key is an ordinary OpenSSH key file, encrypted with a random
+# 512-bit passphrase that this Mac's Secure Enclave seals (KEY.sep next to
+# it). Copied to any other machine, or to another Linux install on this one,
+# the key file cannot be opened. Loading the key unseals the passphrase
+# through sudo after a Touch ID match, and the key goes into a
+# dedicated ssh-agent with the confirm constraint: every signature asks
+# Touch ID (fprintd-verify) first. Plain OpenSSH throughout: ssh, git,
+# ssh-keygen -Y sign all use it through SSH_AUTH_SOCK.
+set -euo pipefail
+
+LIBEXEC=${AURORA_SEP_SSH_LIBEXEC:-/usr/libexec/aurora-sep-ssh}
+ASKPASS=${AURORA_SEP_SSH_ASKPASS:-$LIBEXEC/aurora-sep-ssh-askpass}
+DEFAULT_KEY=$HOME/.ssh/id_ed25519_sep
+RUNDIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/aurora-sep-ssh
+SOCK=$RUNDIR/agent.sock
+
+die() { echo "aurora-sep-ssh: $*" >&2; exit 1; }
+
+usage() {
+	cat <<EOF
+usage: aurora-sep-ssh COMMAND [options]
+
+  keygen [-f KEY] [-C COMMENT]   new ed25519 key sealed to this Mac's Secure Enclave
+                                 (default KEY: ~/.ssh/id_ed25519_sep)
+  agent                          start (or find) the Touch ID agent; use as
+                                 eval "\$(aurora-sep-ssh agent)"
+  add [-t LIFE] [KEY]            Touch ID, then unseal (sudo) and load KEY into
+                                 the agent; every use then asks for Touch ID
+  remove [KEY]                   drop KEY from the agent
+  status [KEY]                   key, record, agent, Secure Enclave check
+  stop                           stop the agent (all keys forgotten)
+
+Environment: AURORA_SEP_SSH_PRESENCE=fprintd (default), or none to skip the
+Touch ID checks (unattended tests only; add and the agent then go ahead
+without asking), or deny to refuse. The agent keeps the value it was
+started with.
+EOF
+}
+
+key_arg() { echo "${1:-$DEFAULT_KEY}"; }
+
+agent_alive() {
+	[ -S "$SOCK" ] || return 1
+	local rc=0
+	SSH_AUTH_SOCK=$SOCK ssh-add -l >/dev/null 2>&1 || rc=$?
+	[ "$rc" -le 1 ]	# 0 keys listed, 1 no keys; 2 = no agent
+}
+
+cmd_keygen() {
+	local key=$DEFAULT_KEY comment
+	comment="$(id -un)@$(hostname -s) (Secure Enclave, $(date +%Y-%m-%d))"
+	while getopts "f:C:" o; do
+		case $o in
+		f) key=$OPTARG ;;
+		C) comment=$OPTARG ;;
+		*) usage; exit 2 ;;
+		esac
+	done
+	[ -e "$key" ] || [ -e "$key.sep" ] && die "$key or $key.sep exists; pick another -f"
+	mkdir -p "$(dirname "$key")"
+	chmod 700 "$(dirname "$key")" 2>/dev/null || true
+	umask 077
+
+	echo "Sealing a new passphrase to this Mac's Secure Enclave (sudo: Touch ID or password)..." >&2
+	AURORA_SEP_SSH_PRESENCE=none "$ASKPASS" --seal-new > "$key.sep.new"
+	mv "$key.sep.new" "$key.sep"
+
+	# ssh-keygen asks for the passphrase twice; the askpass unseals it each
+	# time (sudo caches the first authentication).
+	if ! AURORA_SEP_SSH_RECORD=$key.sep SSH_ASKPASS=$ASKPASS SSH_ASKPASS_REQUIRE=force \
+		ssh-keygen -q -t ed25519 -a 16 -f "$key" -C "$comment" </dev/null; then
+		rm -f "$key" "$key.pub" "$key.sep"
+		die "ssh-keygen failed"
+	fi
+	echo "New Secure Enclave SSH key:" >&2
+	echo "  private  $key (useless without this Mac's Secure Enclave)" >&2
+	echo "  sealed   $key.sep" >&2
+	echo "  public   $key.pub" >&2
+	ssh-keygen -l -f "$key.pub" >&2
+	cat "$key.pub"
+}
+
+cmd_agent() {
+	mkdir -p "$RUNDIR"
+	chmod 700 "$RUNDIR"
+	if ! agent_alive; then
+		rm -f "$SOCK"
+		# The agent runs the askpass for every confirm-constrained key.
+		env SSH_ASKPASS="$ASKPASS" SSH_ASKPASS_REQUIRE=force \
+			AURORA_SEP_SSH_PRESENCE="${AURORA_SEP_SSH_PRESENCE:-fprintd}" \
+			ssh-agent -a "$SOCK" -s >"$RUNDIR/agent.env"
+		echo "aurora-sep-ssh: started the Touch ID agent ($SOCK)" >&2
+	fi
+	echo "SSH_AUTH_SOCK=$SOCK; export SSH_AUTH_SOCK;"
+}
+
+cmd_add() {
+	local life=""
+	while getopts "t:" o; do
+		case $o in
+		t) life=$OPTARG ;;
+		*) usage; exit 2 ;;
+		esac
+	done
+	shift $((OPTIND - 1))
+	local key
+	key=$(key_arg "${1:-}")
+	[ -f "$key" ] || die "no key $key (aurora-sep-ssh keygen makes one)"
+	[ -f "$key.sep" ] || die "no sealed record $key.sep"
+	agent_alive || die "no Touch ID agent; run: eval \"\$(aurora-sep-ssh agent)\""
+	if [ "${SSH_AUTH_SOCK:-}" != "$SOCK" ]; then
+		echo "aurora-sep-ssh: note: SSH_AUTH_SOCK is not the Touch ID agent; loading into $SOCK" >&2
+	fi
+	# Touch ID before the key is unsealed, whatever sudo's own policy is
+	# (a NOPASSWD sudoers rule would otherwise load it without a touch).
+	SSH_ASKPASS_PROMPT=confirm "$ASKPASS" "load $(basename "$key") into the SSH agent" ||
+		die "Touch ID did not match; key not loaded"
+	echo "Unsealing $key with the Secure Enclave..." >&2
+	SSH_AUTH_SOCK=$SOCK AURORA_SEP_SSH_RECORD=$key.sep SSH_ASKPASS=$ASKPASS SSH_ASKPASS_REQUIRE=force \
+		ssh-add -c ${life:+-t "$life"} "$key" </dev/null
+	echo "Loaded. Every use asks for Touch ID." >&2
+}
+
+cmd_remove() {
+	local key
+	key=$(key_arg "${1:-}")
+	SSH_AUTH_SOCK=$SOCK ssh-add -d "$key.pub"
+}
+
+cmd_status() {
+	local key
+	key=$(key_arg "${1:-}")
+	echo "key      $key $( [ -f "$key" ] && echo present || echo MISSING)"
+	echo "record   $key.sep $( [ -f "$key.sep" ] && echo present || echo MISSING)"
+	[ -f "$key.pub" ] && echo "public   $(ssh-keygen -l -f "$key.pub")"
+	if agent_alive; then
+		echo "agent    $SOCK"
+		SSH_AUTH_SOCK=$SOCK ssh-add -l 2>&1 | sed 's/^/         /'
+	else
+		echo "agent    not running (eval \"\$(aurora-sep-ssh agent)\")"
+	fi
+	if [ -f "$key.sep" ]; then
+		if AURORA_SEP_SSH_RECORD=$key.sep "$ASKPASS" --open-check >/dev/null; then
+			echo "enclave  this Mac's Secure Enclave opens the record"
+		else
+			echo "enclave  the record does NOT open here"
+		fi
+	fi
+}
+
+cmd_stop() {
+	if [ -f "$RUNDIR/agent.env" ]; then
+		# shellcheck disable=SC1091
+		. "$RUNDIR/agent.env" >/dev/null
+		SSH_AGENT_PID=$SSH_AGENT_PID ssh-agent -k >/dev/null 2>&1 || true
+	fi
+	rm -f "$SOCK" "$RUNDIR/agent.env"
+	echo "aurora-sep-ssh: agent stopped" >&2
+}
+
+cmd=${1:-}
+[ $# -gt 0 ] && shift
+case $cmd in
+keygen) cmd_keygen "$@" ;;
+agent) cmd_agent "$@" ;;
+add) cmd_add "$@" ;;
+remove) cmd_remove "$@" ;;
+status) cmd_status "$@" ;;
+stop) cmd_stop "$@" ;;
+-h | --help | help) usage ;;
+*) usage; exit 2 ;;
+esac

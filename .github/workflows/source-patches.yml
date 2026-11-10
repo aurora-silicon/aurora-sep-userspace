@@ -72,6 +72,8 @@ jobs:
           sudo python3 -c "import socket; s=socket.socket(socket.AF_ALG, socket.SOCK_SEQPACKET); s.bind(('aead','ccm(aes)')); print('AF_ALG ccm(aes) bind ok')"
           make -C luks
           sudo make -C luks check
+          make -C ssh
+          sudo make -C ssh check
           make -C fido test/aurora-fido-seal
           sudo make -C fido check-seal
       - name: AF_ALG diagnostics
@@ -85,6 +87,7 @@ jobs:
       - name: Shell syntax
         run: |
           sh -n luks/tests/hw-loop-test.sh && sh -n luks/tests/test-luks.sh
+          bash -n ssh/aurora-sep-ssh && bash -n ssh/aurora-sep-ssh-askpass && bash -n ssh/tests/test-ssh.sh
           bash -n fido/tests/test-uhid.sh && bash -n fido/tests/test-seal.sh
 
   sk-provider:
@@ -115,6 +118,10 @@ jobs:
           make -C luks install DESTDIR=$PWD/dest
           test -x dest/usr/bin/aurora-sep-cryptenroll
           test -f dest/usr/lib64/cryptsetup/libcryptsetup-token-aurora-sep.so
+          make -C ssh
+          make -C ssh install DESTDIR=$PWD/dest
+          test -x dest/usr/bin/aurora-sep-ssh
+          test -x dest/usr/libexec/aurora-sep-ssh/aurora-sep-ssh-seal
           make -C fido
           make -C fido install DESTDIR=$PWD/dest
           test -x dest/usr/libexec/aurora-fido/aurora-fidod
