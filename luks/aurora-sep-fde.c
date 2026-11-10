@@ -115,6 +115,21 @@ static int get_secret(const char *file, const char *prompt, int confirm, char *b
 	return r ? r : (*len ? 0 : -EINVAL);
 }
 
+/*
+ * An existing LUKS passphrase from --unlock-key-file is a key file in the
+ * cryptsetup sense: every byte counts, a trailing newline included (as with
+ * "cryptsetup luksFormat DEV FILE" and systemd-cryptenroll --unlock-key-file).
+ */
+static int get_key(const char *file, const char *prompt, char *buf, size_t *len)
+{
+	int r;
+
+	if (!file)
+		return get_secret(NULL, prompt, 0, buf, len);
+	r = read_file(file, buf, SECRET_MAX, len);
+	return r ? r : (*len ? 0 : -EINVAL);
+}
+
 static int load(struct crypt_device **cd, const char *device)
 {
 	const char *dir = secure_getenv("AURORA_SEP_TOKEN_DIR");
@@ -226,7 +241,7 @@ static int cmd_enroll(struct crypt_device *cd, const struct opts *o, int recover
 			o->uid, recovery ? "recovery" : "password");
 		return -EEXIST;
 	}
-	r = get_secret(o->unlock_key_file, "Existing LUKS passphrase: ", 0, existing, &elen);
+	r = get_key(o->unlock_key_file, "Existing LUKS passphrase: ", existing, &elen);
 	if (r)
 		return r;
 	if (recovery) {
@@ -445,7 +460,7 @@ static int cmd_remove_passphrase(struct crypt_device *cd, const struct opts *o)
 	if (r < 0)
 		goto refuse;
 	fde_token_free(&t);
-	r = get_secret(o->unlock_key_file, "Passphrase to remove: ", 0, pass, &n);
+	r = get_key(o->unlock_key_file, "Passphrase to remove: ", pass, &n);
 	if (r)
 		return r;
 	ks = crypt_activate_by_passphrase(cd, NULL, CRYPT_ANY_SLOT, pass, n, 0);

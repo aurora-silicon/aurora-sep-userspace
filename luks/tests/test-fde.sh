@@ -23,7 +23,8 @@ reboot_mac() { rm -f "$AURORA_SEP_FDE_MOCK"/live-* "$AURORA_SEP_FDE_MOCK"/unlock
 
 img=$T/img
 truncate -s 32M "$img"
-printf 'installer passphrase' > "$T/pass"
+# a key file as luksFormat reads it: every byte, the trailing newline included
+printf 'installer passphrase\n' > "$T/pass"
 printf 'correct horse battery' > "$T/pw"
 printf 'wrong horse' > "$T/bad"
 printf 'new staple password' > "$T/pw2"
