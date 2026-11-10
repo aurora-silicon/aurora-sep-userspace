@@ -24,7 +24,7 @@
 #include "sep-fde.h"
 #include "sep-seal.h"
 
-#define BAG_MAX		1024
+#define BAG_MAX		4096	/* SEP_KEYBAG_BLOB_MAX: a fresh user bag wraps to 1504 bytes */
 #define RECORD_MAX	2048
 #define SEALED_MAX	256
 
@@ -227,6 +227,8 @@ struct kb_blob {
 	uint32_t uid, len;
 	uint8_t data[BAG_MAX];
 };
+/* The ioctl numbers encode these sizes: they must match <linux/apple-sep.h>. */
+_Static_assert(sizeof(struct kb_blob) == 8 + 4096, "struct sep_keybag_blob");
 struct fde_key_req {
 	uint32_t uid, record_len;
 	uint8_t record[RECORD_MAX];
