@@ -669,6 +669,12 @@ int fde_add_user(struct crypt_device *cd, const struct fde_conf *c, const char *
 	uint32_t bag_uid = 0;
 	int r, ks;
 
+	char rk[SEP_FDE_RK_LEN + 1];
+
+	/* A password shaped like a recovery key goes only to recovery tokens
+	 * at the unlock prompt, so it could never open this token. */
+	if (!pw_len || pw_len > SEP_FDE_PASSWORD_MAX || fde_recovery_key_normalize(pw, pw_len, rk) == 0)
+		return -EINVAL;
 	if (fde_find_user_token(cd, u, &t) >= 0) {
 		fde_token_free(&t);
 		return -EEXIST;

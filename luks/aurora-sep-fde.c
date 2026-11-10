@@ -430,7 +430,8 @@ static int cmd_enroll_user(struct crypt_device *cd, const struct opts *o)
 	sep_wipe(existing, sizeof(existing));
 	sep_wipe(pw, sizeof(pw));
 	if (r) {
-		fprintf(stderr, "aurora-sep-fde: enrolment failed (%s)\n", errname(r));
+		fprintf(stderr, "aurora-sep-fde: enrolment failed (%s)\n",
+			r == -EINVAL ? "the password is empty, too long or shaped like a recovery key" : errname(r));
 		return r;
 	}
 	if (u.name[0] && fde_volumes_add(&o->conf, o->device))
@@ -467,7 +468,8 @@ static int cmd_add_user(struct crypt_device *cd, const struct opts *o)
 	sep_wipe(existing, sizeof(existing));
 	sep_wipe(pw, sizeof(pw));
 	if (r) {
-		fprintf(stderr, "aurora-sep-fde: adding %s failed (%s)\n", u.name, errname(r));
+		fprintf(stderr, "aurora-sep-fde: adding %s failed (%s)\n", u.name,
+			r == -EINVAL ? "the password is empty, too long or shaped like a recovery key" : errname(r));
 		return r;
 	}
 	if (u.name[0])
@@ -877,12 +879,14 @@ static int status_one(struct crypt_device *cd, const char *device)
 		found++;
 		ks = token_keyslot(cd, tok);
 		printf("token %d: keyslot %d, %s", tok, ks, t.role);
-		if (!strcmp(t.role, SEP_FDE_ROLE_USER))
-			printf(" %s%s%s, %s", t.user[0] ? t.user : "", t.user[0] ? " " : "",
-			       t.label[0] && strcmp(t.label, t.user) ? t.label : "",
+		if (!strcmp(t.role, SEP_FDE_ROLE_USER)) {
+			int lbl = t.label[0] && strcmp(t.label, t.user);
+
+			printf(" %s%s%s, %s", t.user, t.user[0] && lbl ? " " : "", lbl ? t.label : "",
 			       t.owner != 0 ? "owner" : "unlock only");
-		else if (t.label[0])
+		} else if (t.label[0]) {
 			printf(" %s", t.label);
+		}
 		printf(", bag uid %u, bag %zu B, record %zu B, sealed %zu B", t.uid, t.bag_len,
 		       t.record_len, t.sealed_len);
 		if (ks < 0)

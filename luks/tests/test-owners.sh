@@ -24,9 +24,9 @@ try() { if "$@" >"$T/out" 2>&1; then return 0; else cat "$T/out" >&2; return 1; 
 no() { if "$@" >"$T/out" 2>&1; then cat "$T/out" >&2; return 1; else return 0; fi; }
 said() { grep -q "$1" "$T/out"; }
 reboot_mac() { rm -f "$AURORA_SEP_FDE_MOCK"/live-* "$AURORA_SEP_FDE_MOCK"/unlocked-*; }
-attempts() { "$F" status "$1" | sed -n "s/.*user $2 .*failed attempts \([0-9]*\).*/\1/p"; }
+attempts() { "$F" status "$1" | sed -n "s/.*user $2[ ,].*failed attempts \([0-9]*\).*/\1/p"; }
 opens() { "$F" test --password-file "$T/$2" "$1" >/dev/null 2>&1; }
-owner_of() { "$F" status "$1" | grep -q "user $2 .*, owner,"; }
+owner_of() { "$F" status "$1" | grep -Eq "user $2( [^,]*)?, owner,"; }
 
 cat >"$T/passwd" <<'EOF'
 root:x:0:0:root:/root:/bin/bash
@@ -60,7 +60,7 @@ grep -qx "$A" "$T/fde-volumes" && pass "volume registered in fde-volumes" || fai
 if try "$F" add-user --user bob --auth-user alice --auth-password-file "$T/alice" --password-file "$T/bob" "$A"; then pass "owner alice adds bob"; else fail "add bob"; fi
 owner_of "$A" bob && pass "bob (wheel) becomes an owner" || fail "bob not owner"
 if try "$F" add-user --user carol --auth-user alice --auth-password-file "$T/alice" --password-file "$T/carol" "$A"; then pass "owner alice adds carol"; else fail "add carol"; fi
-"$F" status "$A" | grep -q "user carol .*unlock only" && pass "carol (standard user) can unlock but is not an owner" || fail "carol role"
+"$F" status "$A" | grep -q "user carol[ ,].*unlock only" && pass "carol (standard user) can unlock but is not an owner" || fail "carol role"
 if SUDO_USER=bob try "$F" add-user --user root --auth-password-file "$T/bob" --password-file "$T/root" "$A"; then pass "the sudo user (bob) authorizes adding root"; else fail "sudo-user auth"; fi
 owner_of "$A" root && pass "root becomes an owner" || fail "root not owner"
 for u in alice bob carol; do opens "$A" "$u" && pass "$u's password unlocks" || fail "$u does not unlock"; done
@@ -77,6 +77,8 @@ if no "$F" add-user --user dave --auth-user alice --auth-password-file "$T/bad" 
 [ "$(attempts "$A" alice)" -ge 1 ] && pass "the enclave counted the owner's wrong password" || fail "owner attempt not counted"
 if no "$F" add-user --user dave --password-file "$T/dave" "$A"; then pass "no authorizing owner, no change"; else fail "unauthorized add"; fi
 opens "$A" dave && fail "dave got in" || pass "dave still has no disk password"
+printf 'abcd-efgh-jkmn-pqrs-tuvw-xyz2' >"$T/rkshape"
+if no "$F" add-user --user dave --auth-user alice --auth-password-file "$T/alice" --password-file "$T/rkshape" "$A" && said "shaped like a recovery key"; then pass "a password shaped like a recovery key is refused"; else fail "rk-shaped password accepted"; fi
 opens "$A" alice || fail "clear alice count"
 
 # ---- ownership changes ----
@@ -127,7 +129,7 @@ opens "$A" carol && pass "pam: carol's disk password is unchanged after an admin
 if try "$F" reset-password --user carol --auth-user alice --auth-password-file "$T/alice.3" --new-file "$T/carol.2" "$A"; then pass "owner alice resets carol's password"; else fail "owner reset"; fi
 opens "$A" carol.2 && pass "carol's new password opens" || fail "carol new"
 opens "$A" carol && fail "carol's forgotten password still opens" || pass "carol's forgotten password is refused"
-"$F" status "$A" | grep -q "user carol .*unlock only" && pass "a reset keeps carol a non-owner" || fail "carol role after reset"
+"$F" status "$A" | grep -q "user carol[ ,].*unlock only" && pass "a reset keeps carol a non-owner" || fail "carol role after reset"
 [ "$("$F" status "$A" | grep -c 'user carol')" = 1 ] && pass "one token for carol after the reset" || fail "carol tokens"
 
 # ---- recovery key ----
@@ -166,7 +168,7 @@ if $CS0 token import --external-tokens-path "$B" --token-id "$tok" --json-file "
 opens "$T/dmg.img" alice && opens "$T/dmg.img" carol.2 && pass "other users unlock past a damaged token" || fail "damaged token blocks others"
 opens "$T/dmg.img" bob && fail "damaged token opened" || pass "the damaged user is refused (owner resets them)"
 cp "$A" "$T/noslot.img"
-ks=$("$F" status "$T/noslot.img" | sed -n 's/^token [0-9]*: keyslot \([0-9]*\), user bob .*/\1/p')
+ks=$("$F" status "$T/noslot.img" | sed -n 's/^token [0-9]*: keyslot \([0-9]*\), user bob[ ,].*/\1/p')
 $CS0 luksKillSlot -q --key-file "$T/pass" "$T/noslot.img" "$ks" 2>/dev/null || $CS0 luksKillSlot -q "$T/noslot.img" "$ks" </dev/null
 if no "$F" add-user --user dave --auth-user bob --auth-password-file "$T/bob" --password-file "$T/dave" "$T/noslot.img"; then pass "a token whose keyslot is gone cannot authorize"; else fail "slotless token authorized"; fi
 opens "$T/noslot.img" alice && pass "others still unlock with a destroyed keyslot" || fail "noslot others"
