@@ -15,7 +15,7 @@ Version:        1.94.100
 # replaces (1.fc45 < 1.fc45.aurora5) and below the next Fedora release.
 # aurora10: the Touch ID lockout reaches fprintd as FP_DEVICE_ERROR_LOCKED_OUT.
 # aurora11: and why Touch ID needs the password (after boot, other reasons).
-Release:        1%{?dist}.aurora11
+Release:        1%{?dist}.aurora12
 Summary:        Toolkit for fingerprint scanner
 
 # Automatically converted from old format: LGPLv2+ - review is highly recommended.
@@ -67,6 +67,9 @@ Patch1007:      0008-aurora-report-the-touch-id-lockout-as-locked-out.patch
 # first password since boot and other password requirements as their own
 # errors, keeping FP_DEVICE_ERROR_LOCKED_OUT for failed attempts.
 Patch1008:      0009-aurora-say-why-touch-id-needs-the-password.patch
+# fp_device_get_password_required(): say before a prompt that Touch ID needs
+# the password, so front-ends don't ask for a finger first.
+Patch1009:      0010-let-a-front-end-ask-whether-the-reader-needs-the-password.patch
 
 BuildRequires:  meson
 BuildRequires:  gcc
@@ -96,6 +99,8 @@ Provides:       libfprint(aurora-sep) = 5
 Provides:       libfprint(aurora-sep-lockout) = 1
 # FP_DEVICE_ERROR_PASSWORD_REQUIRED{,_AFTER_BOOT}; fprintd's 0003 uses them.
 Provides:       libfprint(aurora-sep-password-reasons) = 1
+# fp_device_get_password_required(); fprintd's 0004 uses it.
+Provides:       libfprint(aurora-sep-password-required) = 1
 # Pull in the SELinux module wherever the targeted policy is installed.
 Requires:       (%{name}-selinux = %{version}-%{release} if selinux-policy-targeted)
 
@@ -200,6 +205,11 @@ python3 %{SOURCE1004} libfprint/drivers/aurora/aurora.c
 %{_datadir}/installed-tests/libfprint-2/
 
 %changelog
+* Tue Nov 10 2026 Ryan Murray <ryan@aurorasilicon.org> - 1.94.100-1.aurora12
+- Add fp_device_get_password_required(), answered by the aurora driver from
+  the kernel's lockout state, so front-ends can skip the finger prompt while
+  Touch ID needs the password
+
 * Sun Nov 08 2026 Ryan Murray <ryan@aurorasilicon.org> - 1.94.100-1.aurora11
 - Ask the kernel why Touch ID needs the password: report the wait for the
   first password since boot as FP_DEVICE_ERROR_PASSWORD_REQUIRED_AFTER_BOOT,
