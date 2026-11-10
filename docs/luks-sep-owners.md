@@ -55,7 +55,7 @@ No value depends on the Mac model. The bag uid base keeps disk-encryption bags a
 
     password optional pam_aurora_sep_fde.so
 
-This line goes after the module that changes the account password, so it runs only after that change succeeded. Fedora's aurora-sep package adds it to the authselect vendor profile, ALARM to `/etc/pam.d/passwd`, and NixOS through `security.pam.services.passwd`. The module passes the old and new password to `/usr/libexec/aurora-sep-fde-passwd` on a pipe and never logs them.
+This line goes after the module that changes the account password, so it runs only after that change succeeded. Fedora's aurora-sep package adds it to the authselect vendor profile's system-auth, ALARM's aurora-sep-luks to `/etc/pam.d/system-auth` (which `passwd` includes), and NixOS through `aurora.sepLuks.passwordSync` on `security.pam.services.passwd`. The module passes the old and new password to `/usr/libexec/aurora-sep-fde-passwd` on a pipe and never logs them.
 
 ## What it relies on and what it does not give
 
