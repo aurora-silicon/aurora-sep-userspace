@@ -25,6 +25,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <termios.h>
+#include <time.h>
 #include <unistd.h>
 #include <sys/random.h>
 #include <json-c/json.h>
@@ -487,6 +488,8 @@ refuse:
  * it, the same request must succeed. The secret is compared to nothing and
  * never printed; it is wiped at once.
  */
+#define GATE_WAIT_S 120
+
 static int cmd_gate_check(struct crypt_device *cd, const struct opts *o)
 {
 	uint8_t out[SEP_FDE_SECRET_BYTES];
@@ -505,7 +508,35 @@ static int cmd_gate_check(struct crypt_device *cd, const struct opts *o)
 		r = -EPERM;
 		goto out;
 	}
+	/* Start from an unlocked bag, so the lock below is a real transition. */
+	if (fde_bag_unlock(t.uid, pw, plen) < 0) {
+		r = -EPERM;
+		goto out;
+	}
 	fde_bag_lock(t.uid);
+	/*
+	 * The key store keeps a bag in its locking phase (class keys usable)
+	 * for a grace period after the lock transition, whatever the reason,
+	 * and reports it locked when that ends. Wait for that, bounded.
+	 */
+	{
+		struct timespec t0, t1;
+		int waited = -1;
+
+		clock_gettime(CLOCK_MONOTONIC, &t0);
+		for (int i = 0; i < GATE_WAIT_S * 2; i++) {
+			if (fde_bag_state(t.uid, &st) == 0 && st.lock_phase == 1) {
+				clock_gettime(CLOCK_MONOTONIC, &t1);
+				waited = (int)(t1.tv_sec - t0.tv_sec);
+				break;
+			}
+			usleep(500000);
+		}
+		if (waited < 0)
+			printf("gate: the enclave did not report the bag locked within %d s\n", GATE_WAIT_S);
+		else
+			printf("gate: the enclave reported the bag locked %d s after the lock\n", waited);
+	}
 	locked_r = fde_unseal(t.uid, t.record, t.record_len, t.sealed, t.sealed_len,
 			      out, sizeof(out), &n);
 	sep_wipe(out, sizeof(out));
