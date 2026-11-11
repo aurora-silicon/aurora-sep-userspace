@@ -21,7 +21,11 @@
  *   aurora-sep-fde remove-passphrase --unlock-key-file F DEVICE
  *   aurora-sep-fde gate-check --user U [--password-file P] DEVICE
  *   aurora-sep-fde status   [DEVICE]
- *   aurora-sep-fde boot-chain   (what the initramfs gate decides on this boot)
+ *   aurora-sep-fde boot-chain [audit | require [--force]] [--no-initramfs]
+ *       no mode: what the gate before every Secure Enclave volume unlock
+ *       decides on this boot; a mode sets it in fde.conf and rebuilds the
+ *       initramfs. require needs this boot verified from an enforcing
+ *       Stage 1 on (--force: lab testing).
  *
  * Recovery keys are a choice, like Touch ID after boot: by default
  * (recovery = offline in fde.conf, or --offline) the key also opens a plain
@@ -53,6 +57,8 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/random.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
 #include <json-c/json.h>
 #include <libcryptsetup.h>
 
@@ -67,7 +73,7 @@ struct opts {
 	const char *cmd, *device, *unlock_key_file, *password_file, *old_file, *new_file,
 		*recovery_key_file, *label, *name, *user, *auth_user, *auth_password_file;
 	long uid;
-	int quiet, sep_only, offline, replace, owner;	/* owner: -1 default, 0 no, 1 yes */
+	int quiet, sep_only, offline, replace, owner, force, no_initramfs;	/* owner: -1 default, 0 no, 1 yes */
 	struct fde_conf conf;
 };
 
@@ -75,7 +81,7 @@ static void die_usage(void)
 {
 	fputs("usage: aurora-sep-fde enroll|add-user|remove-user|set-owner|recovery|change-password|\n"
 	      "       reset-password|passwd-hook|sync|test|remove-passphrase|gate-check|status|\n"
-	      "       boot-chain\n"
+	      "       boot-chain [audit|require [--force]] [--no-initramfs]\n"
 	      "       [options] [DEVICE]\n", stderr);
 	exit(2);
 }
@@ -951,35 +957,227 @@ static int status_one(struct crypt_device *cd, const char *device)
 	return 0;
 }
 
+/* The boot record and what the gate does with it, for status and boot-chain. */
+static void print_chain(const struct sep_boot_chain *c, enum sep_boot_chain_policy p)
+{
+	printf("boot chain: %s%s", c->state, c->advisory == 1 ? ", advisory" : "");
+	if (!c->verified)
+		printf(", first unverified link: %s", c->first_gap);
+	printf("\nboot-chain = %s: ", sep_boot_chain_policy_name(p));
+	if (c->verified)
+		printf("the Secure Enclave unlocks volumes (chain verified from Stage 1 on)\n");
+	else if (p == SEP_BOOT_CHAIN_REQUIRE)
+		printf("the Secure Enclave unlocks nothing on this boot; volumes ask for their "
+		       "passphrase or recovery key\n");
+	else
+		printf("the Secure Enclave unlocks volumes; each unlock logs that require would refuse it\n");
+}
+
+/* This boot's gate lines from the journal (initramfs and real root). */
+static void print_gate_log(void)
+{
+	pid_t pid;
+	int st;
+
+	if (secure_getenv("AURORA_SEP_FDE_ROOT"))
+		return;		/* a test root has no journal */
+	printf("gate lines this boot (journalctl -b -t %s):\n", SEP_BOOT_LOG_IDENT);
+	fflush(stdout);
+	pid = fork();
+	if (pid == 0) {
+		execlp("journalctl", "journalctl", "-b", "-q", "--no-pager", "-o", "short-monotonic",
+		       "-t", SEP_BOOT_LOG_IDENT, (char *)NULL);
+		_exit(127);
+	}
+	if (pid < 0 || waitpid(pid, &st, 0) < 0 || !WIFEXITED(st) || WEXITSTATUS(st) == 127)
+		printf("  (journal not available)\n");
+}
+
 static void status_policy(const struct opts *o)
 {
-	char os[SEP_BOOT_UUID_LEN + 1], state[64];
+	char os[SEP_BOOT_UUID_LEN + 1];
+	struct sep_boot_chain c;
 
 	printf("recovery keys: %s\n", o->conf.recovery_sep_only ?
 	       "SEP only (recovery = sep-only)" : "offline keyslot too (recovery = offline, the default)");
-	if (sep_boot_chain_state(state, sizeof(state)))
-		snprintf(state, sizeof(state), "unknown");
-	printf("boot chain: %s, boot-chain = %s\n", state,
-	       sep_boot_chain_policy_name(sep_boot_chain_policy()));
+	sep_boot_chain_read(&c);
+	print_chain(&c, sep_boot_chain_policy());
+	if (!c.verified)
+		print_gate_log();
 	if (sep_boot_os_uuid(os) == 0)
 		printf("OS install: %s\n", os);
 	else
 		printf("OS install: unknown (no OS identity on this boot)\n");
 }
 
-static int cmd_boot_chain(void)
+/* Keyslots that open at the passphrase prompt with no enclave: not bound to
+ * an aurora-sep token, or a recovery key's offline keyslot. */
+static int plain_keyslots(struct crypt_device *cd)
 {
-	char msg[256], state[64];
-	int first, r;
+	int n = 0, max = crypt_keyslot_max(CRYPT_LUKS2);
 
-	if (sep_boot_chain_state(state, sizeof(state)))
-		snprintf(state, sizeof(state), "unknown");
-	r = sep_boot_chain_gate(msg, sizeof(msg), &first);
-	printf("boot chain %s, boot-chain = %s: the initramfs %s\n", state,
-	       sep_boot_chain_policy_name(sep_boot_chain_policy()),
-	       r ? "does not ask the Secure Enclave (passphrase or recovery key)" :
-	       msg[0] ? "asks the Secure Enclave and logs a warning" : "asks the Secure Enclave");
-	return 0;
+	for (int ks = 0; ks < max; ks++) {
+		crypt_keyslot_info ki = crypt_keyslot_status(cd, ks);
+		int sep = 0, offline = 0;
+
+		if (ki != CRYPT_SLOT_ACTIVE && ki != CRYPT_SLOT_ACTIVE_LAST)
+			continue;
+		for (int tok = 0; tok < FDE_TOKENS_MAX; tok++) {
+			const char *type, *json;
+			struct fde_token t;
+
+			if (crypt_token_status(cd, tok, &type) == CRYPT_TOKEN_INACTIVE || !type ||
+			    strcmp(type, SEP_SEAL_TOKEN_TYPE))
+				continue;
+			if (crypt_token_is_assigned(cd, tok, ks) == 0)
+				sep = 1;
+			if (crypt_token_json_get(cd, tok, &json) >= 0 && fde_token_parse(json, &t) >= 0) {
+				if (t.offline_keyslot == ks)
+					offline = 1;
+				fde_token_free(&t);
+			}
+		}
+		if (!sep || offline)
+			n++;
+	}
+	return n;
+}
+
+/* Registered volumes that would open only through the enclave: under
+ * require on an unverified boot nothing could open them. */
+static int sep_only_volumes(const struct opts *o)
+{
+	char **v = fde_volumes_list(&o->conf);
+	int bad = 0;
+
+	for (char **p = v; v && *p; p++) {
+		struct crypt_device *cd;
+
+		if (fde_load(&cd, *p))
+			continue;
+		if (plain_keyslots(cd) == 0) {
+			fprintf(stderr, "aurora-sep-fde: %s has no passphrase or offline recovery keyslot\n", *p);
+			bad++;
+		}
+		crypt_free(cd);
+	}
+	fde_strv_free(v);
+	return bad;
+}
+
+/* Rebuild the initramfs images, which carry fde.conf. */
+static int regenerate_initramfs(void)
+{
+	const char *cmd = secure_getenv("AURORA_SEP_FDE_INITRAMFS_CMD");
+	char *argv[4] = { NULL };
+	pid_t pid;
+	int st;
+
+	if (cmd && *cmd) {
+		argv[0] = (char *)cmd;
+	} else if (access("/usr/bin/dracut", X_OK) == 0 || access("/usr/sbin/dracut", X_OK) == 0) {
+		argv[0] = "dracut";
+		argv[1] = "--regenerate-all";
+		argv[2] = "--force";
+	} else if (access("/usr/bin/mkinitcpio", X_OK) == 0) {
+		argv[0] = "mkinitcpio";
+		argv[1] = "-P";
+	} else {
+		fprintf(stderr, "aurora-sep-fde: no dracut or mkinitcpio here; rebuild the initramfs yourself "
+			"(it carries fde.conf)\n");
+		return -ENOENT;
+	}
+	printf("rebuilding the initramfs: %s%s%s%s%s\n", argv[0], argv[1] ? " " : "", argv[1] ? argv[1] : "",
+	       argv[2] ? " " : "", argv[2] ? argv[2] : "");
+	fflush(stdout);
+	pid = fork();
+	if (pid == 0) {
+		execvp(argv[0], argv);
+		_exit(127);
+	}
+	if (pid < 0 || waitpid(pid, &st, 0) < 0)
+		return -errno;
+	return WIFEXITED(st) && WEXITSTATUS(st) == 0 ? 0 : -EIO;
+}
+
+/*
+ * aurora-sep-fde boot-chain [audit | require [--force]] [--no-initramfs]
+ * With no mode: what the gate decides on this boot. A mode writes fde.conf
+ * and rebuilds the initramfs. require is refused unless this boot's chain is
+ * verified from an enforcing Stage 1 on (state verified, not advisory): on a
+ * Mac that does not boot that way every boot would ask for the passphrase.
+ * --force skips that check (lab testing); it never switches a registered
+ * volume that only the enclave can open.
+ */
+static int cmd_boot_chain(const struct opts *o, const char *mode)
+{
+	enum sep_boot_chain_policy want, have = sep_boot_chain_policy();
+	char conf[4096];
+	struct sep_boot_chain c;
+	struct stat sb;
+	int r;
+
+	sep_boot_chain_read(&c);
+	if (!mode || !strcmp(mode, "show")) {
+		print_chain(&c, have);
+		printf("require can be switched on here: %s\n", c.verified ? "yes" :
+		       "no (needs a boot verified from an enforcing Stage 1 on; --force for lab tests)");
+		return 0;
+	}
+	if (!strcmp(mode, "audit") || !strcmp(mode, "warn"))
+		want = SEP_BOOT_CHAIN_AUDIT;
+	else if (!strcmp(mode, "require"))
+		want = SEP_BOOT_CHAIN_REQUIRE;
+	else
+		die_usage();
+	if (want == SEP_BOOT_CHAIN_REQUIRE && !c.verified) {
+		if (!o->force) {
+			fprintf(stderr,
+				"aurora-sep-fde: refusing boot-chain = require: this boot's chain is %s%s "
+				"(first unverified link: %s).\n"
+				"With require, every boot that is not verified from an enforcing Stage 1 on asks "
+				"for the passphrase or recovery key. Switch it on after this Mac boots verified "
+				"(enforcing Stage 1, signed UKI); --force switches anyway (lab testing).\n",
+				c.state, c.advisory == 1 ? ", advisory" : "", c.first_gap);
+			return -EPERM;
+		}
+		if (sep_only_volumes(o)) {
+			fprintf(stderr, "aurora-sep-fde: refusing boot-chain = require even with --force: on this "
+				"unverified boot nothing could open the volume(s) above; add a passphrase or an "
+				"offline recovery key first\n");
+			return -EPERM;
+		}
+		fprintf(stderr, "aurora-sep-fde: --force: boot-chain = require on a boot whose chain is %s; "
+			"until this Mac boots verified the enclave unlocks no volume\n", c.state);
+	}
+	sep_boot_conf_path(conf, sizeof(conf));
+	if (lstat(conf, &sb) == 0 && S_ISLNK(sb.st_mode)) {
+		fprintf(stderr, "aurora-sep-fde: %s is a link (managed by the system configuration, e.g. "
+			"NixOS); set boot-chain there\n", conf);
+		return -EROFS;
+	}
+	if (want == have) {
+		printf("boot-chain is already %s\n", sep_boot_chain_policy_name(want));
+	} else {
+		r = sep_boot_chain_policy_write(want);
+		if (r) {
+			fprintf(stderr, "aurora-sep-fde: cannot write %s (%s)\n", conf, strerror(-r));
+			return r;
+		}
+		printf("boot-chain = %s in %s\n", sep_boot_chain_policy_name(want), conf);
+	}
+	if (o->no_initramfs) {
+		printf("initramfs not rebuilt (--no-initramfs): the root volume's unlock keeps the old "
+		       "policy until it is\n");
+		return 0;
+	}
+	r = regenerate_initramfs();
+	if (r && want != have) {
+		sep_boot_chain_policy_write(have);
+		fprintf(stderr, "aurora-sep-fde: rebuilding the initramfs failed; boot-chain is back to %s\n",
+			sep_boot_chain_policy_name(have));
+	}
+	return r;
 }
 
 static int cmd_status(struct crypt_device *cd, const struct opts *o)
@@ -1102,6 +1300,8 @@ int main(int argc, char **argv)
 		{ "sep-only", no_argument, NULL, 'S' },
 		{ "offline", no_argument, NULL, 'F' },
 		{ "replace", no_argument, NULL, 'R' },
+		{ "force", no_argument, NULL, 'f' },
+		{ "no-initramfs", no_argument, NULL, 'I' },
 		{ NULL, 0, NULL, 0 },
 	};
 	struct opts o = { .uid = -1, .owner = -1 };
@@ -1131,6 +1331,8 @@ int main(int argc, char **argv)
 		case 'S': o.sep_only = 1; break;
 		case 'F': o.offline = 1; break;
 		case 'R': o.replace = 1; break;
+		case 'f': o.force = 1; break;
+		case 'I': o.no_initramfs = 1; break;
 		default: die_usage();
 		}
 	}
@@ -1146,6 +1348,11 @@ int main(int argc, char **argv)
 		o.sep_only = 1;
 	need_dev = strcmp(o.cmd, "change-password") && strcmp(o.cmd, "passwd-hook") &&
 		   strcmp(o.cmd, "sync") && strcmp(o.cmd, "status") && strcmp(o.cmd, "boot-chain");
+	if (!strcmp(o.cmd, "boot-chain")) {
+		if (argc - optind > 1)
+			die_usage();
+		return cmd_boot_chain(&o, optind < argc ? argv[optind] : NULL) ? 1 : 0;
+	}
 	if (optind == argc - 1)
 		o.device = argv[optind];
 	else if (optind != argc || need_dev)
@@ -1197,8 +1404,6 @@ int main(int argc, char **argv)
 		r = cmd_gate_check(cd, &o);
 	else if (!strcmp(o.cmd, "status"))
 		r = cmd_status(cd, &o);
-	else if (!strcmp(o.cmd, "boot-chain"))
-		r = cmd_boot_chain();
 	else
 		die_usage();
 	if (cd)
