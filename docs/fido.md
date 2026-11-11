@@ -274,8 +274,11 @@ What an enclave-checked PIN needs, and where each part stands:
    does not: an imported user bag restarts its count after a reboot
    (measured on the Neo), and the rollback anchors proposed for bag imports
    are enforced by the kernel, not the enclave. macOS keeps the count in the
-   Secure Storage Component's counter lockboxes (Apple Platform Security);
-   how to use one for a PIN on Linux is open research.
+   Secure Storage Component's counter lockboxes (Apple Platform Security):
+   the enclave increments the count before it checks a try, and a lockbox
+   that goes past its maximum is erased, which for a PIN means the
+   credentials behind it are gone for good, as when a hardware key locks.
+   Creating such a lockbox for an extra secret from Linux is not known yet.
 3. The PIN never reaches the host in the clear: CTAP sends
    `LEFT(SHA-256(PIN), 16)` encrypted to the authenticator's key agreement
    key, which this daemon holds. Root can read it while you enter it, as it
