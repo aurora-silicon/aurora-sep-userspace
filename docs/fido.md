@@ -153,6 +153,61 @@ available when per-user, password-keyed key bags land (below).
   token with the credential-management permission takes a touch when it is
   issued.
 
+### Per-user credentials (preview, `vault = user`)
+
+With `[authenticator] vault = user`, aurora-fidod keeps only the uhid device
+and the CTAPHID framing. It forwards each CTAP2 request to `aurora-passkeyd`
+(a user unit) of the user who owns the active local session on seat0, the
+same user the hidraw `uaccess` ACL follows. That agent keeps the user's
+credential records in `$XDG_DATA_HOME/aurora-passkeys` and makes the
+`/dev/sep-key` calls as the user.
+
+- The two talk over `$XDG_RUNTIME_DIR/aurora-passkeys/ctap.sock`
+  (SOCK_SEQPACKET): one request per connection, with "user present"
+  keepalives and cancel passed both ways.
+- aurora-fidod checks that the socket's peer is that user. The agent accepts
+  only root (aurora-fidod) and its own user.
+- With no active local user, or no agent running, nothing is signed:
+  getInfo still answers, and every other command gets
+  `CTAP2_ERR_OPERATION_DENIED`.
+- U2F is not forwarded in this mode.
+
+**Keys under your key bag (interface 4).** The agent needs `/dev/sep-key`
+interface 4 (variant-5 key store: the Neo and the M4 Pro) and refuses to
+start without it.
+
+- **Credential keys** are `.userPresence` keys under the user's own key bag,
+  the bag whose secret is the login password. The enclave approves one of
+  these keys after a Touch ID match or after it has checked that password
+  itself. Root can ask the kernel to sign with such a key, but the enclave
+  still waits for the touch or the password. Nothing works while the bag is
+  locked (logged out, suspended).
+- **The vault key**, 64 bytes that wrap credential IDs and records, is
+  sealed to a key with no list under the same bag (`vault.key`). It opens
+  with no touch while the bag is unlocked, and not at all while it is
+  locked. So the agent cannot start, and nobody can read the records, until
+  the user logs in. The agent unseals the vault key at the start of each
+  request and drops it at the end, so it is in memory only during a request
+  and only while the bag is unlocked. Python frees the key but cannot zero it.
+- **The password route** exists only on the native front-end (`provider.py`,
+  for a credentials portal). A request may carry the login password, and the
+  enclave checks it in place of a touch: one call, no retries, and each
+  wrong password counts in the enclave (`CTAP2_ERR_PIN_INVALID`). CTAP over
+  hidraw has no route for it while clientPIN stays off.
+- **Access to the device:** `/dev/sep-key` is root-only by default. For
+  per-user mode, give the user (or a group) access to it. The kernel lets a
+  non-root caller use only keys under that caller's own bag.
+
+**Per-site rules.** `~/.config/aurora-passkeys/sites.conf` holds lines of
+the form `site = policy`, for example `bank.example = touchid-or-password`. A
+rule covers the site and every name under it, and the longest match wins.
+The rule is written into the new credential's access-control list, so the
+enclave enforces it. Changing a rule affects new credentials only. If the
+kernel cannot make the key a rule asks for, the registration is refused
+(`CTAP2_ERR_UNSUPPORTED_OPTION`); a weaker key is never made instead. Under a
+user's bag the kernel makes `.userPresence` keys only, so biometric-only
+rules (`touchid-any`, `touchid-current`) are refused there.
+
 ### Existing credentials (migration from 0.1)
 
 aurora-fido 0.1 checked the touch in the daemon (fprintd, or a polkit
@@ -326,7 +381,7 @@ security key.
 
 ## Tests
 
-    make -C fido check                 # unit tests, no root, no hardware
+    make -C fido check                 # unit tests, no root, no hardware (agent tests: Linux)
     sudo make -C fido check-uhid       # real uhid device: libfido2, OpenSSH, pam_u2f, cryptenroll
     make -C fido test/aurora-fido-seal && sudo make -C fido check-seal
 

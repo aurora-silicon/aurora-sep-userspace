@@ -15,17 +15,19 @@ PREFIX ?= /usr
 LIBEXECDIR ?= $(PREFIX)/libexec/aurora-fido
 PYDIR ?= $(PREFIX)/lib/aurora-fido
 UNITDIR ?= $(PREFIX)/lib/systemd/system
+USERUNITDIR ?= $(PREFIX)/lib/systemd/user
 UDEVRULESDIR ?= $(PREFIX)/lib/udev/rules.d
 SYSCONFDIR ?= /etc
 DOCDIR ?= $(PREFIX)/share/doc/aurora-fido
 BINDIR ?= $(PREFIX)/bin
 PRESETDIR ?= $(PREFIX)/lib/systemd/system-preset
+USERPRESETDIR ?= $(PREFIX)/lib/systemd/user-preset
 
 SEAL := aurora-fido-seal
 SRC := aurora-fido-seal.c ../luks/sep-seal.c ../luks/sep-seal.h
 PY := $(wildcard aurora_fido/*.py)
 
-all: $(SEAL) aurora-fidod aurora-fido aurora-fido.service.out
+all: $(SEAL) aurora-fidod aurora-fido aurora-passkeyd aurora-fido.service.out aurora-passkeyd.service.out
 
 $(SEAL): $(SRC)
 	$(CC) $(CFLAGS) $(DEPS_CFLAGS) -fPIE -pie -Wl,-z,relro,-z,now -o $@ \
@@ -39,11 +41,11 @@ test/$(SEAL): $(SRC)
 
 # Generated from the install paths: always regenerated (FORCE), so that
 # `make install LIBEXECDIR=...` after a plain `make` never ships stale paths.
-aurora-fidod aurora-fido: %: %.in FORCE
+aurora-fidod aurora-fido aurora-passkeyd: %: %.in FORCE
 	sed -e 's|@PYDIR@|$(PYDIR)|' -e 's|@LIBEXECDIR@|$(LIBEXECDIR)|' -e 's|@DOCDIR@|$(DOCDIR)|' $< > $@
 	chmod 755 $@
 
-aurora-fido.service.out: aurora-fido.service FORCE
+aurora-fido.service.out aurora-passkeyd.service.out: %.service.out: %.service FORCE
 	sed 's|@LIBEXECDIR@|$(LIBEXECDIR)|' $< > $@
 
 FORCE:
@@ -51,6 +53,11 @@ FORCE:
 # Unit tests: no root, no hardware (software keys with a scripted enclave touch).
 check:
 	$(PYTHON) tests/test_ctap.py
+	$(PYTHON) tests/test_agent.py
+	$(PYTHON) tests/test_provider.py
+	if command -v dbus-run-session >/dev/null 2>&1; then \
+		dbus-run-session -- $(PYTHON) tests/test_dbus_provider.py; \
+	else $(PYTHON) tests/test_dbus_provider.py; fi
 
 # As root: the real uhid device with libfido2, OpenSSH, pam_u2f, cryptenroll.
 check-uhid:
@@ -63,6 +70,9 @@ check-seal: test/$(SEAL)
 install: all
 	install -Dm755 aurora-fidod $(DESTDIR)$(LIBEXECDIR)/aurora-fidod
 	install -Dm755 aurora-fido $(DESTDIR)$(BINDIR)/aurora-fido
+	install -Dm755 aurora-passkeyd $(DESTDIR)$(LIBEXECDIR)/aurora-passkeyd
+	install -Dm644 aurora-passkeyd.service.out $(DESTDIR)$(USERUNITDIR)/aurora-passkeyd.service
+	install -Dm644 90-aurora-passkeyd.preset $(DESTDIR)$(USERPRESETDIR)/90-aurora-passkeyd.preset
 	install -Dm644 90-aurora-fido.preset $(DESTDIR)$(PRESETDIR)/90-aurora-fido.preset
 	install -Dm755 $(SEAL) $(DESTDIR)$(LIBEXECDIR)/$(SEAL)
 	for f in $(PY); do install -Dm644 $$f $(DESTDIR)$(PYDIR)/$$f; done
@@ -72,6 +82,6 @@ install: all
 	install -Dm644 ../docs/fido.md $(DESTDIR)$(DOCDIR)/fido.md
 
 clean:
-	rm -rf $(SEAL) test aurora-fidod aurora-fido aurora-fido.service.out aurora_fido/__pycache__ tests/__pycache__
+	rm -rf $(SEAL) test aurora-fidod aurora-fido aurora-passkeyd aurora-fido.service.out aurora-passkeyd.service.out aurora_fido/__pycache__ tests/__pycache__
 
 .PHONY: all check check-uhid check-seal install clean FORCE

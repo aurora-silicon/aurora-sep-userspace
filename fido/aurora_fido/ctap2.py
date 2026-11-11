@@ -71,9 +71,14 @@ MAX_USER_FIELD = 64
 class Ctx:
     """Per-request context from the transport."""
 
-    def __init__(self, cancel=None, on_up_needed=lambda: None):
+    def __init__(self, cancel=None, on_up_needed=lambda: None, password=None):
         self.cancel = cancel or threading.Event()
         self.on_up_needed = on_up_needed
+        # The user's login password for this one request (a bytearray the caller
+        # wipes), from the native front-end only: the enclave checks it in place
+        # of a touch for keys under the user's bag. CTAP has no route for it while
+        # clientPIN stays off.
+        self.password = password
 
 
 def _rp_hash(rp_id):
@@ -130,11 +135,15 @@ def _options(params, key):
 class Authenticator:
     def __init__(self, backend, user, vault, store, counter,
                  attestation="self", new_vault=None, clock=time.monotonic,
-                 policy=POLICY_TOUCHID_ANY, on_legacy=lambda rp_id, why: None):
+                 policy=POLICY_TOUCHID_ANY, on_legacy=lambda rp_id, why: None,
+                 policy_for=None):
         self.backend = backend
         self.user = user                  # enclave.EnclaveUser: every approval
         self.policy = policy              # for new credentials (config [touchid] policy)
         self.flags = POLICY_FLAGS[policy]
+        # rp_id -> policy for that site's new credentials, or None for the default
+        # (per-site rules, aurora-passkeyd); the enclave enforces whichever is chosen.
+        self.policy_for = policy_for
         self.on_legacy = on_legacy        # a refused pre-enclave credential was presented
         self.vault = vault
         self.store = store
@@ -229,6 +238,8 @@ class Authenticator:
             raise CtapError(ERR_KEEPALIVE_CANCEL, "cancelled")
         if result == touchid.TIMEOUT:
             raise CtapError(ERR_USER_ACTION_TIMEOUT, "no touch")
+        if result == "wrong-password":                   # enclave.WRONG_PASSWORD
+            raise CtapError(ERR_PIN_INVALID, "the enclave refused the password")
         raise CtapError(ERR_OPERATION_DENIED, f"Touch ID: {result}")
 
     def ask(self, ctx, prompt, request=None):
@@ -238,7 +249,8 @@ class Authenticator:
         just refused is refused again at once (REFUSAL_REPLAY_WINDOW).
         """
         self._replayed_refusal(prompt, request)
-        result = self.user.verify(prompt, ctx.cancel, ctx.on_up_needed)
+        result = self.user.verify(prompt, ctx.cancel, ctx.on_up_needed,
+                                  getattr(ctx, "password", None))
         self._outcome(ctx, result, request)
         return "touchid"
 
@@ -256,13 +268,17 @@ class Authenticator:
     def _gated_sign(self, ctx, prompt, cred, msg, request=None):
         """The credential's signature over msg: the enclave waits for the finger."""
         digest = hashlib.sha256(msg).digest()
+        pw = getattr(ctx, "password", None)
         return self._gated(ctx, prompt, cred,
-                           lambda *a: self.user.sign(cred.handle, digest, *a), request)
+                           lambda *a: self.user.sign(cred.handle, digest, *a, password=pw),
+                           request)
 
     def _gated_unseal(self, ctx, prompt, cred, request=None):
         """The credential's sealed hmac-secret CredRandom pair, released after a match."""
+        pw = getattr(ctx, "password", None)
         return self._gated(ctx, prompt, cred,
-                           lambda *a: self.user.unseal(cred.handle, cred.sealed, *a), request)
+                           lambda *a: self.user.unseal(cred.handle, cred.sealed, *a,
+                                                       password=pw), request)
 
     def _probe_sign(self, msg):
         return self._probe_key.sign(msg, ec.ECDSA(hashes.SHA256()))
@@ -381,13 +397,21 @@ class Authenticator:
         # The new key, with the enclave's access-control list. It signs
         # nothing without a finger, so making it needs no approval; the
         # approval is its first signature below.
-        handle, point = self.backend.create(self.flags)
+        policy, flags = self.policy, self.flags
+        site = self.policy_for(rp_id) if self.policy_for else None
+        if site is not None and site != policy:
+            policy, flags = site, POLICY_FLAGS[site]
+            if flags & ~self.backend.flags_supported:
+                # Never a weaker key than the site's rule asks for.
+                log.warning("site rule for %s asks for a policy this kernel cannot make", rp_id)
+                raise CtapError(ERR_UNSUPPORTED_OPTION, "site policy")
+        handle, point = self.backend.create(flags)
         sealed = None
         if hmac_secret:
             # CredRandomWithUV || CredRandomWithoutUV, released by the
             # enclave only together with a touch-approved signature.
             sealed = self.backend.seal(handle, os.urandom(64))
-        cred = Credential(handle, cred_protect or 1, self.policy, sealed)
+        cred = Credential(handle, cred_protect or 1, policy, sealed)
         cred_id = self.vault.wrap(rp_hash, cred, ID_MAX_CTAP2)
 
         ext_out = {}

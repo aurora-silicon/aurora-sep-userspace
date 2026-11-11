@@ -1,0 +1,9 @@
+#!/usr/bin/python3 -I
+# SPDX-License-Identifier: MIT
+# aurora-passkeyd: one user's passkeys, kept and used as that user (per-user vault mode).
+import sys
+
+sys.path.insert(0, "@PYDIR@")
+from aurora_fido import agent  # noqa: E402
+
+sys.exit(agent.main())
