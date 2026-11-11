@@ -28,7 +28,7 @@ import socket
 import sys
 import threading
 
-from . import __version__, agentproto, cbor, ctap2, daemon
+from . import __version__, agentproto, cbor, creds, ctap2, daemon
 from .errors import ERR_CHANNEL_BUSY
 from .backend import BackendError, open_backend
 
@@ -40,6 +40,53 @@ SEP_KEY_IFACE_USER_BAG = 4
 def data_dir():
     base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
     return os.path.join(base, "aurora-passkeys")
+
+
+def config_dir():
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, "aurora-passkeys")
+
+
+class SitePolicy:
+    """Per-site rules for new credentials: ~/.config/aurora-passkeys/sites.conf
+
+        # site = policy      (the site and every name under it)
+        bank.example = touchid-current
+        corp.example = touchid-any
+
+    The longest matching site wins; no match keeps the default policy. The
+    rule is written into the new key's access-control list, so the enclave
+    enforces it; a changed rule affects new credentials only (macOS behaviour).
+    A malformed line is skipped with a warning, never widened.
+    """
+
+    def __init__(self, path):
+        self.rules = {}
+        try:
+            with open(path, encoding="utf-8") as f:
+                lines = f.read().splitlines()
+        except FileNotFoundError:
+            return
+        for n, line in enumerate(lines, 1):
+            line = line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            site, sep, pol = (x.strip() for x in line.partition("="))
+            site = site.lower().rstrip(".")
+            if not sep or not site or pol not in creds.POLICIES:
+                log.warning("%s:%d: ignored (want 'site = %s')", path, n,
+                            " | ".join(sorted(creds.POLICIES)))
+                continue
+            self.rules[site] = creds.POLICIES[pol]
+
+    def __call__(self, rp_id):
+        rp_id = rp_id.lower().rstrip(".")
+        best = None
+        for site, pol in self.rules.items():
+            if (rp_id == site or rp_id.endswith("." + site)) and (
+                    best is None or len(site) > len(best[0])):
+                best = site, pol
+        return best[1] if best else None
 
 
 def runtime_socket():
@@ -185,12 +232,13 @@ class AgentServer:
             agentproto.send(conn, {"t": "resp", "d": resp})
 
 
-def build_agent(cfg, state_dir, backend, secret, user_name):
+def build_agent(cfg, state_dir, backend, secret, user_name, sites=None):
     """The authenticator for one user (no U2F: not forwarded to agents yet)."""
     cfg.set("touchid", "user", user_name)
     policy, note = daemon.resolve_policy(cfg, backend.flags_supported)
     user = daemon.enclave_user(cfg, backend, state_dir, policy)
     auth, _u2f = daemon.build(cfg, state_dir, backend, user, secret, policy)
+    auth.policy_for = sites
     return auth, note
 
 
@@ -213,7 +261,8 @@ def main(argv=None):
     cfg = daemon.load_config(a.config)
     try:
         backend = open_backend(cfg.get("keys", "store"))
-        auth, note = build_agent(cfg, state_dir, backend, UserBagSecret(backend, state_dir), name)
+        auth, note = build_agent(cfg, state_dir, backend, UserBagSecret(backend, state_dir), name,
+                                 SitePolicy(os.path.join(config_dir(), "sites.conf")))
     except (BackendError, ValueError, OSError) as e:
         log.error("%s", e)
         return 1

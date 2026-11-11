@@ -130,11 +130,15 @@ def _options(params, key):
 class Authenticator:
     def __init__(self, backend, user, vault, store, counter,
                  attestation="self", new_vault=None, clock=time.monotonic,
-                 policy=POLICY_TOUCHID_ANY, on_legacy=lambda rp_id, why: None):
+                 policy=POLICY_TOUCHID_ANY, on_legacy=lambda rp_id, why: None,
+                 policy_for=None):
         self.backend = backend
         self.user = user                  # enclave.EnclaveUser: every approval
         self.policy = policy              # for new credentials (config [touchid] policy)
         self.flags = POLICY_FLAGS[policy]
+        # rp_id -> policy for that site's new credentials, or None for the default
+        # (per-site rules, aurora-passkeyd); the enclave enforces whichever is chosen.
+        self.policy_for = policy_for
         self.on_legacy = on_legacy        # a refused pre-enclave credential was presented
         self.vault = vault
         self.store = store
@@ -381,13 +385,21 @@ class Authenticator:
         # The new key, with the enclave's access-control list. It signs
         # nothing without a finger, so making it needs no approval; the
         # approval is its first signature below.
-        handle, point = self.backend.create(self.flags)
+        policy, flags = self.policy, self.flags
+        site = self.policy_for(rp_id) if self.policy_for else None
+        if site is not None and site != policy:
+            policy, flags = site, POLICY_FLAGS[site]
+            if flags & ~self.backend.flags_supported:
+                # Never a weaker key than the site's rule asks for.
+                log.warning("site rule for %s asks for a policy this kernel cannot make", rp_id)
+                raise CtapError(ERR_UNSUPPORTED_OPTION, "site policy")
+        handle, point = self.backend.create(flags)
         sealed = None
         if hmac_secret:
             # CredRandomWithUV || CredRandomWithoutUV, released by the
             # enclave only together with a touch-approved signature.
             sealed = self.backend.seal(handle, os.urandom(64))
-        cred = Credential(handle, cred_protect or 1, self.policy, sealed)
+        cred = Credential(handle, cred_protect or 1, policy, sealed)
         cred_id = self.vault.wrap(rp_hash, cred, ID_MAX_CTAP2)
 
         ext_out = {}

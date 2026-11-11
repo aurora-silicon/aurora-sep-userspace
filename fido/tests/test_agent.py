@@ -16,7 +16,7 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from aurora_fido import agent, cbor, ctap2, daemon, remote  # noqa: E402
+from aurora_fido import agent, cbor, creds, ctap2, daemon, remote  # noqa: E402
 from aurora_fido import errors as E  # noqa: E402
 from aurora_fido.backend import BackendError  # noqa: E402
 import stub  # noqa: E402
@@ -29,14 +29,15 @@ UID = os.getuid()
 class Agent:
     """One user's aurora-passkeyd on the stub enclave, in a temp dir."""
 
-    def __init__(self, root, name, allowed=None, mode=stub.MATCH):
+    def __init__(self, root, name, allowed=None, mode=stub.MATCH, sites=None, flags_supported=0x3):
         self.state = os.path.join(root, name, "state")
         os.makedirs(self.state, mode=0o700)
-        self.backend = StubKeyBackend(mode=mode)
+        self.backend = StubKeyBackend(mode=mode, flags_supported=flags_supported)
         cfg = daemon.load_config(None)
         cfg.set("touchid", "notify", "no")
         self.auth, _ = agent.build_agent(cfg, self.state, self.backend,
-                                         FileSecret(os.path.join(root, name, "vault")), "root")
+                                         FileSecret(os.path.join(root, name, "vault")), "root",
+                                         sites)
         self.path = os.path.join(root, name, "run", "ctap.sock")
         self.srv = agent.AgentServer(self.auth, self.path,
                                      {UID} if allowed is None else allowed).bind()
@@ -199,6 +200,38 @@ class AgentTest(unittest.TestCase):
             time.sleep(0.05)
         self.assertFalse(a.srv.lock.locked())
         self.assertEqual(a.backend.signs, 0)
+
+    def test_site_policy_is_written_into_the_key(self):
+        conf = os.path.join(self.tmp.name, "sites.conf")
+        with open(conf, "w") as f:
+            f.write("# rules\nbank.example = touchid-current\nexample = touchid-any\n"
+                    "bad line\nweak.example = nothing\n")
+        sites = agent.SitePolicy(conf)
+        self.assertEqual(sites("login.BANK.example."), creds.POLICY_TOUCHID_CURRENT)
+        self.assertEqual(sites("shop.example"), creds.POLICY_TOUCHID_ANY)
+        self.assertIsNone(sites("notbank.example.org"))
+        self.assertIsNone(sites("weak.example.com"))
+        a = self.agent("u", sites=sites)
+        f = Fidod({UID: a.path})
+        f.active = UID
+        st, mc = f.make(rp="login.bank.example")
+        self.assertEqual(st, 0)
+        self.assertEqual(a.backend.last_flags, creds.POLICY_FLAGS[creds.POLICY_TOUCHID_CURRENT])
+        st, r = f.ga(rp="login.bank.example")
+        self.assertEqual(st, 0)                           # the credential signs as usual
+
+    def test_site_policy_the_kernel_cannot_make_is_refused(self):
+        conf = os.path.join(self.tmp.name, "sites.conf")
+        with open(conf, "w") as f:
+            f.write("bank.example = touchid-current\n")
+        a = self.agent("u", sites=agent.SitePolicy(conf), flags_supported=0x2)
+        f = Fidod({UID: a.path})
+        f.active = UID
+        st, _ = f.make(rp="bank.example")
+        self.assertEqual(st, E.ERR_UNSUPPORTED_OPTION)
+        self.assertEqual(a.backend.creates, 0)            # no weaker key was made
+        st, _ = f.make(rp="other.example")
+        self.assertEqual(st, 0)
 
     def test_vault_key_needs_interface_4(self):
         class Old:

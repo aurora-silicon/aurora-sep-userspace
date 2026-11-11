@@ -177,6 +177,14 @@ The agent's vault key is sealed to a key under the user's own key bag
 is logged out, and the credential keys sign for nobody else, root included.
 On a kernel without interface 4 the agent refuses to start.
 
+**Per-site rules.** `~/.config/aurora-passkeys/sites.conf` holds lines of
+the form `site = policy`, for example `bank.example = touchid-current`. A rule
+covers the site and every name under it, and the longest match wins. The
+rule is written into the new credential's access-control list, so the
+enclave enforces it. Changing a rule affects new credentials only. If the
+kernel cannot make the key a rule asks for, the registration is refused
+(`CTAP2_ERR_UNSUPPORTED_OPTION`); a weaker key is never made instead.
+
 ### Existing credentials (migration from 0.1)
 
 aurora-fido 0.1 checked the touch in the daemon (fprintd, or a polkit

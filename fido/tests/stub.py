@@ -57,6 +57,7 @@ class StubKeyBackend(KeyBackend):
         handle = (b"STUB" + bytes([_GATED if gated else 0]) + nonce
                   + self._aead.encrypt(nonce, scalar, b"stub") + b"\0" * self.handle_pad)
         self.creates += 1
+        self.last_flags = flags
         return handle, self._point(priv)
 
     def gated(self, handle):
