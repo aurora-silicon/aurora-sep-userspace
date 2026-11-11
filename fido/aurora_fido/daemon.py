@@ -198,7 +198,10 @@ def key_store_info(backend):
             "keys_detail": "P-256 keys inside the Secure Enclave (/dev/sep-key); the "
                            "private keys never leave it, and the enclave signs only after "
                            "a Touch ID match it checks itself",
-            "hmac_secret": bool(backend.can_unseal)}
+            "hmac_secret": bool(backend.can_unseal),
+            "password_keys": bool(getattr(backend, "can_password", False)),
+            "pin": ("available" if getattr(backend, "pin_reboot_proof", False)
+                    else "not offered: the enclave's wrong-password count does not survive a restart yet")}
 
 
 def serve(auth, u, device_factory, run_dir=None, info=None):

@@ -64,6 +64,10 @@ class KeyBackend:
     flags_supported = 0
     #: SEAL / UNSEAL: secrets the enclave releases only after a match.
     can_unseal = False
+    #: Version 4: keys under the user's key bag, password checked by the enclave.
+    can_password = False
+    #: The enclave's wrong-password count survives a restart (gate for a CTAP2 PIN).
+    pin_reboot_proof = False
     #: CANCEL: a waiting signature can be ended.
     can_cancel = False
 
@@ -119,7 +123,7 @@ IOC_PUBLIC = _ioc(_IOC_READ | _IOC_WRITE, _MAGIC, 0x23, _PUBLIC.size)
 IOC_CANCEL = _ioc(_IOC_NONE, _MAGIC, 0x25, 0)
 IOC_SEAL = _ioc(_IOC_READ | _IOC_WRITE, _MAGIC, 0x26, _SEAL.size)
 IOC_UNSEAL = _ioc(_IOC_READ | _IOC_WRITE, _MAGIC, 0x27, _SEAL.size)
-IFACE_VERSIONS = (2, 3)
+IFACE_VERSIONS = (2, 3, 4)
 # CREATE flags (include/uapi/linux/apple-sep.h).
 CREATE_BIOMETRY_CURRENT_SET = 0x1     # .biometryCurrentSet
 CREATE_BIOMETRY_ANY = 0x2             # .biometryAny
@@ -127,6 +131,8 @@ CREATE_USER_PRESENCE = 0x4            # .userPresence (Touch ID or the user's pa
 # INFO features (version 3; the 'reserved' word of version 2).
 FEATURE_CANCEL = 0x1
 FEATURE_SEAL = 0x2
+FEATURE_PASSWORD = 0x4                # version 4: keys under the user's bag, password checked by the enclave
+FEATURE_PERSISTENT_ATTEMPTS = 0x8     # the enclave's wrong-password count survives a restart
 HANDLE_FLAG_BIOMETRY = 0x01           # handle byte 5: the record carries a biometric ACL
 SEP_MAGIC = b"SEPK"
 LEGACY_SEALED_MAGIC = b"AFSK"         # software keys of aurora-fido 0.1 (removed)
@@ -182,6 +188,11 @@ class SepKeyBackend(KeyBackend):
         self.features = features if version >= 3 else 0
         self.can_cancel = bool(self.features & FEATURE_CANCEL)
         self.can_unseal = bool(self.features & FEATURE_SEAL)
+        self.can_password = bool(self.features & FEATURE_PASSWORD)
+        # A CTAP2 PIN (with pinRetries) is offered only when the enclave's own
+        # count of wrong passwords survives a restart; otherwise root could
+        # reboot between guesses. No kernel sets this yet.
+        self.pin_reboot_proof = bool(self.features & FEATURE_PERSISTENT_ATTEMPTS)
         self.handle_max = min(handle_max, _HANDLE_MAX)
 
     @staticmethod
