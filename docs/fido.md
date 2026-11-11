@@ -186,8 +186,9 @@ start without it.
   sealed to a key with no list under the same bag (`vault.key`). It opens
   with no touch while the bag is unlocked, and not at all while it is
   locked. So the agent cannot start, and nobody can read the records, until
-  the user logs in. The running agent keeps the vault key in memory until it
-  exits; systemd stops user units at logout unless lingering is on.
+  the user logs in. The agent unseals the vault key at the start of each
+  request and drops it at the end, so it is in memory only during a request
+  and only while the bag is unlocked. Python frees the key but cannot zero it.
 - **The password route** exists only on the native front-end (`provider.py`,
   for a credentials portal). A request may carry the login password, and the
   enclave checks it in place of a touch: one call, no retries, and each

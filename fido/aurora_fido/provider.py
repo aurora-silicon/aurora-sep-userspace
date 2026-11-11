@@ -12,6 +12,7 @@ Inputs are WebAuthn-shaped (rp/user dicts, a client data hash the portal
 computed from the origin), and errors are WebAuthn DOMException names.
 """
 
+import contextlib
 import hashlib
 from urllib.parse import urlsplit
 
@@ -58,8 +59,20 @@ def rp_id_matches_origin(rp_id, origin):
 
 
 class Provider:
-    def __init__(self, auth):
+    def __init__(self, auth, gate=None):
         self.auth = auth
+        self.gate = gate              # agent.VaultGate: open the vault per call, if given
+
+    @contextlib.contextmanager
+    def _open(self, need_vault=True):
+        """The vault open for this call (VaultGate); yields whether it opened."""
+        if self.gate is None:
+            yield True
+            return
+        with self.gate.open() as ok:
+            if not ok and need_vault:
+                raise ProviderError("NotAllowedError", "your key bag is locked", "locked")
+            yield ok
 
     def _call(self, cmd, params, ctx):
         r = self.auth.handle(bytes([cmd]) + cbor.encode(params), ctx)
@@ -75,16 +88,21 @@ class Provider:
             raise ProviderError("SecurityError", "rp id %r is not valid for %r" % (rp_id, origin))
 
     def get_info(self):
-        info = self.auth.get_info({}, None)
+        with self._open(need_vault=False) as ok:
+            info = self.auth.get_info({}, None)
         return {"aaguid": info[3], "name": "Aurora Passwords",
                 "algorithms": [a["alg"] for a in info[0x0A]],
                 "extensions": list(info[2]),
                 "uv": ["biometric"] + (["password"] if getattr(self.auth.backend,
                                                                "can_password", False) else []),
-                "locked": False, "rk_remaining": info[0x14]}
+                "locked": not ok, "rk_remaining": info[0x14]}
 
     def list_credentials(self, rp_id, allow=()):
-        """Display metadata only: no enclave operation, no touch."""
+        """Display metadata only: no touch and no credential key operation."""
+        with self._open():
+            return self._list(rp_id, allow)
+
+    def _list(self, rp_id, allow):
         rp_hash = hashlib.sha256(rp_id.encode()).digest()
         out = []
         for rec in self.auth.store.for_rp(rp_hash):
@@ -115,8 +133,9 @@ class Provider:
         """password: the user's login password (bytearray, wiped here) for the
         enclave to check instead of a touch; None = Touch ID."""
         try:
-            return self._make(cdh, rp, user, params, exclude, options,
-                              self._ctx(ctx, password))
+            with self._open():
+                return self._make(cdh, rp, user, params, exclude, options,
+                                  self._ctx(ctx, password))
         finally:
             self._wipe(password)
 
@@ -138,7 +157,8 @@ class Provider:
 
     def get_assertion(self, cdh, rp_id, credential_id, options=None, ctx=None, password=None):
         try:
-            return self._get(cdh, rp_id, credential_id, options, self._ctx(ctx, password))
+            with self._open():
+                return self._get(cdh, rp_id, credential_id, options, self._ctx(ctx, password))
         finally:
             self._wipe(password)
 

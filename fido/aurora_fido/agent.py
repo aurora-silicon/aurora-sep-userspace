@@ -20,6 +20,7 @@ host holds.
 """
 
 import argparse
+import contextlib
 import logging
 import os
 import pwd
@@ -29,7 +30,7 @@ import sys
 import threading
 
 from . import __version__, agentproto, cbor, creds, ctap2, daemon
-from .errors import ERR_CHANNEL_BUSY
+from .errors import ERR_CHANNEL_BUSY, ERR_OPERATION_DENIED
 from .backend import BackendError, BagLocked, UserBagBackend, open_backend, user_handle_uid
 
 log = logging.getLogger("aurora-passkeys")
@@ -145,6 +146,63 @@ class UserBagSecret:
         return self.sep.unseal(rec[1], rec[2])
 
 
+class LockedVault:
+    """Stands in for the vault between requests: nothing opens without the vault key."""
+
+    def __init__(self, state_dir):
+        self.state_dir = state_dir
+        self.handles_dir = os.path.join(state_dir, "handles")
+
+    def _locked(self, *_a, **_k):
+        raise BackendError("the vault is closed (your key bag is locked)")
+
+    wrap = unwrap = seal_record = open_record = _locked
+
+
+class VaultGate:
+    """Opens the vault for one request and closes it again.
+
+    The vault key is unsealed from the user's bag at the start of every
+    request (one enclave key exchange, no touch) and the vault is dropped when
+    the request ends. So the key is in this process's memory only during a
+    request, and only while the bag is unlocked: once the user logs out or the
+    bag locks, the next request cannot open it. (Python frees the key but
+    cannot zero it.) One request at a time, across every front-end.
+    """
+
+    def __init__(self, auth, secret, state_dir, max_rk):
+        self.auth = auth
+        self.secret = secret
+        self.state_dir = state_dir
+        self.max_rk = max_rk
+        self.lock = threading.Lock()
+        self._close()
+
+    def _close(self):
+        v = LockedVault(self.state_dir)
+        self.auth.vault = v
+        self.auth.store = creds.ResidentStore(v, self.state_dir, self.max_rk)
+
+    @contextlib.contextmanager
+    def open(self):
+        """Yields True with the vault open, or False when the bag is locked."""
+        with self.lock:
+            try:
+                master = self.secret.load()
+            except BagLocked as e:
+                log.info("vault stays closed: %s", e)
+                yield False
+                return
+            v = creds.Vault(self.state_dir, master)
+            del master
+            self.auth.vault = v
+            self.auth.store = creds.ResidentStore(v, self.state_dir, self.max_rk)
+            try:
+                yield True
+            finally:
+                self._close()
+
+
 def per_user_info(resp):
     """getInfo from the agent: no U2F_V2 (U2F is not forwarded to agents)."""
     if resp[:1] != b"\x00":
@@ -162,8 +220,9 @@ class AgentServer:
     open the hidraw node, so allowing them here grants nothing new.
     """
 
-    def __init__(self, auth, path, allowed_uids):
+    def __init__(self, auth, path, allowed_uids, gate=None):
         self.auth = auth
+        self.gate = gate                      # VaultGate: the vault is open only per request
         self.path = path
         self.allowed = set(allowed_uids)
         self.sock = None
@@ -248,13 +307,23 @@ class AgentServer:
             resp = bytes([ERR_CHANNEL_BUSY])
         else:
             try:
-                resp = self.auth.handle(data, ctap2.Ctx(cancel, up_needed))
+                resp = self._handle(data, ctap2.Ctx(cancel, up_needed))
             finally:
                 self.lock.release()
         if data[:1] == bytes([ctap2.CMD_GET_INFO]):
             resp = per_user_info(resp)
         with send_lock:
             agentproto.send(conn, {"t": "resp", "d": resp})
+
+
+    def _handle(self, data, ctx):
+        if self.gate is None:
+            return self.auth.handle(data, ctx)
+        with self.gate.open() as ok:
+            # getInfo needs no vault (it only counts the records); the rest does.
+            if ok or data[:1] == bytes([ctap2.CMD_GET_INFO]):
+                return self.auth.handle(data, ctx)
+            return bytes([ERR_OPERATION_DENIED])
 
 
 def build_agent(cfg, state_dir, backend, secret, user_name, sites=None):
@@ -300,8 +369,9 @@ def main(argv=None):
         return 1
     if note:
         log.info("%s", note)
-    srv = AgentServer(auth, a.socket or runtime_socket(), {0, os.getuid()}).bind()
-    dbus = None if a.no_dbus else start_dbus(auth, cfg)
+    gate = VaultGate(auth, secret, state_dir, cfg.getint("authenticator", "max_resident"))
+    srv = AgentServer(auth, a.socket or runtime_socket(), {0, os.getuid()}, gate).bind()
+    dbus = None if a.no_dbus else start_dbus(auth, cfg, gate)
     for s in (signal.SIGTERM, signal.SIGINT):
         signal.signal(s, lambda *_: srv.stop.set())
     log.info("aurora-passkeyd %s ready for %s", __version__, name)
@@ -314,7 +384,7 @@ def main(argv=None):
     return 0
 
 
-def start_dbus(auth, cfg):
+def start_dbus(auth, cfg, gate=None):
     """The native front-end on the session bus (org.aurora.Passkeys1), if possible.
 
     [native] portal_names: bus names allowed to call it (a credentials portal);
@@ -328,7 +398,7 @@ def start_dbus(auth, cfg):
         return None
     names = cfg.get("native", "portal_names", fallback="").split()
     try:
-        svc = dbus_provider.ProviderService(Provider(auth), allow_names=names)
+        svc = dbus_provider.ProviderService(Provider(auth, gate), allow_names=names)
         if not svc.request_name():
             log.warning("%s is taken; no D-Bus front-end", dbus_provider.BUS_NAME)
             svc.close()

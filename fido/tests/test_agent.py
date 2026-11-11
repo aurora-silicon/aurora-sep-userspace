@@ -38,6 +38,7 @@ class Agent:
         self.backend = backend or StubKeyBackend(mode=mode, flags_supported=flags_supported)
         cfg = daemon.load_config(None)
         cfg.set("touchid", "notify", "no")
+        self.gate = None
         if userbag:      # interface 4: credentials and the vault key under the user's bag
             keys = UserBagBackend(self.backend, UID)
             secret = agent.UserBagSecret(self.backend, UID, self.state)
@@ -45,9 +46,11 @@ class Agent:
             keys = self.backend
             secret = FileSecret(os.path.join(root, name, "vault"))
         self.auth, _ = agent.build_agent(cfg, self.state, keys, secret, "root", sites)
+        if userbag:      # as aurora-passkeyd runs: the vault is open only per request
+            self.gate = agent.VaultGate(self.auth, secret, self.state, 4)
         self.path = os.path.join(root, name, "run", "ctap.sock")
         self.srv = agent.AgentServer(self.auth, self.path,
-                                     {UID} if allowed is None else allowed).bind()
+                                     {UID} if allowed is None else allowed, self.gate).bind()
         self.t = threading.Thread(target=self.srv.serve_forever, daemon=True)
         self.t.start()
 
@@ -275,8 +278,9 @@ class UserBagTest(unittest.TestCase):
         st, mc = f.make()
         self.assertEqual(st, 0)
         self.assertEqual(a.auth.policy, creds.POLICY_TOUCHID_OR_PASSWORD)
-        cred = a.auth.vault.unwrap(hashlib.sha256(b"example.com").digest(),
-                                   parse_auth_data(mc[2])["cred_id"])
+        with a.gate.open():
+            cred = a.auth.vault.unwrap(hashlib.sha256(b"example.com").digest(),
+                                       parse_auth_data(mc[2])["cred_id"])
         self.assertEqual(backend.user_handle_uid(cred.handle), UID)
         self.assertTrue(backend.is_gated_handle(cred.handle))
         self.assertTrue(os.path.exists(os.path.join(a.state, "vault.key")))
@@ -311,7 +315,7 @@ class UserBagTest(unittest.TestCase):
 
     def test_password_route_through_the_native_front_end(self):
         a, f = self.agent(mode=stub.NO_MATCH)                 # no finger at all
-        p = Provider(a.auth)
+        p = Provider(a.auth, a.gate)
         o = {"origin": "https://example.com"}
         pw = bytearray(b"pw")
         r = p.make_credential(CDH, {"id": "example.com"}, {"id": b"u1", "name": "r"}, [-7],
@@ -330,6 +334,23 @@ class UserBagTest(unittest.TestCase):
         with self.assertRaises(ProviderError):                # and no finger: refused
             p.get_assertion(CDH, "example.com", cid, o)
         self.assertIn("password", p.get_info()["uv"])
+
+    def test_vault_is_open_only_during_a_request(self):
+        a, f = self.agent()
+        self.assertEqual(f.make()[0], 0)
+        self.assertIsInstance(a.auth.vault, agent.LockedVault)   # closed again
+        a.backend.bag_locked = True
+        st, info = f.call(ctap2.CMD_GET_INFO)                 # needs no vault
+        self.assertEqual(st, 0)
+        self.assertEqual(f.ga()[0], E.ERR_OPERATION_DENIED)
+        p = Provider(a.auth, a.gate)
+        with self.assertRaises(ProviderError) as c:
+            p.list_credentials("example.com")                 # the names stay sealed too
+        self.assertEqual(c.exception.reason, "locked")
+        self.assertTrue(p.get_info()["locked"])
+        a.backend.bag_locked = False
+        self.assertEqual(len(p.list_credentials("example.com")), 1)
+        self.assertEqual(f.ga()[0], 0)
 
     def test_biometric_only_site_rule_is_refused_under_the_bag(self):
         conf = os.path.join(self.tmp.name, "sites.conf")
