@@ -272,6 +272,7 @@ def main(argv=None):
     ap.add_argument("--config", default=daemon.CONFIG)
     ap.add_argument("--state-dir", default=None)
     ap.add_argument("--socket", default=None)
+    ap.add_argument("--no-dbus", action="store_true", help="no session-bus front-end")
     ap.add_argument("-v", "--verbose", action="store_true")
     a = ap.parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if a.verbose else logging.INFO,
@@ -300,6 +301,7 @@ def main(argv=None):
     if note:
         log.info("%s", note)
     srv = AgentServer(auth, a.socket or runtime_socket(), {0, os.getuid()}).bind()
+    dbus = None if a.no_dbus else start_dbus(auth, cfg)
     for s in (signal.SIGTERM, signal.SIGINT):
         signal.signal(s, lambda *_: srv.stop.set())
     log.info("aurora-passkeyd %s ready for %s", __version__, name)
@@ -307,7 +309,36 @@ def main(argv=None):
         srv.serve_forever()
     finally:
         srv.close()
+        if dbus:
+            dbus.close()
     return 0
+
+
+def start_dbus(auth, cfg):
+    """The native front-end on the session bus (org.aurora.Passkeys1), if possible.
+
+    [native] portal_names: bus names allowed to call it (a credentials portal);
+    empty = any process of this user, which can already reach the security key
+    through hidraw, so it grants nothing new."""
+    try:
+        from . import dbus_provider
+        from .provider import Provider
+    except ImportError as e:
+        log.info("no D-Bus front-end (%s)", e)
+        return None
+    names = cfg.get("native", "portal_names", fallback="").split()
+    try:
+        svc = dbus_provider.ProviderService(Provider(auth), allow_names=names)
+        if not svc.request_name():
+            log.warning("%s is taken; no D-Bus front-end", dbus_provider.BUS_NAME)
+            svc.close()
+            return None
+    except (OSError, KeyError) as e:
+        log.info("no session bus (%s); no D-Bus front-end", e)
+        return None
+    threading.Thread(target=svc.serve_forever, name="passkeys-dbus", daemon=True).start()
+    log.info("native front-end on the session bus as %s", dbus_provider.BUS_NAME)
+    return svc
 
 
 if __name__ == "__main__":
