@@ -163,6 +163,9 @@ class AgentTest(unittest.TestCase):
         self.assertEqual((st2, info2), (st, info))
         st, _ = f.make()
         self.assertEqual(st, E.ERR_OPERATION_DENIED)
+        f.active = UID + 1                                # another user, no agent: not a's info
+        st3, info3 = f.call(ctap2.CMD_GET_INFO)
+        self.assertEqual(info3, cbor.decode(remote.static_info()[1:]))
 
     def test_socket_served_by_another_uid_is_refused(self):
         a = self.agent("u")

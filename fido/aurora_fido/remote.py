@@ -41,7 +41,7 @@ class RemoteAuthenticator:
         self.active_uid = active_uid or self._seat_uid
         self.socket_path = socket_path
         self.timeout = timeout
-        self._info = None
+        self._info = {}                 # uid -> last getInfo reply (per user: it counts their passkeys)
         self.lock = threading.Lock()
 
     @staticmethod
@@ -69,20 +69,20 @@ class RemoteAuthenticator:
         uid = self.active_uid()
         if uid is None:
             log.info("no active local session on seat0: request refused")
-            return self._fallback(is_info)
+            return self._fallback(is_info, None)
         try:
             s = self._connect(uid)
         except (OSError, PermissionError) as e:
             log.info("passkey agent of uid %d not reachable (%s): request refused", uid, e)
-            return self._fallback(is_info)
+            return self._fallback(is_info, uid)
         with s:
             try:
-                return self._exchange(s, data, ctx, is_info)
+                return self._exchange(s, data, ctx, is_info, uid)
             except (OSError, agentproto.ProtocolError) as e:
                 log.warning("passkey agent of uid %d failed: %s", uid, e)
-                return self._fallback(is_info)
+                return self._fallback(is_info, uid)
 
-    def _exchange(self, s, data, ctx, is_info):
+    def _exchange(self, s, data, ctx, is_info, uid):
         agentproto.send(s, {"t": "req", "d": data})
         done = threading.Event()
 
@@ -105,14 +105,14 @@ class RemoteAuthenticator:
                     ctx.on_up_needed()
                 elif msg["t"] == "resp":
                     if is_info and msg["d"][:1] == b"\x00":
-                        self._info = msg["d"]
+                        self._info[uid] = msg["d"]
                     return msg["d"]
                 else:
                     raise agentproto.ProtocolError("unexpected %r" % msg["t"])
         finally:
             done.set()
 
-    def _fallback(self, is_info):
+    def _fallback(self, is_info, uid):
         if is_info:
-            return self._info or static_info()
+            return self._info.get(uid) or static_info()
         return bytes([ERR_OPERATION_DENIED])
