@@ -58,6 +58,15 @@ class EnclaveCancelled(BackendError):
     """The waiting signature was cancelled (SEP_KEY_CANCEL)."""
 
 
+class BagLocked(BackendError):
+    """The enclave refuses a key under the user's key bag: the bag is locked
+    (logged out, suspended) or is not this OS install's."""
+
+
+class PasswordRefused(BackendError):
+    """The enclave refused the password; it counted the try."""
+
+
 class KeyBackend:
     name = "abstract"
     #: CREATE flags this backend offers (SEP_KEY_CREATE_*).
@@ -97,6 +106,21 @@ class KeyBackend:
     def public(self, handle):
         raise NotImplementedError
 
+    # -- interface 4: keys under a user's key bag ------------------------------------
+
+    def create_user(self, uid, presence):
+        """(handle, point) of a key under uid's bag: presence=True makes a
+        .userPresence key (Touch ID or the bag's password), False a key with no
+        list that works only while the bag is unlocked."""
+        raise BackendError("this kernel cannot make keys under a user's key bag")
+
+    def sign_password(self, handle, digest, password):
+        """Like sign(), with the bag's password checked by the enclave instead of a touch."""
+        raise BackendError("this kernel cannot check a password in the enclave")
+
+    def unseal_password(self, handle, sealed, password):
+        raise BackendError("this kernel cannot check a password in the enclave")
+
 
 def _ioc(direction, magic, nr, size):
     return direction << 30 | size << 16 | magic << 8 | nr
@@ -115,6 +139,13 @@ _PUBLIC = _CREATE
 # struct sep_key_seal, for SEAL (secret in, sealed out) and UNSEAL (sealed in,
 # secret out): flags, handle_len, secret_len, sealed_len, secret, sealed, handle
 _SEAL = struct.Struct(f"<IIII{_SECRET_MAX}s{_SEALED_MAX}s{_HANDLE_MAX}s")    # 2384
+# Version 4: struct sep_key_create_user (flags, uid, handle_len, point, pad, handle) and
+# struct sep_key_password (len, reserved, bytes) appended to SIGN / SEAL requests.
+_PASSWORD_MAX = 256
+_CREATE_USER = struct.Struct(f"<III{PUB_LEN}s3s{_HANDLE_MAX}s")    # 2128
+_PW = f"II{_PASSWORD_MAX}s"
+_SIGN_PASSWORD = struct.Struct("<" + _SIGN.format.lstrip("<") + _PW)   # 2428
+_SEAL_PASSWORD = struct.Struct("<" + _SEAL.format.lstrip("<") + _PW)   # 2648
 
 IOC_INFO = _ioc(_IOC_READ, _MAGIC, 0x20, _INFO.size)
 IOC_CREATE = _ioc(_IOC_READ | _IOC_WRITE, _MAGIC, 0x21, _CREATE.size)
@@ -123,6 +154,9 @@ IOC_PUBLIC = _ioc(_IOC_READ | _IOC_WRITE, _MAGIC, 0x23, _PUBLIC.size)
 IOC_CANCEL = _ioc(_IOC_NONE, _MAGIC, 0x25, 0)
 IOC_SEAL = _ioc(_IOC_READ | _IOC_WRITE, _MAGIC, 0x26, _SEAL.size)
 IOC_UNSEAL = _ioc(_IOC_READ | _IOC_WRITE, _MAGIC, 0x27, _SEAL.size)
+IOC_CREATE_USER = _ioc(_IOC_READ | _IOC_WRITE, _MAGIC, 0x28, _CREATE_USER.size)
+IOC_SIGN_PASSWORD = _ioc(_IOC_READ | _IOC_WRITE, _MAGIC, 0x29, _SIGN_PASSWORD.size)
+IOC_UNSEAL_PASSWORD = _ioc(_IOC_READ | _IOC_WRITE, _MAGIC, 0x2A, _SEAL_PASSWORD.size)
 IFACE_VERSIONS = (2, 3, 4)
 # CREATE flags (include/uapi/linux/apple-sep.h).
 CREATE_BIOMETRY_CURRENT_SET = 0x1     # .biometryCurrentSet
@@ -139,10 +173,34 @@ LEGACY_SEALED_MAGIC = b"AFSK"         # software keys of aurora-fido 0.1 (remove
 
 assert (_INFO.size, _CREATE.size, _SIGN.size) == (16, 2124, 2164)
 assert _SEAL.size == 2384
+assert (_CREATE_USER.size, _SIGN_PASSWORD.size, _SEAL_PASSWORD.size) == (2128, 2428, 2648)
+# Handle version 2 (interface 4): "SEPK", 2, flags, 0, 0, blob length, uid, blob.
+HANDLE_VERSION_USER = 2
+HANDLE_FLAG_USER_BAG = 0x04           # under a user's bag, macOS .userPresence list
+HANDLE_FLAG_USER_PLAIN = 0x08         # with USER_BAG: no list, usable while the bag is unlocked
+HANDLE_HEADER_USER = 16
+
+
+def user_handle_uid(handle):
+    """The uid of a handle under a user's key bag, or None."""
+    if (isinstance(handle, bytes) and len(handle) > HANDLE_HEADER_USER
+            and handle[:4] == SEP_MAGIC and handle[4] == HANDLE_VERSION_USER
+            and handle[5] & HANDLE_FLAG_USER_BAG):
+        return struct.unpack("<I", handle[12:16])[0]
+    return None
+
+
+def is_user_plain_handle(handle):
+    return user_handle_uid(handle) is not None and \
+        handle[5] == HANDLE_FLAG_USER_BAG | HANDLE_FLAG_USER_PLAIN
 
 
 def is_gated_handle(handle):
-    """A /dev/sep-key handle whose record carries a biometric access-control list."""
+    """A /dev/sep-key handle whose record carries an access-control list the
+    enclave enforces: biometric (version 1), or .userPresence under a user's
+    bag (version 2). A plain user-bag key (no list) is not a credential key."""
+    if user_handle_uid(handle) is not None:
+        return handle[5] == HANDLE_FLAG_USER_BAG
     return (isinstance(handle, bytes) and handle[:4] == SEP_MAGIC and len(handle) > 5
             and bool(handle[5] & HANDLE_FLAG_BIOMETRY))
 
@@ -196,7 +254,12 @@ class SepKeyBackend(KeyBackend):
         self.handle_max = min(handle_max, _HANDLE_MAX)
 
     @staticmethod
-    def _error(e):
+    def _error(e, user=False, password=False):
+        if user and e.errno == EKEYREJECTED:
+            return BagLocked("the enclave refused the key: your key bag is locked "
+                             "(log in again) or belongs to another install")
+        if password and e.errno == errno.EACCES:
+            return PasswordRefused("the enclave refused the password")
         if e.errno in (errno.EINVAL, EKEYREJECTED):
             return InvalidHandle(e.strerror)
         if e.errno == errno.EACCES:
@@ -207,11 +270,11 @@ class SepKeyBackend(KeyBackend):
             return EnclaveCancelled("cancelled")
         return BackendError(e.strerror)
 
-    def _call(self, req, buf):
+    def _call(self, req, buf, user=False, password=False):
         try:
             fcntl.ioctl(self.fd, req, buf, True)
         except OSError as e:
-            raise self._error(e) from e
+            raise self._error(e, user, password) from e
 
     def gated(self, handle):
         return is_gated_handle(handle)
@@ -238,7 +301,7 @@ class SepKeyBackend(KeyBackend):
         if len(digest) != DIGEST_LEN:
             raise ValueError("digest must be 32 bytes")
         buf = bytearray(_SIGN.pack(0, len(handle), digest, 0, b"", handle))
-        self._call(IOC_SIGN, buf)
+        self._call(IOC_SIGN, buf, user=user_handle_uid(handle) is not None)
         _f, _n, _d, sig_len, sig, _h = _SIGN.unpack(buf)
         if not 0 < sig_len <= _SIG_MAX:
             raise BackendError("malformed sign reply")
@@ -251,7 +314,7 @@ class SepKeyBackend(KeyBackend):
         if not 0 < len(sealed) <= _SEALED_MAX:
             raise InvalidHandle("sealed secret length")
         buf = bytearray(_SEAL.pack(0, len(handle), 0, len(sealed), b"", sealed, handle))
-        self._call(IOC_UNSEAL, buf)
+        self._call(IOC_UNSEAL, buf, user=user_handle_uid(handle) is not None)
         _f, _n, secret_len, _sl, secret, _s, _h = _SEAL.unpack(buf)
         if not 0 < secret_len <= _SECRET_MAX:
             raise BackendError("malformed unseal reply")
@@ -264,7 +327,7 @@ class SepKeyBackend(KeyBackend):
         if not 0 < len(secret) <= _SECRET_MAX:
             raise ValueError("secret length")
         buf = bytearray(_SEAL.pack(0, len(handle), len(secret), 0, secret, b"", handle))
-        self._call(IOC_SEAL, buf)
+        self._call(IOC_SEAL, buf, user=user_handle_uid(handle) is not None)
         _f, _n, _sl, sealed_len, _s, sealed, _h = _SEAL.unpack(buf)
         if not 0 < sealed_len <= _SEALED_MAX:
             raise BackendError("malformed seal reply")
@@ -281,8 +344,133 @@ class SepKeyBackend(KeyBackend):
     def public(self, handle):
         self._check(handle)
         buf = bytearray(_PUBLIC.pack(0, len(handle), b"", b"", handle))
-        self._call(IOC_PUBLIC, buf)
+        self._call(IOC_PUBLIC, buf, user=user_handle_uid(handle) is not None)
         return _PUBLIC.unpack(buf)[2]
+
+    # -- interface 4 ---------------------------------------------------------------------
+
+    def _need_password_iface(self):
+        if not self.can_password:
+            raise BackendError("this kernel's /dev/sep-key has no keys under a user's key "
+                               "bag (interface 4, variant-5 key store)")
+
+    def create_user(self, uid, presence):
+        self._need_password_iface()
+        flags = CREATE_USER_PRESENCE if presence else 0
+        buf = bytearray(_CREATE_USER.pack(flags, uid, 0, b"", b"", b""))
+        self._call(IOC_CREATE_USER, buf, user=True)
+        _f, _u, n, point, _r, handle = _CREATE_USER.unpack(buf)
+        if not 0 < n <= self.handle_max or point[0] != 4:
+            raise BackendError("malformed create reply")
+        handle = handle[:n]
+        if user_handle_uid(handle) != uid or is_gated_handle(handle) != presence:
+            raise BackendError("the kernel made a key other than the one asked for")
+        return handle, point
+
+    @staticmethod
+    def _password(password):
+        if not 0 < len(password) <= _PASSWORD_MAX:
+            raise PasswordRefused("password length")
+        return bytes(password)
+
+    def sign_password(self, handle, digest, password):
+        self._need_password_iface()
+        self._check(handle)
+        if len(digest) != DIGEST_LEN:
+            raise ValueError("digest must be 32 bytes")
+        pw = self._password(password)
+        buf = bytearray(_SIGN_PASSWORD.pack(0, len(handle), digest, 0, b"", handle,
+                                            len(pw), 0, pw))
+        try:
+            self._call(IOC_SIGN_PASSWORD, buf, user=True, password=True)
+            f = _SIGN_PASSWORD.unpack(buf)
+        finally:
+            buf[_SIGN.size:] = bytes(len(buf) - _SIGN.size)      # our copy of the password
+        sig_len, sig = f[3], f[4]
+        if not 0 < sig_len <= _SIG_MAX:
+            raise BackendError("malformed sign reply")
+        return sig[:sig_len]
+
+    def unseal_password(self, handle, sealed, password):
+        self._need_password_iface()
+        self._check(handle)
+        if not 0 < len(sealed) <= _SEALED_MAX:
+            raise InvalidHandle("sealed secret length")
+        pw = self._password(password)
+        buf = bytearray(_SEAL_PASSWORD.pack(0, len(handle), 0, len(sealed), b"", sealed,
+                                            handle, len(pw), 0, pw))
+        try:
+            self._call(IOC_UNSEAL_PASSWORD, buf, user=True, password=True)
+            f = _SEAL_PASSWORD.unpack(buf)
+        finally:
+            buf[_SEAL.size:] = bytes(len(buf) - _SEAL.size)
+        secret_len, secret = f[2], f[4]
+        if not 0 < secret_len <= _SECRET_MAX:
+            raise BackendError("malformed unseal reply")
+        return secret[:secret_len]
+
+
+class UserBagBackend(KeyBackend):
+    """Credential keys under one user's key bag (interface 4), for that user's agent.
+
+    Every credential key is a .userPresence key (Touch ID, or the bag's
+    password checked by the enclave): that is the only kind a user's own
+    process may make. Policies that need a biometric-only list are not
+    offered here (flags_supported), so a site rule asking for one is refused,
+    never weakened.
+    """
+
+    name = "sep-key (your key bag)"
+    flags_supported = CREATE_USER_PRESENCE
+
+    def __init__(self, sep, uid):
+        self.sep = sep
+        self.uid = uid
+        self.can_unseal = sep.can_unseal
+        self.can_cancel = sep.can_cancel
+        self.can_password = True
+        self.pin_reboot_proof = sep.pin_reboot_proof
+        self.version = sep.version
+
+    def create(self, flags):
+        if flags != CREATE_USER_PRESENCE:
+            raise BackendError("keys under your key bag are Touch ID or password keys "
+                               "(.userPresence) only")
+        return self.sep.create_user(self.uid, True)
+
+    def gated(self, handle):
+        return is_gated_handle(handle) and user_handle_uid(handle) == self.uid
+
+    def _mine(self, handle):
+        if user_handle_uid(handle) != self.uid:
+            raise InvalidHandle("not a key under this user's bag")
+
+    def sign(self, handle, digest):
+        self._mine(handle)
+        return self.sep.sign(handle, digest)
+
+    def sign_password(self, handle, digest, password):
+        self._mine(handle)
+        return self.sep.sign_password(handle, digest, password)
+
+    def seal(self, handle, secret):
+        self._mine(handle)
+        return self.sep.seal(handle, secret)
+
+    def unseal(self, handle, sealed):
+        self._mine(handle)
+        return self.sep.unseal(handle, sealed)
+
+    def unseal_password(self, handle, sealed, password):
+        self._mine(handle)
+        return self.sep.unseal_password(handle, sealed, password)
+
+    def cancel(self):
+        self.sep.cancel()
+
+    def public(self, handle):
+        self._mine(handle)
+        return self.sep.public(handle)
 
 
 STORES = ("auto", "sep-key")

@@ -30,7 +30,7 @@ import threading
 
 from . import __version__, agentproto, cbor, creds, ctap2, daemon
 from .errors import ERR_CHANNEL_BUSY
-from .backend import BackendError, open_backend
+from .backend import BackendError, BagLocked, UserBagBackend, open_backend, user_handle_uid
 
 log = logging.getLogger("aurora-passkeys")
 
@@ -95,29 +95,54 @@ def runtime_socket():
 
 
 class UserBagSecret:
-    """The vault key, sealed to a no-touch key under the user's key bag.
+    """The vault key (64 bytes that wrap credential IDs and records), sealed
+    to a key with no list under the user's own key bag (interface 4,
+    SEP_KEY_CREATE_USER with flags 0).
 
-    Placeholder until sep-key interface 4 (SEP_KEY_CREATE_USER_BAG_ONLY:
-    a key under the caller's bag whose list needs the bag unlocked, no
-    credential). Until then it refuses; it never keeps a host-readable key.
+    The enclave opens it with no touch and no password, but only while the
+    bag is unlocked (the user logged in with their password). Root cannot
+    open it while the user is logged out, and nothing host-readable is kept.
+    File vault.key: CBOR {1: key handle, 2: sealed vault key}.
     """
 
-    def __init__(self, backend, state_dir):
-        self.backend = backend
-        self.state_dir = state_dir
+    FILE = "vault.key"
+
+    def __init__(self, sep, uid, state_dir):
+        self.sep = sep
+        self.uid = uid
+        self.path = os.path.join(state_dir, self.FILE)
 
     def _need_iface(self):
-        if getattr(self.backend, "version", 0) < SEP_KEY_IFACE_USER_BAG:
+        if not getattr(self.sep, "can_password", False):
             raise BackendError(
                 "per-user passkeys need /dev/sep-key interface 4 (keys under your own key "
-                "bag); this kernel has interface %s" % getattr(self.backend, "version", "?"))
-        raise BackendError("interface 4 vault key: not implemented yet")
-
-    def load(self):
-        self._need_iface()
+                "bag, variant-5 key store); this kernel has interface %s"
+                % getattr(self.sep, "version", "?"))
 
     def new(self):
         self._need_iface()
+        handle, _point = self.sep.create_user(self.uid, False)
+        secret = os.urandom(64)
+        sealed = self.sep.seal(handle, secret)
+        if self.sep.unseal(handle, sealed) != secret:
+            raise BackendError("the enclave did not give the vault key back")
+        creds.atomic_write(self.path, cbor.encode({1: handle, 2: sealed}))
+        log.info("made the vault key (sealed under your key bag)")
+        return secret
+
+    def load(self):
+        self._need_iface()
+        try:
+            with open(self.path, "rb") as f:
+                rec = cbor.decode(f.read(8192))
+        except FileNotFoundError:
+            return self.new()
+        if not (isinstance(rec, dict) and isinstance(rec.get(1), bytes)
+                and isinstance(rec.get(2), bytes)):
+            raise BackendError("%s is damaged" % self.path)
+        if user_handle_uid(rec[1]) != self.uid:
+            raise BackendError("%s belongs to another user" % self.path)
+        return self.sep.unseal(rec[1], rec[2])
 
 
 def per_user_info(resp):
@@ -259,10 +284,16 @@ def main(argv=None):
     os.umask(0o077)
     os.makedirs(state_dir, mode=0o700, exist_ok=True)
     cfg = daemon.load_config(a.config)
+    uid = os.getuid()
     try:
-        backend = open_backend(cfg.get("keys", "store"))
-        auth, note = build_agent(cfg, state_dir, backend, UserBagSecret(backend, state_dir), name,
+        sep = open_backend(cfg.get("keys", "store"))
+        secret = UserBagSecret(sep, uid, state_dir)
+        secret._need_iface()
+        auth, note = build_agent(cfg, state_dir, UserBagBackend(sep, uid), secret, name,
                                  SitePolicy(os.path.join(config_dir(), "sites.conf")))
+    except BagLocked as e:
+        log.error("%s; aurora-passkeyd starts again when you log in", e)
+        return 1
     except (BackendError, ValueError, OSError) as e:
         log.error("%s", e)
         return 1

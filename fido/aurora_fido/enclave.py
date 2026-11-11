@@ -33,14 +33,17 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.utils import Prehashed
 
 from . import cbor, creds, touchid
-from .backend import (BackendError, EnclaveCancelled, EnclaveRefused, EnclaveTimeout,
-                      InvalidHandle)
+from .backend import (BackendError, BagLocked, EnclaveCancelled, EnclaveRefused,
+                      EnclaveTimeout, InvalidHandle, PasswordRefused)
 
 log = logging.getLogger("aurora-fido")
 
 PRESENCE_FILE = "presence.key"
 # The kernel waits about a minute for a finger; a CANCEL ends it sooner.
 ENCLAVE_WAIT = 60.0
+# Results besides touchid.MATCH / NO_MATCH / TIMEOUT / CANCELLED:
+WRONG_PASSWORD = "wrong-password"     # the enclave refused the password (and counted it)
+BAG_LOCKED = "bag-locked"             # the user's key bag is locked: nothing under it works
 
 
 def verify_digest(point, digest, der_sig):
@@ -146,26 +149,52 @@ class EnclaveUser:
                         return touchid.TIMEOUT, None
                     except EnclaveCancelled:
                         return touchid.CANCELLED, None
+                    except BagLocked as e:
+                        log.info("%s: %s", prompt.title(), e)
+                        return BAG_LOCKED, None
                 return touchid.NO_MATCH, None
             finally:
                 self.notifier.close(note)
 
-    def sign(self, handle, digest, prompt, cancel, waiting=lambda: None):
-        """(result, DER signature): the enclave signs after it saw a match."""
+    def _with_password(self, op, prompt):
+        """(result, value) of one enclave call that checks the bag's password itself.
+
+        No retries here: every wrong password counts in the enclave, and the
+        caller decides whether to ask again."""
+        with self.lock:
+            try:
+                return touchid.MATCH, op()
+            except PasswordRefused:
+                log.info("%s: the enclave refused the password", prompt.title())
+                return WRONG_PASSWORD, None
+            except BagLocked as e:
+                log.info("%s: %s", prompt.title(), e)
+                return BAG_LOCKED, None
+
+    def sign(self, handle, digest, prompt, cancel, waiting=lambda: None, password=None):
+        """(result, DER signature): the enclave signs after it saw a match, or
+        after it checked password (keys under the user's bag only)."""
+        if password is not None:
+            return self._with_password(
+                lambda: self.backend.sign_password(handle, digest, password), prompt)
         return self._prompt(lambda: self.backend.sign(handle, digest), prompt, cancel, waiting)
 
-    def unseal(self, handle, sealed, prompt, cancel, waiting=lambda: None):
-        """(result, secret): the enclave releases a sealed secret after a match."""
+    def unseal(self, handle, sealed, prompt, cancel, waiting=lambda: None, password=None):
+        """(result, secret): the enclave releases a sealed secret after a match
+        (or after it checked password)."""
+        if password is not None:
+            return self._with_password(
+                lambda: self.backend.unseal_password(handle, sealed, password), prompt)
         return self._prompt(lambda: self.backend.unseal(handle, sealed), prompt, cancel,
                             waiting)
 
-    def verify(self, prompt, cancel, waiting=lambda: None):
+    def verify(self, prompt, cancel, waiting=lambda: None, password=None):
         """A Touch ID approval for something that signs nothing: the presence key."""
         for renew in (False, True):
             handle, point = self.presence_key(renew)
             nonce = os.urandom(32)
             try:
-                result, sig = self.sign(handle, nonce, prompt, cancel, waiting)
+                result, sig = self.sign(handle, nonce, prompt, cancel, waiting, password)
             except InvalidHandle:
                 # touchid-current: the enrolled fingers changed, the enclave
                 # retired the old presence key. Make a new one once.

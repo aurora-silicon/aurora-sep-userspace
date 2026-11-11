@@ -22,9 +22,12 @@ from . import errors as E
 class ProviderError(Exception):
     """name: a WebAuthn DOMException name (NotAllowedError, InvalidStateError, ...)."""
 
-    def __init__(self, name, message=""):
+    def __init__(self, name, message="", reason=None):
         super().__init__(message or name)
         self.name = name
+        # Finer cause for the portal UI: "wrong-password" (ask again; the enclave
+        # counted the try), else None.
+        self.reason = reason
 
 
 # CTAP status -> DOMException name (WebAuthn L3, "authenticatorMakeCredential"/
@@ -59,7 +62,9 @@ class Provider:
         self.auth = auth
 
     def _call(self, cmd, params, ctx):
-        r = self.auth.handle(bytes([cmd]) + cbor.encode(params), ctx or ctap2.Ctx())
+        r = self.auth.handle(bytes([cmd]) + cbor.encode(params), ctx)
+        if r[0] == E.ERR_PIN_INVALID:
+            raise ProviderError("NotAllowedError", "wrong password", "wrong-password")
         if r[0] != 0:
             raise ProviderError(_DOM.get(r[0], "NotAllowedError"), "CTAP status 0x%02x" % r[0])
         return cbor.decode(r[1:]) if len(r) > 1 else {}
@@ -73,7 +78,9 @@ class Provider:
         info = self.auth.get_info({}, None)
         return {"aaguid": info[3], "name": "Aurora Passwords",
                 "algorithms": [a["alg"] for a in info[0x0A]],
-                "extensions": list(info[2]), "uv": ["biometric"],
+                "extensions": list(info[2]),
+                "uv": ["biometric"] + (["password"] if getattr(self.auth.backend,
+                                                               "can_password", False) else []),
                 "locked": False, "rk_remaining": info[0x14]}
 
     def list_credentials(self, rp_id, allow=()):
@@ -92,7 +99,28 @@ class Provider:
                             "display_name": "", "created": 0})
         return out
 
-    def make_credential(self, cdh, rp, user, params, exclude=(), options=None, ctx=None):
+    @staticmethod
+    def _ctx(ctx, password):
+        ctx = ctx or ctap2.Ctx()
+        ctx.password = password
+        return ctx
+
+    @staticmethod
+    def _wipe(password):
+        if isinstance(password, bytearray):
+            password[:] = bytes(len(password))
+
+    def make_credential(self, cdh, rp, user, params, exclude=(), options=None, ctx=None,
+                        password=None):
+        """password: the user's login password (bytearray, wiped here) for the
+        enclave to check instead of a touch; None = Touch ID."""
+        try:
+            return self._make(cdh, rp, user, params, exclude, options,
+                              self._ctx(ctx, password))
+        finally:
+            self._wipe(password)
+
+    def _make(self, cdh, rp, user, params, exclude, options, ctx):
         o = dict(options or {})
         self._check_origin(rp.get("id"), o.get("origin", ""))
         p = {1: cdh, 2: {k: v for k, v in rp.items() if k in ("id", "name")},
@@ -108,7 +136,13 @@ class Provider:
         return {"attestation_object": cbor.encode(att), "transports": ["internal"],
                 "extensions": r.get(6, {})}
 
-    def get_assertion(self, cdh, rp_id, credential_id, options=None, ctx=None):
+    def get_assertion(self, cdh, rp_id, credential_id, options=None, ctx=None, password=None):
+        try:
+            return self._get(cdh, rp_id, credential_id, options, self._ctx(ctx, password))
+        finally:
+            self._wipe(password)
+
+    def _get(self, cdh, rp_id, credential_id, options, ctx):
         o = dict(options or {})
         self._check_origin(rp_id, o.get("origin", ""))
         p = {1: rp_id, 2: cdh, 3: [{"type": "public-key", "id": credential_id}]}

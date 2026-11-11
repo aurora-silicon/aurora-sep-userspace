@@ -5,6 +5,7 @@ on the stub enclave (tests/stub.py). Linux only (SOCK_SEQPACKET, SO_PEERCRED).
 Run from fido/: python3 tests/test_agent.py
 """
 
+import hashlib
 import os
 import socket
 import sys
@@ -16,9 +17,10 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from aurora_fido import agent, cbor, creds, ctap2, daemon, remote  # noqa: E402
+from aurora_fido import agent, backend, cbor, creds, ctap2, daemon, remote  # noqa: E402
 from aurora_fido import errors as E  # noqa: E402
-from aurora_fido.backend import BackendError  # noqa: E402
+from aurora_fido.backend import BackendError, BagLocked, UserBagBackend  # noqa: E402
+from aurora_fido.provider import Provider, ProviderError  # noqa: E402
 import stub  # noqa: E402
 from stub import FileSecret, StubKeyBackend  # noqa: E402
 from test_ctap import CDH, parse_auth_data  # noqa: E402
@@ -29,15 +31,20 @@ UID = os.getuid()
 class Agent:
     """One user's aurora-passkeyd on the stub enclave, in a temp dir."""
 
-    def __init__(self, root, name, allowed=None, mode=stub.MATCH, sites=None, flags_supported=0x3):
+    def __init__(self, root, name, allowed=None, mode=stub.MATCH, sites=None, flags_supported=0x3,
+                 userbag=False, backend=None):
         self.state = os.path.join(root, name, "state")
-        os.makedirs(self.state, mode=0o700)
-        self.backend = StubKeyBackend(mode=mode, flags_supported=flags_supported)
+        os.makedirs(self.state, mode=0o700, exist_ok=True)
+        self.backend = backend or StubKeyBackend(mode=mode, flags_supported=flags_supported)
         cfg = daemon.load_config(None)
         cfg.set("touchid", "notify", "no")
-        self.auth, _ = agent.build_agent(cfg, self.state, self.backend,
-                                         FileSecret(os.path.join(root, name, "vault")), "root",
-                                         sites)
+        if userbag:      # interface 4: credentials and the vault key under the user's bag
+            keys = UserBagBackend(self.backend, UID)
+            secret = agent.UserBagSecret(self.backend, UID, self.state)
+        else:
+            keys = self.backend
+            secret = FileSecret(os.path.join(root, name, "vault"))
+        self.auth, _ = agent.build_agent(cfg, self.state, keys, secret, "root", sites)
         self.path = os.path.join(root, name, "run", "ctap.sock")
         self.srv = agent.AgentServer(self.auth, self.path,
                                      {UID} if allowed is None else allowed).bind()
@@ -237,8 +244,106 @@ class AgentTest(unittest.TestCase):
         class Old:
             version = 3
         with self.assertRaises(BackendError) as c:
-            agent.UserBagSecret(Old(), self.tmp.name).load()
+            agent.UserBagSecret(Old(), UID, self.tmp.name).load()
         self.assertIn("interface 4", str(c.exception))
+
+
+class UserBagTest(unittest.TestCase):
+    """Interface 4: keys and the vault key under the user's own key bag."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.agents = []
+
+    def tearDown(self):
+        for a in self.agents:
+            a.close()
+        self.tmp.cleanup()
+
+    def agent(self, name="u", **kw):
+        a = Agent(self.tmp.name, name, userbag=True, **kw)
+        self.agents.append(a)
+        f = Fidod({UID: a.path})
+        f.active = UID
+        return a, f
+
+    def test_passkey_is_a_user_presence_key_under_the_bag(self):
+        a, f = self.agent()
+        st, mc = f.make()
+        self.assertEqual(st, 0)
+        self.assertEqual(a.auth.policy, creds.POLICY_TOUCHID_OR_PASSWORD)
+        cred = a.auth.vault.unwrap(hashlib.sha256(b"example.com").digest(),
+                                   parse_auth_data(mc[2])["cred_id"])
+        self.assertEqual(backend.user_handle_uid(cred.handle), UID)
+        self.assertTrue(backend.is_gated_handle(cred.handle))
+        self.assertTrue(os.path.exists(os.path.join(a.state, "vault.key")))
+        st, _ = f.ga()
+        self.assertEqual(st, 0)
+
+    def test_vault_key_is_a_plain_bag_key_and_reopens(self):
+        a, f = self.agent()
+        self.assertEqual(f.make()[0], 0)
+        with open(os.path.join(a.state, "vault.key"), "rb") as fh:
+            rec = cbor.decode(fh.read())
+        self.assertTrue(backend.is_user_plain_handle(rec[1]))
+        self.assertFalse(backend.is_gated_handle(rec[1]))     # never a credential key
+        a.close()
+        self.agents.remove(a)
+        b, f2 = self.agent(backend=a.backend)                 # agent restart, same enclave
+        st, r = f2.ga()
+        self.assertEqual(st, 0)                               # records open again
+
+    def test_locked_bag_refuses_everything(self):
+        a, f = self.agent()
+        self.assertEqual(f.make()[0], 0)
+        signs = a.backend.signs
+        a.backend.bag_locked = True
+        st, _ = f.ga()
+        self.assertEqual(st, E.ERR_OPERATION_DENIED)
+        self.assertEqual(a.backend.signs, signs)
+        with self.assertRaises(BagLocked):
+            agent.UserBagSecret(a.backend, UID, a.state).load()  # no vault key while locked
+        a.backend.bag_locked = False
+        self.assertEqual(f.ga()[0], 0)
+
+    def test_password_route_through_the_native_front_end(self):
+        a, f = self.agent(mode=stub.NO_MATCH)                 # no finger at all
+        p = Provider(a.auth)
+        o = {"origin": "https://example.com"}
+        pw = bytearray(b"pw")
+        r = p.make_credential(CDH, {"id": "example.com"}, {"id": b"u1", "name": "r"}, [-7],
+                              options=o, password=pw)
+        self.assertEqual(pw, bytearray(2))                    # wiped
+        cid = parse_auth_data(cbor.decode(r["attestation_object"])["authData"])["cred_id"]
+        a2 = p.get_assertion(CDH, "example.com", cid, o, password=bytearray(b"pw"))
+        self.assertTrue(a2["signature"])
+        self.assertEqual(a.backend.password_signs, 2)
+        before = a.backend.signs
+        with self.assertRaises(ProviderError) as c:
+            p.get_assertion(CDH, "example.com", cid, o, password=bytearray(b"nope"))
+        self.assertEqual(c.exception.reason, "wrong-password")
+        self.assertEqual(a.backend.password_failures, 1)      # counted by the "enclave"
+        self.assertEqual(a.backend.signs, before)
+        with self.assertRaises(ProviderError):                # and no finger: refused
+            p.get_assertion(CDH, "example.com", cid, o)
+        self.assertIn("password", p.get_info()["uv"])
+
+    def test_biometric_only_site_rule_is_refused_under_the_bag(self):
+        conf = os.path.join(self.tmp.name, "sites.conf")
+        with open(conf, "w") as fh:
+            fh.write("bank.example = touchid-current\n")
+        a, f = self.agent(sites=agent.SitePolicy(conf))
+        st, _ = f.make(rp="bank.example")
+        self.assertEqual(st, E.ERR_UNSUPPORTED_OPTION)
+        self.assertEqual(f.make(rp="other.example")[0], 0)
+
+    def test_another_users_handle_is_refused(self):
+        a, _ = self.agent()
+        mine = UserBagBackend(a.backend, UID)
+        h, _p = a.backend.create_user(UID + 1, True)
+        with self.assertRaises(backend.InvalidHandle):
+            mine.sign(h, b"\0" * 32)
+        self.assertFalse(mine.gated(h))
 
 
 if __name__ == "__main__":
