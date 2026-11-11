@@ -756,7 +756,9 @@ static int cmd_test(struct crypt_device *cd, const struct opts *o)
 		       o->name ? ", active as /dev/mapper/" : "", o->name ? o->name : "");
 		return 0;
 	}
-	printf("refused (%s)\n", r == -ENOANO ? "wrong password or recovery key" : strerror(-r));
+	printf("refused (%s)\n", r == -ENOANO   ? "wrong password or recovery key"
+				  : r == -ENOENT ? "no token opened this volume"
+						 : strerror(-r));
 	return r;
 }
 
