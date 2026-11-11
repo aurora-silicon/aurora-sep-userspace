@@ -292,8 +292,12 @@ int sep_boot_chain_gate(const char *volume, char *msg, size_t size)
 			 "aurora-sep: boot-chain = audit: require would refuse the Secure Enclave unlock of %s "
 			 "(boot chain %s%s, first unverified link: %s); unlocking anyway",
 			 volume, c.state, c.advisory == 1 ? ", advisory" : "", c.first_gap);
+	return p == SEP_BOOT_CHAIN_REQUIRE ? -EPERM : 0;
+}
+
+void sep_boot_chain_log(const char *msg)
+{
 	openlog(SEP_BOOT_LOG_IDENT, LOG_PID, LOG_AUTH);
 	syslog(LOG_WARNING, "%s", msg);
 	closelog();
-	return p == SEP_BOOT_CHAIN_REQUIRE ? -EPERM : 0;
 }

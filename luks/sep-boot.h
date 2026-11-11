@@ -61,10 +61,11 @@ int sep_boot_in_initrd(void);
  * unlock (initramfs and real root). Returns 0 to go on or -EPERM to refuse
  * the SEP unlock (the volume then asks for its passphrase or recovery key).
  * When the chain is not verified, msg gets the one line for this unlock
- * (chain state, first unverified link, the volume), which is also sent to
- * syslog as SEP_BOOT_LOG_IDENT; empty when the chain is verified.
+ * (chain state, first unverified link, the volume); empty when the chain is
+ * verified. sep_boot_chain_log() sends it to syslog as SEP_BOOT_LOG_IDENT.
  */
 #define SEP_BOOT_LOG_IDENT	"aurora-sep-boot-chain"
 int sep_boot_chain_gate(const char *volume, char *msg, size_t size);
+void sep_boot_chain_log(const char *msg);
 
 #endif

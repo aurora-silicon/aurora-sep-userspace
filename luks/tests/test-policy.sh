@@ -165,6 +165,7 @@ if try "$F" test --password-file "$T/alice" "$img" && said 'boot-chain = audit: 
 	pass "audit (default): one line with chain state, first unverified link and the volume; SEP unlock goes on"; else fail "audit partial"; fi
 "$F" test --password-file "$T/alice" "$img" >"$T/out" 2>&1 || fail "audit second open"
 if said 'require would refuse'; then pass "audit: a line for every unlock"; else fail "audit line only once"; fi
+if [ "$(grep -c 'require would refuse' "$T/out")" = 1 ]; then pass "audit: one line per unlock, not one per token"; else fail "audit line per token"; fi
 st partial 0 "stage1 enforce stage2 verified $H" "stage2 enforce u-boot verified $H" "u-boot off kernel unverified $H"
 if try "$F" test --password-file "$T/alice" "$img" && said 'first unverified link: u-boot kernel (off, unverified)'; then
 	pass "audit: the first link that is not enforced+verified is named"; else fail "first gap later stage"; fi

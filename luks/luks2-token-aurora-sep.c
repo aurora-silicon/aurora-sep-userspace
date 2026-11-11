@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <libcryptsetup.h>
 
 #include "sep-seal.h"
@@ -40,16 +41,28 @@ static int wait_seconds(void)
  * boot chain is not verified and goes on; boot-chain = require refuses, so
  * the volume asks for its passphrase or recovery key instead.
  */
-static int boot_chain_gate(struct crypt_device *cd)
+static int boot_chain_gate(struct crypt_device *cd, const char *pin)
 {
+	/* libcryptsetup offers one entry to each token in turn: one line per
+	 * unlock attempt, not one per token. */
+	static struct crypt_device *last_cd;
+	static const char *last_pin;
+	static struct timespec last;
 	const char *dev = crypt_get_device_name(cd), *uuid = crypt_get_uuid(cd);
 	char vol[384], msg[768];
+	struct timespec now;
 	int r;
 
 	snprintf(vol, sizeof(vol), "%s (LUKS UUID %s)", dev ? dev : "?", uuid ? uuid : "?");
 	r = sep_boot_chain_gate(vol, msg, sizeof(msg));
-	if (msg[0])
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	if (msg[0] && !(cd == last_cd && pin == last_pin && now.tv_sec - last.tv_sec < 2)) {
 		crypt_logf(cd, CRYPT_LOG_ERROR, "%s\n", msg);
+		sep_boot_chain_log(msg);
+	}
+	last_cd = cd;
+	last_pin = pin;
+	last = now;
 	return r;
 }
 
@@ -83,7 +96,7 @@ static int open_password_mode(struct crypt_device *cd, const char *json, const c
 		crypt_log(cd, CRYPT_LOG_ERROR, "aurora-sep: malformed password token\n");
 		return r;
 	}
-	if (boot_chain_gate(cd)) {
+	if (boot_chain_gate(cd, pin)) {
 		fde_token_free(&t);
 		return -EPERM;
 	}
@@ -171,7 +184,7 @@ int cryptsetup_token_open_pin(struct crypt_device *cd, int token, const char *pi
 	/* Machine mode has no PIN: a PIN would not be enforced by the SEP. */
 	if (pin && pin_size)
 		return -ENOANO;
-	if (boot_chain_gate(cd))
+	if (boot_chain_gate(cd, NULL))
 		return -EPERM;
 	uuid = crypt_get_uuid(cd);
 	r = sep_seal_aad(uuid, aad, sizeof(aad));
