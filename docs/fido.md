@@ -192,19 +192,23 @@ The cases a strong attacker can still use, and what bounds them:
 
 - **One touch, one other operation (redirect).** Root controls the kernel
   that asks the enclave to sign, so when you touch for site A it can have
-  the enclave sign for site B instead. It gets the operation one touch
-  approves, not more, and only while you touch. Same as macOS against a
+  the enclave sign for site B instead. It needs you to touch, and it gets
+  what that one matched context allows (next point). Same as macOS against a
   kernel attacker. The notification shows what the daemon asked for, not
   what a compromised kernel asks.
-- **Credential context reuse.** The kernel deletes each matched context
-  before the SIGN call returns, and the enclave refuses a deleted context
-  (hardware self-test 4 and the one-touch row 3 on linux#1196). Whether the
-  enclave lets a matched context that a compromised kernel does *not*
-  delete sign more than once, and for how long, is not measured yet: open
-  research (a one-touch, two-signature self-test is the next hardware row). If
-  it does, a compromised kernel gets several operations per touch within the
-  context's life; the fix is an access-control field that bounds credential
-  age or use, if the enclave has one.
+- **Credential context reuse.** One matched credential context is not
+  one-use: the enclave accepts every operation the key's access control
+  allows for as long as the context exists (macOS behaves the same and
+  documents it: a bound `LAContext` signs again without a prompt until it
+  is invalidated). The kernel opens a fresh context for each SIGN or UNSEAL
+  and deletes it before the call returns, and the enclave refuses a deleted
+  context (self-test 4 and the one-touch row on linux#1196). So against
+  root in userspace one touch is one operation. A compromised kernel that
+  keeps a matched context instead of deleting it can make further
+  signatures with that key until it does, but only for keys whose access
+  control the touch satisfied and only after you touched. No access-control
+  field limits the number of uses; the one age field (`pgcma`) filters
+  reused global credentials and is not a bound here.
 - **Recorded sensor frames.** The Touch ID sensor talks to the enclave over
   an authenticated, encrypted channel with a per-session key and a sequence
   that advances per message; the AP relays opaque frames and has no way to
