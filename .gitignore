@@ -11,3 +11,5 @@ sk/test/
 /fido/test/
 __pycache__/
 /fido/aurora-fido
+/luks/aurora-sep-fde
+/luks/pam_aurora_sep_fde.so

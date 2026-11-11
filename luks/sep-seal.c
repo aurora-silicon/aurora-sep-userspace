@@ -5,6 +5,7 @@
  */
 #define _GNU_SOURCE
 #include <errno.h>
+#include <fcntl.h>
 #include <glob.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -145,6 +146,45 @@ void sep_key_drop(int32_t serial)
 			 (unsigned long)(long)KEY_SPEC_THREAD_KEYRING, 0, 0);
 }
 
+static const char *keystore_glob = SEP_KEYSTORE_GLOB;
+
+#ifdef SEP_SEAL_TEST_USER_KEYS
+void sep_set_keystore_glob(const char *pattern)
+{
+	keystore_glob = pattern ? pattern : SEP_KEYSTORE_GLOB;
+}
+#endif
+
+int sep_keystore_state(void)
+{
+	char buf[16] = { 0 };
+	glob_t g = { 0 };
+	ssize_t n = -1;
+	int fd;
+
+	if (glob(keystore_glob, GLOB_NOSORT, NULL, &g) != 0 || g.gl_pathc == 0) {
+		globfree(&g);
+		return SEP_KEYSTORE_ABSENT;
+	}
+	fd = open(g.gl_pathv[0], O_RDONLY | O_CLOEXEC);
+	globfree(&g);
+	if (fd < 0)
+		return SEP_KEYSTORE_ABSENT;
+	n = read(fd, buf, sizeof(buf) - 1);
+	close(fd);
+	if (n <= 0)
+		return SEP_KEYSTORE_ABSENT;
+	buf[strcspn(buf, "\n")] = '\0';
+	if (!strcmp(buf, "open"))
+		return SEP_KEYSTORE_OPEN;
+	if (!strcmp(buf, "closed"))
+		return SEP_KEYSTORE_CLOSED;
+	if (!strcmp(buf, "unknown"))
+		return SEP_KEYSTORE_UNKNOWN;
+	/* A value this build does not know: let add_key() decide. */
+	return SEP_KEYSTORE_ABSENT;
+}
+
 #ifdef SEP_SEAL_TEST_USER_KEYS
 int sep_key_new(int32_t *serial, char **blob_hex)
 {
@@ -191,11 +231,16 @@ int sep_key_load(const char *blob_hex, int wait_s, int32_t *serial)
 }
 #else
 /*
- * The 'trusted' key type is registered by apple_sep once the SEP is up, which
- * can be tens of seconds into boot (the module itself loads once /var/lib is
- * mounted). add_key() fails with ENODEV until then. Only wait when this
- * machine has an SEP at all: the driver is loaded, or the device-tree SEP
- * node exists as a platform device.
+ * The 'trusted' key type is registered by apple_sep as soon as the driver
+ * probes, while the SEP key store can still be tens of seconds from ready.
+ * add_key() before then does not fail: the kernel instantiates keys under one
+ * global mutex and the driver waits there for the key store, up to 90 s. In
+ * the initrd and early boot systemd creates a keyring for every service it
+ * starts, so an early add_key() stalls the whole boot. Wait on the driver's
+ * diag/keystore attribute first; reading it takes no lock.
+ *
+ * Only wait at all when this machine has an SEP: the driver is loaded, or
+ * the device-tree SEP node exists as a platform device.
  */
 static int sep_present(void)
 {
@@ -215,13 +260,21 @@ static int32_t add_trusted_wait(const char *payload, int wait_s)
 	struct timespec step = { 0, 250 * 1000 * 1000 };
 	long tries = (long)wait_s * 4;
 	char desc[96];
-	int32_t s;
+	int32_t s = -ENODEV;
+	int ks;
 
 	for (;;) {
-		key_desc(desc, sizeof(desc));
-		s = add_key_sys(SEP_SEAL_KEY_TYPE, desc, payload, strlen(payload));
-		if (s != -ENODEV || tries-- <= 0 || !sep_present())
-			return s;
+		ks = sep_keystore_state();
+		if (ks == SEP_KEYSTORE_CLOSED)
+			return -ENODEV;
+		if (ks != SEP_KEYSTORE_UNKNOWN) {
+			key_desc(desc, sizeof(desc));
+			s = add_key_sys(SEP_SEAL_KEY_TYPE, desc, payload, strlen(payload));
+			if (s != -ENODEV || !sep_present())
+				return s;
+		}
+		if (tries-- <= 0)
+			return ks == SEP_KEYSTORE_UNKNOWN ? -ETIMEDOUT : s;
 		nanosleep(&step, NULL);
 	}
 }

@@ -60,10 +60,14 @@ Kernel updates do not change it. Unlike a TPM PCR policy, it does not measure th
 
 ## Limits
 
-- The root volume is not supported yet. The SEP key store files live in `/var/lib` on the root filesystem, so the initrd cannot reach them before root is open. Root unlock needs a key store location the initrd can read, and that is follow-up work.
+- The root volume needs the initrd integration in [luks-sep-initrd.md](luks-sep-initrd.md) and a kernel whose `apple_sep` has the key-store-only attach phase. Without them a SEP-sealed root asks for its passphrase.
 - No PIN or Touch ID binding yet. A PIN that the SEP does not enforce would add nothing, so the token has no PIN mode until the SEP can check one.
 - As with any dm-crypt volume, the open volume key lives in kernel memory, and root on the running system can read the unsealed secret while the plugin runs. macOS keeps its FileVault key out of the CPU, which Linux dm-crypt cannot do.
 
 ## Testing
 
 `make -C luks check` runs unit tests and LUKS2 file-image tests with kernel `user` keys standing in for the SEP (as root where the kernel restricts AF_ALG). `luks/tests/hw-loop-test.sh` is the hardware test: it works on one 64 MiB file under `/var/tmp`, enrolls it, unlocks it with cryptsetup and systemd-cryptsetup, and after a reboot checks unlock again, the recovery passphrase, refused tampered and foreign blobs, and SELinux denials.
+
+## Several users and password changes
+
+Password mode (`aurora-sep-fde`) gives each user their own SEP-sealed keyslot, with volume owners who manage the others, password changes that follow `passwd` and GNOME Settings, and a recovery key: [luks-sep-owners.md](luks-sep-owners.md).

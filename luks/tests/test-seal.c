@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <linux/keyctl.h>
 #include "sep-seal.h"
@@ -16,6 +17,51 @@ static int fails;
 	else { printf("FAIL %s (line %d)\n", what, __LINE__); fails++; } \
 } while (0)
 
+/* diag/keystore in a fake sysfs tree: the states the plugin waits on. */
+static void test_keystore_state(void)
+{
+	char dir[] = "/tmp/sep-ks-XXXXXX", path[128], pattern[128];
+	static const struct { const char *text; int want; const char *what; } cases[] = {
+		{ "unknown\n", SEP_KEYSTORE_UNKNOWN, "keystore unknown: wait before add_key" },
+		{ "open\n", SEP_KEYSTORE_OPEN, "keystore open: add_key may run" },
+		{ "closed\n", SEP_KEYSTORE_CLOSED, "keystore closed: give up at once" },
+		{ "open", SEP_KEYSTORE_OPEN, "keystore value without a newline" },
+		{ "later\n", SEP_KEYSTORE_ABSENT, "unknown keystore value: leave it to add_key" },
+		{ "", SEP_KEYSTORE_ABSENT, "empty keystore attribute" },
+	};
+	FILE *f;
+
+	if (!mkdtemp(dir)) {
+		CHECK(0, "mkdtemp");
+		return;
+	}
+	snprintf(pattern, sizeof(pattern), "%s/*/diag/keystore", dir);
+	sep_set_keystore_glob(pattern);
+	CHECK(sep_keystore_state() == SEP_KEYSTORE_ABSENT, "no driver: keystore absent");
+	snprintf(path, sizeof(path), "%s/25e400000.sep", dir);
+	mkdir(path, 0700);
+	snprintf(path, sizeof(path), "%s/25e400000.sep/diag", dir);
+	mkdir(path, 0700);
+	snprintf(path, sizeof(path), "%s/25e400000.sep/diag/keystore", dir);
+	for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+		f = fopen(path, "w");
+		if (!f) {
+			CHECK(0, "write fake keystore");
+			break;
+		}
+		fputs(cases[i].text, f);
+		fclose(f);
+		CHECK(sep_keystore_state() == cases[i].want, cases[i].what);
+	}
+	unlink(path);
+	snprintf(path, sizeof(path), "%s/25e400000.sep/diag", dir);
+	rmdir(path);
+	snprintf(path, sizeof(path), "%s/25e400000.sep", dir);
+	rmdir(path);
+	rmdir(dir);
+	sep_set_keystore_glob(NULL);
+}
+
 int main(void)
 {
 	uint8_t secret[SEP_SEAL_SECRET_BYTES], out[SEP_SEAL_SECRET_BYTES + 16], raw[8];
@@ -24,6 +70,8 @@ int main(void)
 	size_t len = 0;
 	char hex[17], *json, *bad;
 	int r;
+
+	test_keystore_state();
 
 	/* Build roots and containers may block the keyring (seccomp): skip, not fail. */
 	if (syscall(SYS_add_key, "user", "aurora-sep-probe", "x", 1, KEY_SPEC_THREAD_KEYRING) < 0 &&

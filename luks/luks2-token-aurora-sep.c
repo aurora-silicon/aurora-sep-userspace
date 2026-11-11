@@ -13,6 +13,8 @@
 #include <libcryptsetup.h>
 
 #include "sep-seal.h"
+#include "sep-fde.h"
+#include "sep-boot.h"
 
 #define TOKEN_VERSION "1.0"
 
@@ -31,9 +33,121 @@ static int wait_seconds(void)
 	return (int)v;
 }
 
+/*
+ * In the initramfs (the root volume and anything else opened before the
+ * switch to the real root), check the boot chain before the Secure Enclave
+ * is asked for a key: fde.conf boot-chain = warn says once per boot that the
+ * chain is not verified and goes on; boot-chain = require refuses, so the
+ * volume asks for its passphrase or recovery key instead.
+ */
+static int boot_chain_gate(struct crypt_device *cd)
+{
+	char msg[256];
+	int first, r;
+
+	if (!sep_boot_in_initrd())
+		return 0;
+	r = sep_boot_chain_gate(msg, sizeof(msg), &first);
+	if (msg[0] && (first || r))
+		crypt_logf(cd, CRYPT_LOG_ERROR, "%s\n", msg);
+	return r;
+}
+
 const char *cryptsetup_token_version(void)
 {
 	return TOKEN_VERSION;
+}
+
+/*
+ * Password mode (FileVault model). The PIN libcryptsetup passes is the user's
+ * password, or the recovery key for a recovery token. A recovery-key-shaped
+ * entry goes only to recovery tokens and anything else only to user tokens,
+ * so typing the recovery key never costs the user's bag a failed attempt.
+ * -ENOENT: not a password-mode token.
+ */
+static int open_password_mode(struct crypt_device *cd, const char *json, const char *pin,
+			      size_t pin_size, char **buffer, size_t *buffer_len)
+{
+	uint8_t secret[SEP_FDE_SECRET_BYTES];
+	char rk[SEP_FDE_RK_LEN + 1];
+	struct fde_token t;
+	const char *pw = pin;
+	size_t pw_len = pin_size;
+	int is_rk, r;
+	char *pass;
+
+	r = fde_token_parse(json, &t);
+	if (r == -ENOENT)
+		return r;
+	if (r < 0) {
+		crypt_log(cd, CRYPT_LOG_ERROR, "aurora-sep: malformed password token\n");
+		return r;
+	}
+	if (boot_chain_gate(cd)) {
+		fde_token_free(&t);
+		return -EPERM;
+	}
+	if (!pin || !pin_size) {
+		fde_token_free(&t);
+		return -ENOANO;
+	}
+	/*
+	 * Without a usable enclave every password token must say so, whatever
+	 * the PIN looks like: one -ENOANO (from the token of the other role)
+	 * would make libcryptsetup report "PIN needed" and systemd ask again
+	 * forever, never reaching the passphrase prompt where the recovery
+	 * key's offline keyslot opens the volume.
+	 */
+	r = fde_wait_ready(wait_seconds());
+	if (r < 0) {
+		fde_token_free(&t);
+		crypt_logf(cd, CRYPT_LOG_VERBOSE,
+			  "aurora-sep: the Secure Enclave key store is not available\n");
+		return -EAGAIN;
+	}
+	is_rk = fde_recovery_key_normalize(pin, pin_size, rk) == 0;
+	if (is_rk != !strcmp(t.role, SEP_FDE_ROLE_RECOVERY)) {
+		fde_token_free(&t);
+		sep_wipe(rk, sizeof(rk));
+		return -ENOANO;
+	}
+	if (is_rk) {
+		pw = rk;
+		pw_len = strlen(rk);
+	}
+	r = fde_open_token(&t, pw, pw_len, secret);
+	sep_wipe(rk, sizeof(rk));
+	fde_token_free(&t);
+	if (r == -ENODEV || r == -ETIMEDOUT) {
+		crypt_logf(cd, CRYPT_LOG_VERBOSE,
+			  "aurora-sep: the Secure Enclave key store is not available\n");
+		return -EAGAIN;
+	}
+	if (r == -EACCES)
+		return -ENOANO;		/* wrong password; the enclave counted it */
+	if (r == -EXDEV) {
+		/* Sealed under another OS install on this Mac (FileVault: per volume). */
+		crypt_log(cd, CRYPT_LOG_ERROR,
+			  "aurora-sep: this disk key belongs to another OS install on this Mac; "
+			  "use the recovery key or the volume's passphrase\n");
+		return -EPERM;
+	}
+	if (r < 0) {
+		crypt_logf(cd, CRYPT_LOG_VERBOSE,
+			  "aurora-sep: this Mac's Secure Enclave did not accept this token (%s)\n",
+			  strerror(-r));
+		return -EPERM;
+	}
+	pass = malloc(SEP_FDE_PASS_LEN + 1);
+	if (!pass) {
+		sep_wipe(secret, sizeof(secret));
+		return -ENOMEM;
+	}
+	sep_hex_encode(secret, sizeof(secret), pass, SEP_FDE_PASS_LEN + 1);
+	sep_wipe(secret, sizeof(secret));
+	*buffer = pass;
+	*buffer_len = SEP_FDE_PASS_LEN;
+	return 0;
 }
 
 int cryptsetup_token_open_pin(struct crypt_device *cd, int token, const char *pin,
@@ -48,13 +162,17 @@ int cryptsetup_token_open_pin(struct crypt_device *cd, int token, const char *pi
 	int r;
 
 	(void)usrptr;
-	/* No PIN mode yet: a PIN would not be enforced by the SEP. */
-	if (pin && pin_size)
-		return -ENOANO;
-
 	r = crypt_token_json_get(cd, token, &json);
 	if (r < 0)
 		return r;
+	r = open_password_mode(cd, json, pin, pin_size, buffer, buffer_len);
+	if (r != -ENOENT)
+		return r;
+	/* Machine mode has no PIN: a PIN would not be enforced by the SEP. */
+	if (pin && pin_size)
+		return -ENOANO;
+	if (boot_chain_gate(cd))
+		return -EPERM;
 	uuid = crypt_get_uuid(cd);
 	r = sep_seal_aad(uuid, aad, sizeof(aad));
 	if (r < 0)
@@ -114,9 +232,17 @@ void cryptsetup_token_buffer_free(void *buffer, size_t buffer_len)
 
 int cryptsetup_token_validate(struct crypt_device *cd, const char *json)
 {
+	struct fde_token t;
 	struct sep_sealed s;
 	int r;
 
+	r = fde_token_parse(json, &t);
+	fde_token_free(&t);
+	if (r != -ENOENT) {
+		if (r < 0)
+			crypt_log(cd, CRYPT_LOG_DEBUG, "aurora-sep: password token JSON rejected\n");
+		return r;
+	}
 	r = sep_token_parse(json, &s);
 	if (r < 0)
 		crypt_log(cd, CRYPT_LOG_DEBUG, "aurora-sep: token JSON rejected\n");
@@ -126,8 +252,19 @@ int cryptsetup_token_validate(struct crypt_device *cd, const char *json)
 
 void cryptsetup_token_dump(struct crypt_device *cd, const char *json)
 {
+	struct fde_token t;
 	struct sep_sealed s;
 
+	if (fde_token_parse(json, &t) == 0) {
+		crypt_logf(cd, CRYPT_LOG_NORMAL, "\tSealed by:   Apple Secure Enclave (user key bag)\n");
+		crypt_logf(cd, CRYPT_LOG_NORMAL, "\tUnlock:      %s\n",
+			   strcmp(t.role, SEP_FDE_ROLE_RECOVERY) ? "password" : "recovery key");
+		crypt_logf(cd, CRYPT_LOG_NORMAL, "\tBag uid:     %u%s%s\n", t.uid,
+			   t.label[0] ? "  " : "", t.label);
+		crypt_logf(cd, CRYPT_LOG_NORMAL, "\tBag/record:  %zu / %zu bytes\n", t.bag_len, t.record_len);
+		fde_token_free(&t);
+		return;
+	}
 	if (sep_token_parse(json, &s) < 0) {
 		crypt_logf(cd, CRYPT_LOG_NORMAL, "\taurora-sep:  malformed\n");
 		return;
