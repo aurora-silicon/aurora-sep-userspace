@@ -2,7 +2,8 @@
 """aurora-fido: turn the Touch ID security key on or off, and say what it is doing.
 
   aurora-fido status            (any user) is it on, which key store, which device
-  aurora-fido enable            (root) check what it needs, then start it now and at boot
+  aurora-fido enable            (root) check that the Secure Enclave can enforce Touch ID,
+                                then start it now and at boot (refused otherwise)
   aurora-fido disable           (root) stop it now and at boot; credentials are kept
   aurora-fido disable --forget  (root) also delete every credential it made
 
@@ -23,22 +24,20 @@ from . import __version__, paths
 UNIT = "aurora-fido.service"
 
 POLICY_TEXT = {
-    "touchid-or-password": "Touch ID, or your password when Touch ID does not match, "
-                           "is locked or unavailable (the default, as on macOS)",
+    "touchid-or-password": "Touch ID, or your password checked by the Secure Enclave "
+                           "(the default, as on macOS, where the kernel offers it)",
     "touchid-any": "Touch ID only, any enrolled finger",
     "touchid-current": "Touch ID only, and only the fingers enrolled when a credential "
                        "is made (adding or removing a finger retires it)",
 }
 
-THREAT = {
-    "sep-key": "Keys live in the Secure Enclave and cannot be copied off this Mac. "
-               "The touch is checked by aurora-fidod, so root on this Mac can sign "
-               "without one.",
-    "sealed": "This kernel has no /dev/sep-key, so keys are software keys wrapped by a "
-              "secret only this Mac's Secure Enclave can unseal. A copied disk or backup "
-              "is useless elsewhere, but root on this Mac can unwrap and copy the keys. "
-              "New keys go into the Secure Enclave once the kernel has /dev/sep-key.",
-}
+THREAT = ("Keys live in the Secure Enclave and cannot be copied off this Mac. The "
+          "enclave itself checks the Touch ID match inside every signature, so root on "
+          "this Mac cannot sign without your finger; at most it can use one touch you "
+          "give for a different request. Details and limits: the threat model in the doc.")
+
+LEGACY = ("{n} credential(s) made by aurora-fido 0.1 (touch checked outside the enclave) "
+          "are refused now: register this key again with those sites and SSH servers{rps}.")
 
 
 def _systemctl(*args):
@@ -77,7 +76,17 @@ def read_status(path=None):
 
 
 def expected_keys(sep_key="/dev/sep-key"):
-    return "sep-key" if os.path.exists(sep_key) else "sealed"
+    return "sep-key" if os.path.exists(sep_key) else "none (no /dev/sep-key: cannot be enabled)"
+
+
+def legacy_rps(state_dir=None):
+    """Relying parties whose legacy credentials were refused (root only), or None."""
+    try:
+        with open(os.path.join(state_dir or paths.STATE_DIR, "legacy-refused.json")) as f:
+            d = json.load(f)
+        return sorted(d) if isinstance(d, dict) else None
+    except (OSError, ValueError):
+        return None
 
 
 def configured_policy(path=None):
@@ -87,7 +96,7 @@ def configured_policy(path=None):
         cp.read(path or paths.CONFIG)
     except configparser.Error:
         pass
-    return cp.get("touchid", "policy", fallback="touchid-or-password")
+    return cp.get("touchid", "policy", fallback="auto")
 
 
 def gather():
@@ -104,6 +113,11 @@ def gather():
         "ready": bool(st and st.get("ready")),
         "policy": (st or {}).get("policy") or configured_policy(),
         "policy_detail": (st or {}).get("policy_detail"),
+        "policy_note": (st or {}).get("policy_note"),
+        "hmac_secret": (st or {}).get("hmac_secret"),
+        "legacy_resident": (st or {}).get("legacy_resident", 0),
+        "legacy_refused_rps": (st or {}).get("legacy_refused_rps", 0),
+        "legacy_rps": legacy_rps() if os.geteuid() == 0 else None,
         "version": __version__,
     }
 
@@ -114,14 +128,26 @@ def render(s):
              f"(service {s['active']}, {s['enabled']} at boot)"]
     if on:
         lines.append(f"  device:    {s['device'] or 'not seen yet'}")
-        lines.append(f"  key store: {s['keys'] or 'unknown'}")
+        lines.append(f"  key store: {s['keys'] or 'unknown'} (Touch ID checked by the "
+                     "Secure Enclave)")
     else:
         lines.append(f"  key store when enabled: {s['keys_if_enabled']}")
-    pol = s.get("policy") or "touchid-or-password"
+    pol = s.get("policy") or "auto"
     lines.append(f"  approval:  {pol}: " + (s.get("policy_detail")
-                                         or POLICY_TEXT.get(pol, "unknown policy")))
+                                         or POLICY_TEXT.get(pol, "the best policy the "
+                                                            "Secure Enclave can enforce")))
+    if s.get("policy_note"):
+        lines.append(f"             {s['policy_note']}")
     lines.append("             (new credentials; set [touchid] policy in " + paths.CONFIG + ")")
-    lines.append("  " + THREAT.get(s["keys_if_enabled"], ""))
+    if on and s.get("hmac_secret") is False:
+        lines.append("  hmac-secret (systemd-cryptenroll --fido2-device): not offered; this "
+                     "kernel cannot seal secrets to enclave keys")
+    n = (s.get("legacy_resident") or 0) + (s.get("legacy_refused_rps") or 0)
+    if n:
+        rps = s.get("legacy_rps")
+        lines.append("  " + LEGACY.format(n=n, rps=(": " + ", ".join(rps)) if rps else
+                                          " (sudo aurora-fido status lists the sites seen)"))
+    lines.append("  " + THREAT)
     if not on:
         lines.append("  Turn it on with: " + ("aurora.fido.enable = true; (NixOS)"
                                               if _is_nixos() else "sudo aurora-fido enable"))
@@ -129,21 +155,31 @@ def render(s):
     return "\n".join(lines)
 
 
+def enclave_problems(config=None):
+    """Why the Secure Enclave cannot enforce Touch ID here (list of strings)."""
+    try:
+        from .backend import BackendError, open_backend
+        from . import daemon
+    except ImportError as e:
+        return [f"cannot load the daemon: {e}"]
+    cfg = daemon.load_config(config or paths.CONFIG)
+    try:
+        backend = open_backend(cfg.get("keys", "store"))
+        daemon.resolve_policy(cfg, backend.flags_supported)
+    except (BackendError, ValueError) as e:
+        return [str(e)]
+    return []
+
+
 def preflight(seal_helper):
     """Problems that would stop the daemon, as a list of strings."""
     bad = []
     try:
-        import gi  # noqa: F401
-        gi.require_version("Gio", "2.0")
-    except (ImportError, ValueError):
-        bad.append("python3-gobject (gi) is missing")
-    try:
         import cryptography  # noqa: F401
     except ImportError:
         bad.append("python3-cryptography is missing")
-    if not (shutil.which("fprintd-list") or os.path.exists(
-            "/usr/share/dbus-1/system-services/net.reactivated.Fprint.service")):
-        bad.append("fprintd is not installed (Touch ID)")
+    else:
+        bad += enclave_problems()
     subprocess.run(["modprobe", "uhid"], capture_output=True, timeout=30)
     if not os.path.exists("/dev/uhid"):
         bad.append("/dev/uhid is missing (uhid module)")

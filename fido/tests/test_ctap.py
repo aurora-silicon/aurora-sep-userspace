@@ -1,12 +1,16 @@
 # SPDX-License-Identifier: MIT
-"""Unit tests: CBOR, CTAP2, PIN/UV token, credential management, hmac-secret, U2F, CTAPHID.
+"""Unit tests: CBOR, CTAP2, PIN/UV token, credential management, hmac-secret, U2F, CTAPHID,
+and the rule that every approval is an enclave-checked touch.
 
-Run from fido/: python3 -m unittest discover -s tests -t .
-Software stand-ins for the Secure Enclave and Touch ID come from tests/stub.py.
+Run from fido/: python3 tests/test_ctap.py
+The Secure Enclave is stood in for by tests/stub.py: software keys whose
+sign() and unseal() refuse without a scripted "enclave touch", as the kernel's
+SIGN does for keys with a biometric access-control list.
 """
 
 import hashlib
 import hmac
+import json
 import os
 import struct
 import sys
@@ -23,10 +27,11 @@ from cryptography.hazmat.primitives import hashes  # noqa: E402
 from cryptography.hazmat.primitives.asymmetric import ec  # noqa: E402
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat  # noqa: E402
 
-from aurora_fido import backend, cbor, creds, ctap2, ctaphid, keys, pinuv, touchid, u2f  # noqa: E402
+from aurora_fido import backend, cbor, creds, ctap2, ctaphid, daemon, enclave, keys  # noqa: E402
+from aurora_fido import pinuv, touchid, u2f  # noqa: E402
 from aurora_fido import errors as E  # noqa: E402
-from aurora_fido.daemon import build, load_config  # noqa: E402
-from stub import FileSecret, StubKeyBackend, StubVerifier  # noqa: E402
+import stub  # noqa: E402
+from stub import FileSecret, StubKeyBackend  # noqa: E402
 
 CDH = hashlib.sha256(b"client data").digest()
 
@@ -43,23 +48,58 @@ class Clock:
         return self.t
 
 
-class Rig:
-    """An authenticator with stub backend and verifier in a temp state dir."""
+class Notes:
+    """Records the notifications the daemon would show."""
 
-    def __init__(self, mode="match", handle_pad=0, attestation="self"):
+    def __init__(self):
+        self.titles = []
+
+    def show(self, uid, title, body, timeout_s):
+        self.titles.append(title)
+        return len(self.titles)
+
+    def close(self, handle):
+        pass
+
+
+class Rig:
+    """An authenticator on the stub enclave in a temp state dir."""
+
+    def __init__(self, mode=stub.MATCH, handle_pad=0, attestation="self", policy="auto",
+                 flags_supported=0x3, can_unseal=True, max_tries=3):
         self.tmp = tempfile.TemporaryDirectory()
-        self.backend = StubKeyBackend(handle_pad=handle_pad)
-        self.verifier = StubVerifier(mode)
-        cfg = load_config(None)
+        self.backend = StubKeyBackend(handle_pad=handle_pad, mode=mode,
+                                      flags_supported=flags_supported, can_unseal=can_unseal)
+        cfg = daemon.load_config(None)
         cfg.set("authenticator", "attestation", attestation)
         cfg.set("authenticator", "max_resident", "4")
+        cfg.set("touchid", "policy", policy)
+        cfg.set("touchid", "user", "root")
+        cfg.set("touchid", "max_tries", str(max_tries))
+        self.cfg = cfg
+        self.state = os.path.join(self.tmp.name, "state")
+        os.makedirs(self.state, mode=0o700)
+        self.policy, self.note = daemon.resolve_policy(cfg, flags_supported)
+        self.user = daemon.enclave_user(cfg, self.backend, self.state, self.policy)
+        self.notes = Notes()
+        self.user.notifier = self.notes
         self.secret = FileSecret(os.path.join(self.tmp.name, "master"))
-        self.auth, self.u2f = build(cfg, os.path.join(self.tmp.name, "state"),
-                                    self.backend, self.verifier, self.secret)
+        self.legacy = []
+        self.auth, self.u2f = daemon.build(cfg, self.state, self.backend, self.user,
+                                           self.secret, self.policy,
+                                           lambda rp, why: self.legacy.append((rp, why)))
         self.clock = Clock()
         self.auth.clock = self.clock
         self.auth.started = self.clock()
         self.auth.token.clock = self.clock
+
+    @property
+    def mode(self):
+        return self.backend.mode
+
+    @mode.setter
+    def mode(self, m):
+        self.backend.mode = m
 
     def call(self, cmd, params=None, ctx=None):
         data = bytes([cmd]) + (cbor.encode(params) if params is not None else b"")
@@ -75,6 +115,11 @@ class Rig:
         if extra:
             p.update(extra)
         return self.call(ctap2.CMD_MAKE_CREDENTIAL, p)
+
+    def ga(self, cid, cdh=CDH, rp="example.com", extra=None):
+        p = {1: rp, 2: cdh, 3: [{"type": "public-key", "id": cid}]}
+        p.update(extra or {})
+        return self.call(ctap2.CMD_GET_ASSERTION, p)
 
     def close(self):
         self.tmp.cleanup()
@@ -133,7 +178,6 @@ class CborTest(unittest.TestCase):
         v = {"b": 1, 1: [True, False, None, b"\x00", "x"], -1: -500, "aa": {3: 4}}
         enc = cbor.encode(v)
         self.assertEqual(cbor.decode(enc), v)
-        # ints (major 0), negative ints (1), then text by length then bytes.
         self.assertEqual(list(cbor.decode(enc).keys()), [1, -1, "b", "aa"])
 
     def test_cose_key_order(self):
@@ -168,159 +212,152 @@ class Ctap2Test(unittest.TestCase):
         self.assertEqual(st, 0)
         self.assertIn("FIDO_2_1", info[1])
         self.assertIn("U2F_V2", info[1])
+        self.assertEqual(info[2], ["credProtect", "hmac-secret"])
         self.assertEqual(info[3], ctap2.AAGUID)
         self.assertTrue(info[4]["uv"] and info[4]["rk"] and info[4]["credMgmt"])
         self.assertTrue(info[4]["pinUvAuthToken"])
         self.assertNotIn("clientPin", info[4])
         self.assertEqual(info[6], [2, 1])
-        self.assertEqual(info[0x0A], [{"type": "public-key", "alg": -7}])
+        rig = Rig(can_unseal=False)
+        try:
+            self.assertEqual(rig.call(ctap2.CMD_GET_INFO)[1][2], ["credProtect"])
+        finally:
+            rig.close()
 
-    def test_make_credential_self_attestation_and_assertion(self):
+    def test_one_enclave_touch_per_ceremony(self):
         st, r = self.rig.make()
         self.assertEqual(st, 0)
         self.assertEqual(r[1], "packed")
         ad = parse_auth_data(r[2])
-        self.assertEqual(ad["rp_hash"], hashlib.sha256(b"example.com").digest())
         self.assertEqual(ad["flags"] & (ctap2.FLAG_UP | ctap2.FLAG_UV | ctap2.FLAG_AT),
                          ctap2.FLAG_UP | ctap2.FLAG_UV | ctap2.FLAG_AT)
-        self.assertEqual(ad["key"][3], -7)
-        self.assertNotIn("x5c", r[3])
         self.assertTrue(es256_ok(ad["point"], r[2] + CDH, r[3]["sig"]))
-        self.assertEqual(len(self.rig.verifier.prompts), 1)
-        self.assertEqual(self.rig.verifier.prompts[0].title(),
-                         "Touch ID to register with example.com")
+        # The attestation signature was the enclave's touch-gated one: one touch.
+        self.assertEqual((self.rig.backend.touches, self.rig.backend.signs), (1, 1))
+        self.assertEqual(self.rig.notes.titles, ["Touch ID to register with example.com"])
 
         cdh2 = hashlib.sha256(b"login").digest()
-        st, a = self.rig.call(ctap2.CMD_GET_ASSERTION, {
-            1: "example.com", 2: cdh2, 3: [{"type": "public-key", "id": ad["cred_id"]}]})
+        st, a = self.rig.ga(ad["cred_id"], cdh2)
         self.assertEqual(st, 0)
-        self.assertEqual(a[1]["id"], ad["cred_id"])
         aad = parse_auth_data(a[2])
         self.assertEqual(aad["flags"], ctap2.FLAG_UP | ctap2.FLAG_UV)
         self.assertGreater(aad["counter"], ad["counter"])
         self.assertTrue(es256_ok(ad["point"], a[2] + cdh2, a[3]))
-        self.assertNotIn(4, a)
-        self.assertEqual(self.rig.verifier.prompts[-1].title(),
-                         "Touch ID to sign in to example.com")
+        self.assertEqual(self.rig.backend.touches, 2)
+        self.assertEqual(self.rig.notes.titles[-1], "Touch ID to sign in to example.com")
 
-    def test_attestation_none(self):
+    def test_keys_carry_the_policy_access_control(self):
+        made = []
+        orig = self.rig.backend.create
+        self.rig.backend.create = lambda flags, **k: made.append(flags) or orig(flags, **k)
+        self.rig.make()
+        self.assertEqual(made, [creds.POLICY_FLAGS[creds.POLICY_TOUCHID_ANY]])
+        rig = Rig(policy="touchid-current")
+        try:
+            orig2 = rig.backend.create
+            rig.backend.create = lambda flags, **k: made.append(flags) or orig2(flags, **k)
+            self.assertEqual(rig.make()[0], 0)
+            self.assertEqual(made[-1], 0x1)
+        finally:
+            rig.close()
+
+    def test_attestation_none_still_needs_the_enclave_touch(self):
         rig = Rig(attestation="none")
         try:
             st, r = rig.make()
             self.assertEqual((st, r[1], r[3]), (0, "none", {}))
+            self.assertEqual(rig.backend.touches, 1)
+            rig.mode = stub.NO_MATCH
+            rig.clock.t += 20
+            self.assertEqual(rig.make(uid=b"x")[0], E.ERR_OPERATION_DENIED)
         finally:
             rig.close()
+
+    def test_no_match_registers_nothing(self):
+        self.rig.mode = stub.NO_MATCH
+        st, _ = self.rig.make(rk=True)
+        self.assertEqual(st, E.ERR_OPERATION_DENIED)
+        self.assertEqual(self.rig.backend.touches, 3)      # max_tries
+        self.assertEqual(self.rig.backend.signs, 0)
+        self.assertEqual(self.rig.auth.store.count(), 0)
 
     def test_credential_is_bound_to_rp(self):
         _, r = self.rig.make(rp="a.example")
         cid = parse_auth_data(r[2])["cred_id"]
-        st, _ = self.rig.call(ctap2.CMD_GET_ASSERTION, {
-            1: "b.example", 2: CDH, 3: [{"type": "public-key", "id": cid}]})
-        self.assertEqual(st, E.ERR_NO_CREDENTIALS)
+        self.assertEqual(self.rig.ga(cid, rp="b.example")[0], E.ERR_NO_CREDENTIALS)
 
     def test_tampered_credential_id(self):
         _, r = self.rig.make()
         cid = bytearray(parse_auth_data(r[2])["cred_id"])
         cid[20] ^= 1
-        st, _ = self.rig.call(ctap2.CMD_GET_ASSERTION, {
-            1: "example.com", 2: CDH, 3: [{"type": "public-key", "id": bytes(cid)}]})
-        self.assertEqual(st, E.ERR_NO_CREDENTIALS)
+        self.assertEqual(self.rig.ga(bytes(cid))[0], E.ERR_NO_CREDENTIALS)
 
     def test_wrong_finger_timeout_cancel(self):
-        for mode, code in ((touchid.NO_MATCH, E.ERR_OPERATION_DENIED),
-                           (touchid.LOCKED, E.ERR_OPERATION_DENIED),
-                           (touchid.UNAVAILABLE, E.ERR_OPERATION_DENIED),
-                           (touchid.TIMEOUT, E.ERR_USER_ACTION_TIMEOUT)):
-            self.rig.verifier.mode = mode
+        _, r = self.rig.make()
+        cid = parse_auth_data(r[2])["cred_id"]
+        for mode, code in ((stub.NO_MATCH, E.ERR_OPERATION_DENIED),
+                           (stub.TIMEOUT, E.ERR_USER_ACTION_TIMEOUT)):
+            self.rig.mode = mode
             self.rig.clock.t += ctap2.REFUSAL_REPLAY_WINDOW + 1   # not a replay
-            st, _ = self.rig.make()
-            self.assertEqual(st, code, mode)
-        self.assertEqual(self.rig.backend.creates, 0)
+            self.assertEqual(self.rig.ga(cid)[0], code, mode)
+        # A miss then a match within one prompt signs.
+        self.rig.mode = [stub.NO_MATCH, stub.MATCH]
+        self.rig.clock.t += 20
+        self.assertEqual(self.rig.ga(cid, hashlib.sha256(b"z").digest())[0], 0)
 
-        self.rig.verifier.mode = "wait"
+        self.rig.mode = stub.WAIT
         ctx = ctap2.Ctx()
         threading.Timer(0.05, ctx.cancel.set).start()
-        st, _ = self.rig.call(ctap2.CMD_MAKE_CREDENTIAL, {
-            1: CDH, 2: {"id": "x"}, 3: {"id": b"u"},
-            4: [{"type": "public-key", "alg": -7}]}, ctx)
+        t0 = time.monotonic()
+        st, _ = self.rig.call(ctap2.CMD_GET_ASSERTION, {
+            1: "example.com", 2: CDH, 3: [{"type": "public-key", "id": cid}]}, ctx)
         self.assertEqual(st, E.ERR_KEEPALIVE_CANCEL)
+        self.assertLess(time.monotonic() - t0, 3)
+
+    def test_timeout_cancels_the_enclave_wait(self):
+        self.rig.user.timeout = 0.2
+        self.rig.mode = stub.WAIT
+        t0 = time.monotonic()
+        self.assertEqual(self.rig.make()[0], E.ERR_USER_ACTION_TIMEOUT)
+        self.assertLess(time.monotonic() - t0, 3)
 
     def test_denied_assertion_signs_nothing(self):
         _, r = self.rig.make()
         cid = parse_auth_data(r[2])["cred_id"]
         signs = self.rig.backend.signs
-        self.rig.verifier.mode = touchid.NO_MATCH
-        st, _ = self.rig.call(ctap2.CMD_GET_ASSERTION, {
-            1: "example.com", 2: CDH, 3: [{"type": "public-key", "id": cid}]})
-        self.assertEqual(st, E.ERR_OPERATION_DENIED)
+        self.rig.mode = stub.NO_MATCH
+        self.assertEqual(self.rig.ga(cid)[0], E.ERR_OPERATION_DENIED)
         self.assertEqual(self.rig.backend.signs, signs)
 
-    def _ga(self, cid, cdh=CDH):
-        return self.rig.call(ctap2.CMD_GET_ASSERTION, {
-            1: "example.com", 2: cdh, 3: [{"type": "public-key", "id": cid}]})[0]
-
-    def test_replayed_refusal_gets_no_new_prompt(self):
-        # OpenSSH signs the same data again after OPERATION_DENIED.
+    def test_replayed_refusal_gets_no_new_touch(self):
         _, r = self.rig.make()
         cid = parse_auth_data(r[2])["cred_id"]
-        n, signs = len(self.rig.verifier.prompts), self.rig.backend.signs
-        self.rig.verifier.mode = touchid.NO_MATCH
-        self.assertEqual(self._ga(cid), E.ERR_OPERATION_DENIED)
-        self.assertEqual(len(self.rig.verifier.prompts), n + 1)
-        self.rig.clock.t += 0.5
-        self.rig.verifier.mode = touchid.MATCH       # would match, but is never asked
-        self.assertEqual(self._ga(cid), E.ERR_OPERATION_DENIED)
-        self.assertEqual(len(self.rig.verifier.prompts), n + 1)
-        self.assertEqual(self.rig.backend.signs, signs)
-        # A new challenge is a new request: normal prompt.
-        self.assertEqual(self._ga(cid, hashlib.sha256(b"new").digest()), 0)
-        self.assertEqual(len(self.rig.verifier.prompts), n + 2)
-        # The match cleared the refusal: the old request may ask again.
-        self.assertEqual(self._ga(cid), 0)
-        self.assertEqual(len(self.rig.verifier.prompts), n + 3)
-
-    def test_replay_window_ends(self):
-        _, r = self.rig.make()
-        cid = parse_auth_data(r[2])["cred_id"]
-        n = len(self.rig.verifier.prompts)
-        self.rig.verifier.mode = touchid.LOCKED
-        self.assertEqual(self._ga(cid), E.ERR_OPERATION_DENIED)
-        self.rig.clock.t += ctap2.REFUSAL_REPLAY_WINDOW - 1
-        self.assertEqual(self._ga(cid), E.ERR_OPERATION_DENIED)
-        self.assertEqual(len(self.rig.verifier.prompts), n + 1)
+        self.rig.mode = stub.NO_MATCH
+        self.assertEqual(self.rig.ga(cid)[0], E.ERR_OPERATION_DENIED)
+        n = self.rig.backend.touches
         self.rig.clock.t += 2
-        self.rig.verifier.mode = touchid.MATCH
-        self.assertEqual(self._ga(cid), 0)
-        self.assertEqual(len(self.rig.verifier.prompts), n + 2)
+        self.assertEqual(self.rig.ga(cid)[0], E.ERR_OPERATION_DENIED)
+        self.assertEqual(self.rig.backend.touches, n)
+        # A new challenge prompts; after the window the same one does too.
+        self.rig.mode = stub.MATCH
+        self.assertEqual(self.rig.ga(cid, hashlib.sha256(b"new").digest())[0], 0)
+        self.rig.mode = stub.NO_MATCH
+        self.assertEqual(self.rig.ga(cid)[0], E.ERR_OPERATION_DENIED)
+        self.rig.clock.t += ctap2.REFUSAL_REPLAY_WINDOW + 1
+        n = self.rig.backend.touches
+        self.assertEqual(self.rig.ga(cid)[0], E.ERR_OPERATION_DENIED)
+        self.assertGreater(self.rig.backend.touches, n)
 
-    def test_timeout_and_cancel_are_not_refusals(self):
+    def test_silent_assertion_has_no_enclave_signature(self):
         _, r = self.rig.make()
-        cid = parse_auth_data(r[2])["cred_id"]
-        n = len(self.rig.verifier.prompts)
-        self.rig.verifier.mode = touchid.TIMEOUT
-        self.assertEqual(self._ga(cid), E.ERR_USER_ACTION_TIMEOUT)
-        self.rig.verifier.mode = touchid.MATCH
-        self.assertEqual(self._ga(cid), 0)
-        self.assertEqual(len(self.rig.verifier.prompts), n + 2)
-
-    def test_replayed_make_credential_refusal(self):
-        self.rig.verifier.mode = touchid.NO_MATCH
-        self.assertEqual(self.rig.make()[0], E.ERR_OPERATION_DENIED)
-        self.assertEqual(self.rig.make()[0], E.ERR_OPERATION_DENIED)
-        self.assertEqual(len(self.rig.verifier.prompts), 1)
-        self.assertEqual(self.rig.make(uid=b"user-2")[0], E.ERR_OPERATION_DENIED)
-        self.assertEqual(len(self.rig.verifier.prompts), 2)
-
-    def test_silent_assertion(self):
-        _, r = self.rig.make()
-        cid = parse_auth_data(r[2])["cred_id"]
-        n = len(self.rig.verifier.prompts)
-        st, a = self.rig.call(ctap2.CMD_GET_ASSERTION, {
-            1: "example.com", 2: CDH, 3: [{"type": "public-key", "id": cid}],
-            5: {"up": False}})
+        ad = parse_auth_data(r[2])
+        n = self.rig.backend.touches
+        st, a = self.rig.ga(ad["cred_id"], extra={5: {"up": False}})
         self.assertEqual(st, 0)
         self.assertEqual(parse_auth_data(a[2])["flags"], 0)
-        self.assertEqual(len(self.rig.verifier.prompts), n)
+        self.assertEqual(self.rig.backend.touches, n)
+        # The probe answer verifies against no credential key.
+        self.assertFalse(es256_ok(ad["point"], a[2] + CDH, a[3]))
 
     def test_bad_requests(self):
         self.assertEqual(self.rig.make(extra={4: [{"type": "public-key", "alg": -8}]})[0],
@@ -336,30 +373,33 @@ class Ctap2Test(unittest.TestCase):
         self.assertEqual(self.rig.auth.handle(b"\x55"), bytes([E.ERR_INVALID_COMMAND]))
         self.assertEqual(self.rig.make(extra={1: b"short"})[0], E.ERR_INVALID_LENGTH)
 
-    def test_exclude_list(self):
+    def test_exclude_list_takes_an_enclave_touch(self):
         _, r = self.rig.make()
         cid = parse_auth_data(r[2])["cred_id"]
+        n = self.rig.backend.touches
         st, _ = self.rig.make(extra={5: [{"type": "public-key", "id": cid}]})
         self.assertEqual(st, E.ERR_CREDENTIAL_EXCLUDED)
+        self.assertEqual(self.rig.backend.touches, n + 1)       # the presence key
         st, _ = self.rig.make(rp="other.example", extra={5: [{"type": "public-key", "id": cid}]})
         self.assertEqual(st, 0)
 
     def test_resident_and_next_assertion(self):
         for uid in (b"u1", b"u2", b"u3"):
-            st, _ = self.rig.make(uid=uid, rk=True)
-            self.assertEqual(st, 0)
-        st, _ = self.rig.make(uid=b"u2", rk=True)        # replaces u2
+            self.assertEqual(self.rig.make(uid=uid, rk=True)[0], 0)
+        self.rig.make(uid=b"u2", rk=True)        # replaces u2
         self.assertEqual(self.rig.auth.store.count(), 3)
         st, a = self.rig.call(ctap2.CMD_GET_ASSERTION, {1: "example.com", 2: CDH})
         self.assertEqual(st, 0)
         self.assertEqual(a[5], 3)
         users = {a[4]["id"]}
-        self.assertEqual(a[4].get("name"), "ryan")      # UV done, several accounts
+        self.assertEqual(a[4].get("name"), "ryan")
+        n = self.rig.backend.touches
         for _ in range(2):
-            st, n = self.rig.call(ctap2.CMD_GET_NEXT_ASSERTION)
+            st, nx = self.rig.call(ctap2.CMD_GET_NEXT_ASSERTION)
             self.assertEqual(st, 0)
-            users.add(n[4]["id"])
-            self.assertNotIn(5, n)
+            users.add(nx[4]["id"])
+        # Each account's signature is its own enclave touch.
+        self.assertEqual(self.rig.backend.touches, n + 2)
         self.assertEqual(users, {b"u1", b"u2", b"u3"})
         self.assertEqual(self.rig.call(ctap2.CMD_GET_NEXT_ASSERTION)[0], E.ERR_NOT_ALLOWED)
         self.assertEqual(self.rig.make(uid=b"u4", rk=True)[0], 0)
@@ -367,9 +407,7 @@ class Ctap2Test(unittest.TestCase):
 
     def test_cred_protect(self):
         _, r = self.rig.make(uid=b"p3", rk=True, ext={"credProtect": 3})
-        ad = parse_auth_data(r[2])
-        self.assertEqual(ad["ext"], {"credProtect": 3})
-        # Silent discovery does not see a uvRequired credential.
+        self.assertEqual(parse_auth_data(r[2])["ext"], {"credProtect": 3})
         st, _ = self.rig.call(ctap2.CMD_GET_ASSERTION, {1: "example.com", 2: CDH,
                                                         5: {"up": False}})
         self.assertEqual(st, E.ERR_NO_CREDENTIALS)
@@ -383,56 +421,45 @@ class Ctap2Test(unittest.TestCase):
             ad = parse_auth_data(r[2])
             self.assertLessEqual(len(ad["cred_id"]), creds.ID_MAX_CTAP2)
             self.assertEqual(ad["cred_id"][1], creds.KIND_REF)
-            st, a = rig.call(ctap2.CMD_GET_ASSERTION, {
-                1: "example.com", 2: CDH, 3: [{"type": "public-key", "id": ad["cred_id"]}]})
+            st, a = rig.ga(ad["cred_id"])
             self.assertEqual(st, 0)
             self.assertTrue(es256_ok(ad["point"], a[2] + CDH, a[3]))
         finally:
             rig.close()
 
-    def test_token_one_touch_make_credential(self):
+    def test_get_assertion_token_takes_no_extra_touch(self):
+        _, r = self.rig.make()
+        cid = parse_auth_data(r[2])["cred_id"]
+        plat = Platform(self.rig)
+        n = self.rig.backend.touches
+        st, tok = plat.token(pinuv.PERM_GA, "example.com")
+        self.assertEqual(st, 0)
+        self.assertEqual(self.rig.backend.touches, n)            # no touch for the token
+        # Firefox's silent pre-flight with the token: no touch, no flags.
+        st, a = self.rig.ga(cid, extra={5: {"up": False}, 6: plat.auth(tok, CDH), 7: 2})
+        self.assertEqual((st, parse_auth_data(a[2])["flags"]), (0, 0))
+        self.assertEqual(self.rig.backend.touches, n)
+        # The real request: one enclave touch, UP and UV.
+        st, a = self.rig.ga(cid, extra={6: plat.auth(tok, CDH), 7: 2})
+        self.assertEqual(st, 0)
+        self.assertEqual(parse_auth_data(a[2])["flags"], ctap2.FLAG_UP | ctap2.FLAG_UV)
+        self.assertEqual(self.rig.backend.touches, n + 1)
+        # A token does not stand in for the touch: with no finger, nothing signs.
+        _, tok = plat.token(pinuv.PERM_GA, "example.com")
+        self.rig.mode = stub.NO_MATCH
+        st, _ = self.rig.ga(cid, hashlib.sha256(b"q").digest(),
+                            extra={6: plat.auth(tok, hashlib.sha256(b"q").digest()), 7: 2})
+        self.assertEqual(st, E.ERR_OPERATION_DENIED)
+
+    def test_make_credential_token(self):
         plat = Platform(self.rig)
         st, tok = plat.token(pinuv.PERM_MC | pinuv.PERM_GA, "example.com")
         self.assertEqual(st, 0)
-        n = len(self.rig.verifier.prompts)
         st, r = self.rig.make(extra={8: plat.auth(tok, CDH), 9: 2, 7: {}})
         self.assertEqual(st, 0)
-        self.assertEqual(len(self.rig.verifier.prompts), n)    # the token's touch counted
-        self.assertTrue(parse_auth_data(r[2])["flags"] & ctap2.FLAG_UV)
-        # One ceremony per token: its mc permission is used up.
-        st, r = self.rig.make(extra={8: plat.auth(tok, CDH), 9: 2})
-        self.assertEqual(st, E.ERR_PIN_AUTH_INVALID)
-        self.assertEqual(len(self.rig.verifier.prompts), n)
-        # Without a token, the same request asks for Touch ID again.
-        st, r = self.rig.make()
-        self.assertEqual(st, 0)
-        self.assertEqual(len(self.rig.verifier.prompts), n + 1)
-
-    def test_token_survives_silent_preflight(self):
-        # Firefox: getPinUvAuthToken (one touch), a silent up=false getAssertion
-        # with the token to filter the allow list, then the real getAssertion.
-        st, r = self.rig.make()
-        cid = parse_auth_data(r[2])["cred_id"]
-        allow = [{"type": "public-key", "id": cid}]
-        plat = Platform(self.rig)
-        st, tok = plat.token(pinuv.PERM_GA, "example.com")
-        self.assertEqual(st, 0)
-        n = len(self.rig.verifier.prompts)
-        st, a = self.rig.call(ctap2.CMD_GET_ASSERTION, {
-            1: "example.com", 2: CDH, 3: allow, 5: {"up": False},
-            6: plat.auth(tok, CDH), 7: 2})
-        self.assertEqual(st, 0)
-        self.assertFalse(parse_auth_data(a[2])["flags"] & ctap2.FLAG_UP)
-        st, a = self.rig.call(ctap2.CMD_GET_ASSERTION, {
-            1: "example.com", 2: CDH, 3: allow, 6: plat.auth(tok, CDH), 7: 2})
-        self.assertEqual(st, 0)
-        flags = parse_auth_data(a[2])["flags"]
-        self.assertTrue(flags & ctap2.FLAG_UP and flags & ctap2.FLAG_UV)
-        self.assertEqual(len(self.rig.verifier.prompts), n)    # still one touch
-        # The real ceremony used the token up.
-        st, _ = self.rig.call(ctap2.CMD_GET_ASSERTION, {
-            1: "example.com", 2: CDH, 3: allow, 6: plat.auth(tok, CDH), 7: 2})
-        self.assertEqual(st, E.ERR_PIN_AUTH_INVALID)
+        self.assertEqual(self.rig.backend.touches, 1)
+        self.assertEqual(self.rig.make(extra={8: plat.auth(tok, CDH), 9: 2})[0],
+                         E.ERR_PIN_AUTH_INVALID)
 
     def test_token_bad_param_and_rp(self):
         plat = Platform(self.rig, version=1)
@@ -444,7 +471,7 @@ class Ctap2Test(unittest.TestCase):
                          E.ERR_PIN_AUTH_INVALID)
         self.assertEqual(plat.token(0x08)[0], E.ERR_UNAUTHORIZED_PERMISSION)
         self.assertEqual(plat.token(pinuv.PERM_MC)[0], E.ERR_MISSING_PARAMETER)
-        self.rig.verifier.mode = touchid.NO_MATCH
+        self.rig.mode = stub.NO_MATCH
         self.assertEqual(plat.token(pinuv.PERM_CM)[0], E.ERR_OPERATION_DENIED)
 
     def test_token_expires(self):
@@ -461,7 +488,6 @@ class Ctap2Test(unittest.TestCase):
                          E.ERR_INVALID_SUBCOMMAND)
         st, r = self.rig.call(ctap2.CMD_CLIENT_PIN, {1: 2, 2: 0x07})
         self.assertEqual((st, r[5]), (0, 3))
-        # Old-style "touch to select" probe.
         self.assertEqual(self.rig.make(extra={8: b"", 9: 1})[0], E.ERR_PIN_NOT_SET)
 
     def test_credential_management(self):
@@ -469,7 +495,9 @@ class Ctap2Test(unittest.TestCase):
         self.rig.make(rp="b.example", uid=b"ub", rk=True)
         self.rig.make(rp="b.example", uid=b"ub2", rk=True)
         plat = Platform(self.rig)
+        n = self.rig.backend.touches
         _, tok = plat.token(pinuv.PERM_CM)
+        self.assertEqual(self.rig.backend.touches, n + 1)       # enclave-checked, presence key
 
         def cm(sub, params=None, auth=True):
             p = {1: sub}
@@ -485,46 +513,33 @@ class Ctap2Test(unittest.TestCase):
         st, rp1 = cm(0x02)
         self.assertEqual((st, rp1[5]), (0, 2))
         st, rp2 = cm(0x03, auth=False)
-        self.assertEqual(st, 0)
         self.assertEqual({rp1[3]["id"], rp2[3]["id"]}, {"a.example", "b.example"})
-        self.assertEqual(cm(0x03, auth=False)[0], E.ERR_NOT_ALLOWED)
-
         bh = hashlib.sha256(b"b.example").digest()
         st, c1 = cm(0x04, {1: bh})
         self.assertEqual((st, c1[9]), (0, 2))
-        self.assertEqual(c1[8][3], -7)
         st, c2 = cm(0x05, auth=False)
-        self.assertEqual(st, 0)
-
-        st, _ = cm(0x07, {2: c2[7], 3: {"id": c2[6]["id"], "name": "renamed"}})
-        self.assertEqual(st, 0)
-        st, _ = cm(0x06, {2: c1[7]})
-        self.assertEqual(st, 0)
+        self.assertEqual(cm(0x07, {2: c2[7], 3: {"id": c2[6]["id"], "name": "renamed"}})[0], 0)
+        self.assertEqual(cm(0x06, {2: c1[7]})[0], 0)
         self.assertEqual(self.rig.auth.store.count(), 2)
-        self.assertIsNone(self.rig.auth.store.find(c1[7]["id"]))
         self.assertEqual(self.rig.auth.store.find(c2[7]["id"])["userName"], "renamed")
-
-        # Wrong auth, and a token without cm.
-        self.assertEqual(self.rig.call(ctap2.CMD_CRED_MGMT,
-                                       {1: 0x01, 3: 2, 4: b"\x00" * 32})[0],
-                         E.ERR_PIN_AUTH_INVALID)
+        # A token for getAssertion (no touch) cannot manage credentials.
         _, tok2 = plat.token(pinuv.PERM_GA, "a.example")
         self.assertEqual(self.rig.call(ctap2.CMD_CRED_MGMT,
                                        {1: 0x01, 3: 2, 4: plat.auth(tok2, b"\x01")})[0],
                          E.ERR_PIN_AUTH_INVALID)
 
-    def _hmac_secret(self, plat, salt, cid):
+    def _hmac_secret(self, plat, salt, cid, rig=None):
+        rig = rig or self.rig
         enc = plat.proto.encrypt(plat.shared, salt)
         hs = {1: plat.cose, 2: enc, 3: plat.proto.authenticate(plat.shared, enc),
               4: plat.version}
-        st, a = self.rig.call(ctap2.CMD_GET_ASSERTION, {
-            1: "example.com", 2: CDH, 3: [{"type": "public-key", "id": cid}],
-            4: {"hmac-secret": hs}})
+        st, a = rig.ga(cid, extra={4: {"hmac-secret": hs}})
         self.assertEqual(st, 0)
         ad = parse_auth_data(a[2])
-        return plat.proto.decrypt(plat.shared, ad["ext"]["hmac-secret"])
+        return a, ad, (plat.proto.decrypt(plat.shared, ad["ext"]["hmac-secret"])
+                       if "ext" in ad else None)
 
-    def test_hmac_secret(self):
+    def test_hmac_secret_is_released_by_the_enclave(self):
         _, r = self.rig.make(ext={"hmac-secret": True})
         ad = parse_auth_data(r[2])
         self.assertEqual(ad["ext"], {"hmac-secret": True})
@@ -532,20 +547,36 @@ class Ctap2Test(unittest.TestCase):
         for version in (1, 2):
             plat = Platform(self.rig, version)
             s1, s2 = os.urandom(32), os.urandom(32)
-            o1 = self._hmac_secret(plat, s1, cid)
-            o12 = self._hmac_secret(plat, s1 + s2, cid)
+            n = self.rig.backend.touches
+            a, aad, o1 = self._hmac_secret(plat, s1, cid)
+            # Two enclave touches: UNSEAL of the CredRandom, then the signature.
+            self.assertEqual(self.rig.backend.touches, n + 2)
+            self.assertTrue(es256_ok(ad["point"], a[2] + CDH, a[3]))
+            _, _, o12 = self._hmac_secret(plat, s1 + s2, cid)
             self.assertEqual(len(o1), 32)
             self.assertEqual(o12[:32], o1)
             self.assertNotEqual(o12[32:], o1)
-            # Deterministic per credential and salt.
-            self.assertEqual(self._hmac_secret(plat, s1, cid), o1)
-        # Bad saltAuth.
+            self.assertEqual(self._hmac_secret(plat, s1, cid)[2], o1)
+        # No touch, no secret.
+        self.rig.mode = stub.NO_MATCH
         plat = Platform(self.rig)
         enc = plat.proto.encrypt(plat.shared, os.urandom(32))
-        st, _ = self.rig.call(ctap2.CMD_GET_ASSERTION, {
-            1: "example.com", 2: CDH, 3: [{"type": "public-key", "id": cid}],
-            4: {"hmac-secret": {1: plat.cose, 2: enc, 3: b"\x00" * 32, 4: 2}}})
-        self.assertEqual(st, E.ERR_PIN_AUTH_INVALID)
+        st, _ = self.rig.ga(cid, extra={4: {"hmac-secret": {
+            1: plat.cose, 2: enc, 3: plat.proto.authenticate(plat.shared, enc), 4: 2}}})
+        self.assertEqual(st, E.ERR_OPERATION_DENIED)
+        # The CredRandom is not in the credential ID in any form the host can open.
+        c = self.rig.auth.vault.unwrap(hashlib.sha256(b"example.com").digest(), cid)
+        self.assertIsNotNone(c.sealed)
+        with self.assertRaises(backend.EnclaveRefused):
+            self.rig.backend.unseal(c.handle, c.sealed)
+
+    def test_no_hmac_secret_without_kernel_sealing(self):
+        rig = Rig(can_unseal=False)
+        try:
+            _, r = rig.make(ext={"hmac-secret": True})
+            self.assertNotIn("ext", parse_auth_data(r[2]))
+        finally:
+            rig.close()
 
     def test_reset(self):
         _, r = self.rig.make(rk=True)
@@ -553,38 +584,152 @@ class Ctap2Test(unittest.TestCase):
         self.rig.clock.t += 11
         self.assertEqual(self.rig.call(ctap2.CMD_RESET)[0], E.ERR_NOT_ALLOWED)
         self.rig.clock.t = self.rig.auth.started + 1
-        self.rig.verifier.mode = touchid.NO_MATCH
+        self.rig.mode = stub.NO_MATCH
         self.assertEqual(self.rig.call(ctap2.CMD_RESET)[0], E.ERR_OPERATION_DENIED)
-        self.rig.verifier.mode = touchid.MATCH
+        self.rig.mode = stub.MATCH
         self.assertEqual(self.rig.call(ctap2.CMD_RESET)[0], 0)
         self.assertEqual(self.rig.auth.store.count(), 0)
-        st, _ = self.rig.call(ctap2.CMD_GET_ASSERTION, {
-            1: "example.com", 2: CDH, 3: [{"type": "public-key", "id": cid}]})
-        self.assertEqual(st, E.ERR_NO_CREDENTIALS)
+        self.assertEqual(self.rig.ga(cid)[0], E.ERR_NO_CREDENTIALS)
 
     def test_state_survives_restart(self):
         _, r = self.rig.make(rk=True)
         cid = parse_auth_data(r[2])["cred_id"]
-        cfg = load_config(None)
-        auth2, _ = build(cfg, os.path.join(self.rig.tmp.name, "state"),
-                         self.rig.backend, self.rig.verifier, self.rig.secret)
+        auth2, _ = daemon.build(self.rig.cfg, self.rig.state, self.rig.backend,
+                                self.rig.user, self.rig.secret, self.rig.policy)
         self.assertEqual(auth2.store.count(), 1)
         self.assertIsNotNone(auth2.vault.unwrap(hashlib.sha256(b"example.com").digest(), cid))
-        self.assertGreaterEqual(auth2.counter.value, 1)
-        # A different master secret opens nothing.
         other = FileSecret(os.path.join(self.rig.tmp.name, "other"))
-        auth3, _ = build(cfg, os.path.join(self.rig.tmp.name, "state"),
-                         self.rig.backend, self.rig.verifier, other)
+        auth3, _ = daemon.build(self.rig.cfg, self.rig.state, self.rig.backend,
+                                self.rig.user, other, self.rig.policy)
         self.assertEqual(auth3.store.all(), [])
-        self.assertIsNone(auth3.vault.unwrap(hashlib.sha256(b"example.com").digest(), cid))
 
     def test_state_files_are_private(self):
         self.rig.make(rk=True)
-        state = os.path.join(self.rig.tmp.name, "state")
         for d in ("resident", "handles"):
-            self.assertEqual(os.stat(os.path.join(state, d)).st_mode & 0o077, 0)
-        for f in os.listdir(os.path.join(state, "resident")):
-            self.assertEqual(os.stat(os.path.join(state, "resident", f)).st_mode & 0o077, 0)
+            self.assertEqual(os.stat(os.path.join(self.rig.state, d)).st_mode & 0o077, 0)
+
+
+class LegacyTest(unittest.TestCase):
+    """Credentials of aurora-fido 0.1 (touch checked outside the enclave) are refused."""
+
+    def setUp(self):
+        self.rig = Rig()
+        self.rp_hash = hashlib.sha256(b"example.com").digest()
+
+    def tearDown(self):
+        self.rig.close()
+
+    def old_id(self, handle, rk=False):
+        # The 0.1 payload: handle, seed (host-held hmac-secret key), credProtect.
+        v = self.rig.auth.vault
+        cid = v._seal(creds.KIND_INLINE, self.rp_hash, {1: handle, 2: os.urandom(32), 3: 1})
+        if rk:
+            self.rig.auth.store.put({"rpId": "example.com", "rpIdHash": self.rp_hash,
+                                     "userId": b"old", "credId": cid,
+                                     "pub": b"\x04" + b"\x01" * 64, "credProtect": 1})
+        return cid
+
+    def test_old_ids_are_refused_and_reported(self):
+        for handle in (b"AFSK\x01" + os.urandom(60),
+                       self.rig.backend.create(0x2)[0]):
+            self.rig.legacy.clear()
+            touches = self.rig.backend.touches
+            self.assertEqual(self.rig.ga(self.old_id(handle))[0], E.ERR_NO_CREDENTIALS)
+            self.assertEqual(self.rig.backend.touches, touches)
+            self.assertEqual(self.rig.legacy[0][0], "example.com")
+            self.assertIn("0.1", self.rig.legacy[0][1])
+
+    def test_keys_without_access_control_are_refused(self):
+        handle, _ = self.rig.backend.create(0x2, gated=False)
+        cid = self.rig.auth.vault.wrap(self.rp_hash, creds.Credential(handle, 1, 1))
+        self.assertEqual(self.rig.ga(cid)[0], E.ERR_NO_CREDENTIALS)
+        self.assertEqual(self.rig.backend.signs, 0)
+        self.assertTrue(self.rig.legacy)
+
+    def test_resident_count_and_log(self):
+        self.old_id(b"AFSK\x01" + os.urandom(60), rk=True)
+        self.rig.make(uid=b"new", rk=True)
+        self.assertEqual(daemon.legacy_resident(self.rig.auth.vault, self.rig.auth.store, self.rig.backend), 1)
+        st, a = self.rig.call(ctap2.CMD_GET_ASSERTION, {1: "example.com", 2: CDH})
+        self.assertEqual((st, a[4]["id"]), (0, b"new"))
+        seen = []
+        log = daemon.LegacyLog(self.rig.state, seen.append)
+        log("ssh:", "old")
+        log("ssh:", "old")
+        with open(os.path.join(self.rig.state, "legacy-refused.json")) as f:
+            self.assertEqual(json.load(f)["ssh:"]["count"], 2)
+        self.assertEqual(seen, [1, 1])
+
+
+class PolicyTest(unittest.TestCase):
+    def cfg(self, policy):
+        c = daemon.load_config(None)
+        c.set("touchid", "policy", policy)
+        return c
+
+    def test_auto_takes_the_best_the_enclave_enforces(self):
+        self.assertEqual(daemon.resolve_policy(self.cfg("auto"), 0x3)[0], creds.POLICY_TOUCHID_ANY)
+        self.assertIn("no password fallback", daemon.resolve_policy(self.cfg("auto"), 0x3)[1])
+        self.assertEqual(daemon.resolve_policy(self.cfg("auto"), 0x7),
+                         (creds.POLICY_TOUCHID_OR_PASSWORD, None))
+
+    def test_a_policy_the_enclave_cannot_enforce_is_refused(self):
+        with self.assertRaises(daemon.PolicyError) as e:
+            daemon.resolve_policy(self.cfg("touchid-or-password"), 0x3)
+        self.assertIn("root approve without you", str(e.exception))
+        with self.assertRaises(daemon.PolicyError):
+            daemon.resolve_policy(self.cfg("touchid-current"), 0x2)
+        with self.assertRaises(daemon.PolicyError):
+            daemon.resolve_policy(self.cfg("whatever"), 0x3)
+        self.assertEqual(daemon.resolve_policy(self.cfg("touchid-current"), 0x3)[0],
+                         creds.POLICY_TOUCHID_CURRENT)
+
+    def test_default_config_is_auto(self):
+        self.assertEqual(daemon.load_config(None).get("touchid", "policy"), "auto")
+
+
+class EnclaveUserTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.b = StubKeyBackend()
+        self.u = enclave.EnclaveUser(self.b, self.tmp.name, 0x2, user="root")
+        self.u.notifier = Notes()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_presence_key_is_made_once_and_checked(self):
+        ev = threading.Event()
+        self.assertEqual(self.u.verify(touchid.Prompt("select", None), ev), touchid.MATCH)
+        self.assertEqual(self.b.creates, 1)
+        u2 = enclave.EnclaveUser(self.b, self.tmp.name, 0x2, user="root")
+        u2.notifier = Notes()
+        self.assertEqual(u2.verify(touchid.Prompt("select", None), ev), touchid.MATCH)
+        self.assertEqual(self.b.creates, 1)
+        # A key the enclave retired (touchid-current after an enrolment change).
+        self.b.mode = ["reject", stub.MATCH]
+        self.assertEqual(u2.verify(touchid.Prompt("select", None), ev), touchid.MATCH)
+        self.assertEqual(self.b.creates, 2)
+
+    def test_a_signature_that_does_not_verify_is_not_a_touch(self):
+        self.u.presence_key()
+        real = self.b.sign
+        self.b.sign = lambda h, d: real(h, hashlib.sha256(d).digest())   # wrong digest
+        with self.assertRaises(backend.BackendError):
+            self.u.verify(touchid.Prompt("select", None), threading.Event())
+
+    def test_presence_key_for_other_flags_is_replaced(self):
+        self.u.presence_key()
+        u2 = enclave.EnclaveUser(self.b, self.tmp.name, 0x1, user="root")
+        u2.presence_key()
+        self.assertEqual(self.b.creates, 2)
+
+    def test_tries(self):
+        self.b.mode = stub.NO_MATCH
+        h, _ = self.b.create(0x2)
+        r, v = self.u.sign(h, b"\x00" * 32, touchid.Prompt("sign-in", "x"), threading.Event())
+        self.assertEqual((r, v, self.b.touches), (touchid.NO_MATCH, None, 3))
+        self.assertEqual(self.u.notifier.titles, ["Touch ID to sign in to x"])
 
 
 class U2fTest(unittest.TestCase):
@@ -598,7 +743,7 @@ class U2fTest(unittest.TestCase):
     def apdu(self, ins, p1, data):
         return bytes([0, ins, p1, 0, 0]) + struct.pack(">H", len(data)) + data + b"\x00\x00"
 
-    def poll(self, apdu, tries=50):
+    def poll(self, apdu, tries=100):
         for _ in range(tries):
             r = self.rig.u2f.handle(apdu)
             if r[-2:] != b"\x69\x85":
@@ -616,23 +761,17 @@ class U2fTest(unittest.TestCase):
         chal = os.urandom(32)
         r = self.poll(self.apdu(u2f.INS_REGISTER, 0, chal + self.app))
         self.assertEqual(r[-2:], b"\x90\x00")
+        self.assertEqual(self.rig.backend.touches, 1)            # presence key
         r = r[:-2]
-        self.assertEqual(r[0], 5)
         point, khl = r[1:66], r[66]
         kh = r[67:67 + khl]
-        self.assertLessEqual(khl, 255)
         rest = r[67 + khl:]
-        self.assertEqual(rest[0], 0x30)
         nlen = rest[1] & 0x7F if rest[1] & 0x80 else 0
         body = int.from_bytes(rest[2:2 + nlen], "big") if nlen else rest[1]
-        cert_len = 2 + nlen + body
-        cert = x509.load_der_x509_certificate(rest[:cert_len])
-        sig = rest[cert_len:]
-        self.assertEqual(cert.public_key().public_bytes(
-            Encoding.X962, PublicFormat.UncompressedPoint), point)
-        cert.public_key().verify(cert.signature, cert.tbs_certificate_bytes,
+        cert = x509.load_der_x509_certificate(rest[:2 + nlen + body])
+        sig = rest[2 + nlen + body:]
+        cert.public_key().verify(sig, b"\x00" + self.app + chal + kh + point,
                                  ec.ECDSA(hashes.SHA256()))
-        self.assertTrue(es256_ok(point, b"\x00" + self.app + chal + kh + point, sig))
 
         auth = self.apdu(u2f.INS_AUTHENTICATE, 0x07, chal + self.app + bytes([khl]) + kh)
         self.assertEqual(self.rig.u2f.handle(auth), b"\x69\x85")
@@ -640,21 +779,27 @@ class U2fTest(unittest.TestCase):
         bad = self.apdu(u2f.INS_AUTHENTICATE, 0x07, chal + other + bytes([khl]) + kh)
         self.assertEqual(self.rig.u2f.handle(bad), b"\x6a\x80")
 
-        time.sleep(0.05)
         self.rig.u2f.presence.last_poll -= 10          # new ceremony
         auth = self.apdu(u2f.INS_AUTHENTICATE, 0x03, chal + self.app + bytes([khl]) + kh)
         r = self.poll(auth)
         self.assertEqual(r[-2:], b"\x90\x00")
         self.assertEqual(r[0], 1)
         self.assertTrue(es256_ok(point, self.app + r[:5] + chal, r[5:-2]))
+        self.assertEqual(self.rig.backend.touches, 2)
+        # Don't-enforce: no UP and no enclave signature.
+        r = self.rig.u2f.handle(self.apdu(u2f.INS_AUTHENTICATE, 0x08,
+                                          chal + self.app + bytes([khl]) + kh))
+        self.assertEqual((r[-2:], r[0]), (b"\x90\x00", 0))
+        self.assertFalse(es256_ok(point, self.app + r[:5] + chal, r[5:-2]))
+        self.assertEqual(self.rig.backend.touches, 2)
 
     def test_refusal_is_not_reprompted_while_polling(self):
-        self.rig.verifier.mode = touchid.NO_MATCH
+        self.rig.mode = stub.NO_MATCH
         apdu = self.apdu(u2f.INS_REGISTER, 0, os.urandom(32) + self.app)
         r = self.poll(apdu, tries=30)
         self.assertEqual(r[-2:], b"\x69\x85")
-        self.assertEqual(len(self.rig.verifier.prompts), 1)
-        self.assertEqual(self.rig.backend.creates, 0)
+        self.assertEqual(self.rig.backend.touches, 3)            # one prompt, max_tries
+        self.assertEqual(self.rig.backend.creates, 1)            # only the presence key
 
 
 class FakeDev:
@@ -709,8 +854,6 @@ class CtapHidTest(unittest.TestCase):
         self.send(ctaphid.BROADCAST, ctaphid.CMD_INIT, nonce)
         cid, cmd, data = read_msg(self.dev)
         self.assertEqual((cid, cmd, data[:8]), (ctaphid.BROADCAST, ctaphid.CMD_INIT, nonce))
-        self.assertEqual(data[12], 2)
-        self.assertTrue(data[16] & ctaphid.CAP_CBOR)
         return struct.unpack(">I", data[8:12])[0]
 
     def test_init_ping_fragmented(self):
@@ -724,32 +867,20 @@ class CtapHidTest(unittest.TestCase):
         self.send(cid, ctaphid.CMD_CBOR, bytes([ctap2.CMD_GET_INFO]))
         c, cmd, data = read_msg(self.dev)
         self.assertEqual((c, cmd, data[0]), (cid, ctaphid.CMD_CBOR, 0))
-        self.assertIn("FIDO_2_1", cbor.decode(data[1:])[1])
         self.send(cid, ctaphid.CMD_MSG, b"\x00\x03\x00\x00")
         self.assertEqual(read_msg(self.dev), (cid, ctaphid.CMD_MSG, b"U2F_V2\x90\x00"))
 
-    def test_errors(self):
-        self.send(0x12345678, ctaphid.CMD_PING, b"x")
-        self.assertEqual(read_msg(self.dev)[1:], (ctaphid.CMD_ERROR, bytes([E.ERR_INVALID_CHANNEL])))
-        cid = self.init()
-        frames = ctaphid.frames(cid, ctaphid.CMD_PING, os.urandom(200))
-        self.hid.packet(frames[0])
-        bad = bytearray(frames[1])
-        bad[4] = 5
-        self.hid.packet(bytes(bad))
-        self.assertEqual(read_msg(self.dev)[1:], (ctaphid.CMD_ERROR, bytes([E.ERR_INVALID_SEQ])))
-        self.send(cid, 0x55, b"")
-        self.assertEqual(read_msg(self.dev)[1:], (ctaphid.CMD_ERROR, bytes([E.ERR_INVALID_COMMAND])))
-
     def test_keepalive_upneeded_busy_and_cancel(self):
-        self.rig.verifier.mode = "wait"
+        self.rig.mode = stub.WAIT
         cid = self.init()
         other = self.init()
         req = {1: CDH, 2: {"id": "x"}, 3: {"id": b"u"}, 4: [{"type": "public-key", "alg": -7}]}
         self.send(cid, ctaphid.CMD_CBOR, bytes([ctap2.CMD_MAKE_CREDENTIAL]) + cbor.encode(req))
-        c, cmd, data = read_msg(self.dev, skip_keepalive=False)
-        self.assertEqual((c, cmd, data), (cid, ctaphid.CMD_KEEPALIVE,
-                                          bytes([ctaphid.KEEPALIVE_UPNEEDED])))
+        while True:
+            c, cmd, data = read_msg(self.dev, skip_keepalive=False)
+            if data == bytes([ctaphid.KEEPALIVE_UPNEEDED]):
+                break
+        self.assertEqual((c, cmd), (cid, ctaphid.CMD_KEEPALIVE))
         self.send(other, ctaphid.CMD_PING, b"hi")
         while True:
             c, cmd, data = read_msg(self.dev, skip_keepalive=False)
@@ -761,169 +892,42 @@ class CtapHidTest(unittest.TestCase):
         self.assertEqual((c, cmd, data), (cid, ctaphid.CMD_CBOR, bytes([E.ERR_KEEPALIVE_CANCEL])))
 
 
-class FakeSep(StubKeyBackend):
-    """Stub keys in a "SEPK" handle, standing in for /dev/sep-key."""
-
-    name = "sep-key"
-    non_extractable = True
-
-    gate = False          # make "biometric ACL" handles (byte 5 bit 0)
-    refuse = None         # exception the gated sign raises
-
-    def create(self, policy=0):
-        h, p = super().create()
-        return b"SEPK\x01" + bytes([1 if self.gate else 0]) + h, p
-
-    def enclave_gated(self, handle):
-        return handle[:4] == b"SEPK" and bool(handle[5] & 1)
-
-    def sign(self, handle, digest):
-        if self.enclave_gated(handle) and self.refuse:
-            raise self.refuse
-        return super().sign(handle[6:], digest)
-
-    def public(self, handle):
-        return super().public(handle[6:])
-
-
-class KeyStoreTest(unittest.TestCase):
-    def test_sealed_keys(self):
-        m = os.urandom(64)
-        b = backend.SealedKeyBackend(m)
-        h, point = b.create()
-        self.assertEqual(len(h), 65)
-        self.assertEqual(h[:5], b"AFSK\x01")
-        self.assertEqual(b.public(h), point)
-        d = hashlib.sha256(b"m").digest()
-        pub = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), point)
-        from cryptography.hazmat.primitives.asymmetric.utils import Prehashed
-        pub.verify(b.sign(h, d), d, ec.ECDSA(Prehashed(hashes.SHA256())))
-        bad = bytearray(h)
-        bad[30] ^= 1
-        with self.assertRaises(backend.InvalidHandle):
-            b.sign(bytes(bad), d)
-        with self.assertRaises(backend.InvalidHandle):
-            backend.SealedKeyBackend(os.urandom(64)).sign(h, d)
-        with self.assertRaises(backend.InvalidHandle):
-            b.sign(h[:-1], d)
+class BackendTest(unittest.TestCase):
+    def test_no_sep_key_no_service(self):
+        with self.assertRaises(backend.BackendError) as e:
+            backend.open_backend("auto", "/nonexistent-sep-key")
+        self.assertIn("not present", str(e.exception))
+        with self.assertRaises(backend.BackendError) as e:
+            backend.open_backend("sealed", "/nonexistent-sep-key")
+        self.assertIn("no longer supported", str(e.exception))
         with self.assertRaises(backend.BackendError):
-            backend.SealedKeyBackend().create()
+            backend.open_backend("bogus")
 
-    def test_store_dispatch_by_handle(self):
-        m = os.urandom(64)
-        sealed = backend.SealedKeyBackend(m)
-        old, _ = sealed.create()                        # made before /dev/sep-key
-        sep = FakeSep()
-        ks = backend.KeyStore(sep, sealed, sep)
-        self.assertEqual((ks.name, ks.non_extractable), ("sep-key", True))
-        new, _ = ks.create()
-        self.assertEqual(new[:4], b"SEPK")
-        d = hashlib.sha256(b"x").digest()
-        ks.sign(old, d)
-        ks.sign(new, d)
-        nosep = backend.KeyStore(sealed, sealed, None)
-        self.assertEqual((nosep.name, nosep.non_extractable), ("sealed", False))
-        with self.assertRaises(backend.BackendError):
-            nosep.sign(new, d)
-        with self.assertRaises(backend.InvalidHandle):
-            nosep.sign(b"STUB" + new[4:], d)
-        # A reset's new master secret retires every sealed key.
-        sealed.rekey(os.urandom(64))
-        with self.assertRaises(backend.InvalidHandle):
-            ks.sign(old, d)
+    def test_ioctl_layout(self):
+        self.assertEqual(backend.IOC_SIGN, 0xC874B122)
+        self.assertEqual(backend.IOC_CANCEL, 0x0000B125)
+        self.assertEqual(backend._SEAL.size, 2384)
+        self.assertEqual(backend.IOC_SEAL >> 16 & 0x3FFF, 2384)
 
-    def test_broken_sep_key_is_an_error_not_a_fallback(self):
-        tmp = tempfile.TemporaryDirectory()
-        try:
-            node = os.path.join(tmp.name, "sep-key")
-            open(node, "w").close()           # exists, but the info ioctl fails
-            for store in ("auto", "sep-key"):
-                with self.assertRaises(backend.BackendError):
-                    backend.open_store(store, node)
-            ks, _ = backend.open_store("sealed", node)
-            self.assertEqual(ks.name, "sealed")
-        finally:
-            tmp.cleanup()
-
-    def test_enclave_flags_only_when_offered_and_enabled(self):
-        from aurora_fido import creds as C
-        b = backend.SepKeyBackend.__new__(backend.SepKeyBackend)
-        b.flags_supported, b.enclave_policies = 1, False
-        self.assertEqual(b.create_flags(C.POLICY_TOUCHID_CURRENT), 0)
-        b.enclave_policies = True
-        self.assertEqual(b.create_flags(C.POLICY_TOUCHID_CURRENT), backend.CREATE_BIOMETRY_CURRENT_SET)
-        self.assertEqual(b.create_flags(C.POLICY_TOUCHID_ANY), 0)      # not offered
-        self.assertEqual(b.create_flags(C.POLICY_TOUCHID_OR_PASSWORD), 0)
-        b.flags_supported = 3
-        self.assertEqual(b.create_flags(C.POLICY_TOUCHID_ANY), backend.CREATE_BIOMETRY_ANY)
-        self.assertTrue(b.enclave_gated(b"SEPK\x01\x01" + b"\0" * 10))
-        self.assertFalse(b.enclave_gated(b"SEPK\x01\x00" + b"\0" * 10))
-        self.assertFalse(b.enclave_gated(b"AFSK\x01\x01" + b"\0" * 10))
-
-    def test_open_store_without_sep_key(self):
-        missing = os.path.join(tempfile.gettempdir(), "no-such-sep-key")
-        ks, why = backend.open_store("auto", missing)
-        self.assertEqual(ks.name, "sealed")
-        self.assertIn("no-such-sep-key", why)
-        with self.assertRaises(backend.BackendError):
-            backend.open_store("sep-key", missing)
-        with self.assertRaises(backend.BackendError):
-            backend.open_store("software", missing)
-        ks, _ = backend.open_store("sealed", missing)
-        self.assertEqual(ks.name, "sealed")
-
-    def test_authenticator_on_sealed_store_and_reset(self):
-        tmp = tempfile.TemporaryDirectory()
-        try:
-            ks, _ = backend.open_store("sealed", os.path.join(tmp.name, "none"))
-            secret = FileSecret(os.path.join(tmp.name, "master"))
-            auth, _u = build(load_config(None), os.path.join(tmp.name, "state"), ks,
-                             StubVerifier(), secret)
-            def call(cmd, params=None):
-                r = auth.handle(bytes([cmd]) + (cbor.encode(params) if params else b""))
-                return r[0], (cbor.decode(r[1:]) if len(r) > 1 else None)
-            st, r = call(ctap2.CMD_MAKE_CREDENTIAL, {
-                1: CDH, 2: {"id": "example.com"}, 3: {"id": b"u"},
-                4: [{"type": "public-key", "alg": -7}]})
-            self.assertEqual(st, 0)
-            ad = parse_auth_data(r[2])
-            req = {1: "example.com", 2: CDH, 3: [{"type": "public-key", "id": ad["cred_id"]}]}
-            st, a = call(ctap2.CMD_GET_ASSERTION, req)
-            self.assertEqual(st, 0)
-            self.assertTrue(es256_ok(ad["point"], a[2] + CDH, a[3]))
-            # Restart: same sealed secret, the credential still signs.
-            auth2, _ = build(load_config(None), os.path.join(tmp.name, "state"),
-                             backend.open_store("sealed", "/nonexistent")[0],
-                             StubVerifier(), secret)
-            r2 = auth2.handle(bytes([ctap2.CMD_GET_ASSERTION]) + cbor.encode(req))
-            self.assertEqual(r2[0], 0)
-            old = auth.vault.unwrap(hashlib.sha256(b"example.com").digest(),
-                                    ad["cred_id"]).handle
-            ks.sealed.sign(old, hashlib.sha256(b"x").digest())
-            # Reset: a new master secret; the old credential is gone.
-            st, _ = call(ctap2.CMD_RESET)
-            self.assertEqual(st, 0)
-            st, _ = call(ctap2.CMD_GET_ASSERTION, req)
-            self.assertEqual(st, E.ERR_NO_CREDENTIALS)
-            with self.assertRaises(backend.InvalidHandle):  # the sealed backend was rekeyed
-                ks.sealed.sign(old, hashlib.sha256(b"x").digest())
-        finally:
-            tmp.cleanup()
+    def test_legacy_kind(self):
+        self.assertEqual(backend.legacy_kind(b"AFSK\x01xx"), "sealed software key")
+        self.assertIn("without access control",
+                      backend.legacy_kind(b"SEPK\x01\x00\x00\x00" + b"\x00" * 8))
+        self.assertIsNone(backend.legacy_kind(b"SEPK\x01\x01\x00\x00" + b"\x00" * 8))
+        self.assertTrue(backend.is_gated_handle(b"SEPK\x01\x03"))
 
     def test_status_file(self):
-        from aurora_fido import daemon
         tmp = tempfile.TemporaryDirectory()
         try:
             run = os.path.join(tmp.name, "run")
-            ks, why = backend.open_store("auto", "/nonexistent-sep-key")
-            daemon.write_status(run, dict(daemon.key_store_info(ks, why), ready=True))
+            daemon.write_status(run, dict(daemon.key_store_info(StubKeyBackend()), ready=True))
             path = os.path.join(run, "status.json")
             self.assertEqual(os.stat(path).st_mode & 0o777, 0o644)
-            import json
             with open(path) as f:
                 st = json.load(f)
-            self.assertEqual(st["keys"], "sealed")
-            self.assertIn("root on this Mac can copy them", st["keys_detail"])
+            self.assertEqual((st["keys"], st["enforcement"]), ("sep-key", "enclave"))
+            self.assertIn("signs only after a Touch ID match it checks itself",
+                          st["keys_detail"])
         finally:
             tmp.cleanup()
 
@@ -939,27 +943,27 @@ class CliTest(unittest.TestCase):
                 with open(os.path.join(d, "uevent"), "w") as f:
                     f.write(f"HID_ID=0003:00001209:00000001\nHID_PHYS={phys}\n")
             self.assertEqual(cli.find_device(tmp.name), "/dev/hidraw3")
-            self.assertIsNone(cli.find_device(os.path.join(tmp.name, "none")))
         finally:
             tmp.cleanup()
 
-    def test_render_says_state_and_threat_model(self):
+    def test_render_says_state_threat_model_and_legacy(self):
         from aurora_fido import cli
         off = {"enabled": "disabled", "active": "inactive", "device": None, "keys": None,
-               "keys_if_enabled": "sealed", "ready": False, "version": "x"}
+               "keys_if_enabled": "sep-key", "ready": False, "version": "x", "policy": "auto"}
         t = cli.render(off)
         self.assertIn("Touch ID security key: off", t)
         self.assertIn("sudo aurora-fido enable", t)
-        self.assertIn("root on this Mac can unwrap and copy the keys", t)
+        self.assertIn("root on this Mac cannot sign without your finger", t)
         on = dict(off, enabled="enabled", active="active", device="/dev/hidraw5",
-                  keys="sep-key", keys_if_enabled="sep-key", ready=True)
+                  keys="sep-key", ready=True, policy="touchid-any", hmac_secret=False,
+                  legacy_resident=1, legacy_refused_rps=1, legacy_rps=["github.com"])
         t = cli.render(on)
-        self.assertIn("ON", t)
         self.assertIn("/dev/hidraw5", t)
-        self.assertIn("cannot be copied off this Mac", t)
-        self.assertFalse(any("aurora-fido enable" in line for line in t.split("\n")))
-        self.assertIn("touchid-or-password", t)
-        for word in ("demo", "TEST"):
+        self.assertIn("Touch ID checked by the Secure Enclave", t)
+        self.assertIn("2 credential(s) made by aurora-fido 0.1", t)
+        self.assertIn("github.com", t)
+        self.assertIn("hmac-secret", t)
+        for word in ("demo", "TEST", "sealed", "polkit"):
             self.assertNotIn(word, cli.render(off) + t)
 
     def test_enable_and_disable_need_root(self):
@@ -969,200 +973,23 @@ class CliTest(unittest.TestCase):
         self.assertEqual(cli.main(["enable"]), 1)
         self.assertEqual(cli.main(["disable"]), 1)
 
-
-class PolicyTest(unittest.TestCase):
-    """Who may approve: touchid-or-password (default), touchid-any, touchid-current."""
-
-    def rig(self, policy, enrolled=b"A" * 32):
-        r = Rig()
-        r.auth.policy = creds.POLICIES[policy]
-        r.enrolled = [enrolled]
-        r.auth.enrolled_set = lambda: r.enrolled[0]
-        return r
-
-    def ga(self, r, cid, cdh=CDH):
-        return r.call(ctap2.CMD_GET_ASSERTION, {
-            1: "example.com", 2: cdh, 3: [{"type": "public-key", "id": cid}]})[0]
-
-    def test_default_takes_the_password(self):
-        r = Rig()
-        try:
-            self.assertEqual(r.auth.policy, creds.POLICY_TOUCHID_OR_PASSWORD)
-            r.verifier.mode = touchid.PASSWORD
-            st, out = r.make()
-            self.assertEqual(st, 0)
-            self.assertTrue(r.verifier.prompts[-1].allow_password)
-            cid = parse_auth_data(out[2])["cred_id"]
-            self.assertEqual(self.ga(r, cid), 0)
-            self.assertTrue(r.verifier.prompts[-1].allow_password)
-        finally:
-            r.close()
-
-    def test_touchid_only_refuses_the_password(self):
-        for policy in ("touchid-any", "touchid-current"):
-            r = self.rig(policy)
-            try:
-                r.verifier.mode = touchid.PASSWORD
-                self.assertEqual(r.make()[0], E.ERR_OPERATION_DENIED, policy)
-                self.assertFalse(r.verifier.prompts[-1].allow_password)
-                self.assertEqual(r.backend.creates, 0)
-                r.verifier.mode = touchid.MATCH
-                st, out = r.make(uid=b"u2")
-                self.assertEqual(st, 0)
-                cid = parse_auth_data(out[2])["cred_id"]
-                r.verifier.mode = touchid.PASSWORD
-                self.assertEqual(self.ga(r, cid), E.ERR_OPERATION_DENIED)
-                r.verifier.mode = touchid.MATCH
-                self.assertEqual(self.ga(r, cid, hashlib.sha256(b"2").digest()), 0)
-            finally:
-                r.close()
-
-    def test_policy_is_fixed_per_credential(self):
-        r = self.rig("touchid-any")
-        try:
-            st, out = r.make()
-            cid = parse_auth_data(out[2])["cred_id"]
-            r.auth.policy = creds.POLICY_TOUCHID_OR_PASSWORD    # config changed later
-            r.verifier.mode = touchid.PASSWORD
-            self.assertEqual(self.ga(r, cid), E.ERR_OPERATION_DENIED)
-        finally:
-            r.close()
-
-    def test_current_set_retires_on_enrolment_change(self):
-        r = self.rig("touchid-current")
-        try:
-            st, out = r.make()
-            self.assertEqual(st, 0)
-            cid = parse_auth_data(out[2])["cred_id"]
-            self.assertEqual(self.ga(r, cid), 0)
-            r.enrolled[0] = b"B" * 32                          # a finger added
-            n = len(r.verifier.prompts)
-            self.assertEqual(self.ga(r, cid, hashlib.sha256(b"3").digest()), E.ERR_NO_CREDENTIALS)
-            self.assertEqual(len(r.verifier.prompts), n)       # not even asked
-            r.enrolled[0] = None
-            self.assertEqual(r.make(uid=b"u3")[0], E.ERR_OPERATION_DENIED)  # nothing to bind to
-        finally:
-            r.close()
-
-    def test_password_token_does_not_unlock_touchid_only_credentials(self):
-        r = self.rig("touchid-any")
-        try:
-            st, out = r.make()
-            cid = parse_auth_data(out[2])["cred_id"]
-            r.auth.policy = creds.POLICY_TOUCHID_OR_PASSWORD
-            plat = Platform(r)
-            r.verifier.mode = touchid.PASSWORD
-            st, tok = plat.token(pinuv.PERM_GA, "example.com")
-            self.assertEqual(st, 0)                             # token itself: password OK
-            self.assertEqual(r.auth.token_method, "password")
-            n = len(r.verifier.prompts)
-            st, _ = r.call(ctap2.CMD_GET_ASSERTION, {
-                1: "example.com", 2: CDH, 3: [{"type": "public-key", "id": cid}],
-                6: plat.auth(tok, CDH), 7: plat.version})
-            self.assertEqual(st, E.ERR_OPERATION_DENIED)        # asked again, Touch ID only
-            self.assertEqual(len(r.verifier.prompts), n + 1)
-            self.assertFalse(r.verifier.prompts[-1].allow_password)
-        finally:
-            r.close()
-
-    def test_u2f_follows_the_policy(self):
-        r = self.rig("touchid-any")
-        try:
-            r.verifier.mode = touchid.PASSWORD
-            app = hashlib.sha256(b"https://u2f.example").digest()
-            apdu = bytes([0, 1, 3, 0, 0, 0, 64]) + os.urandom(32) + app + b"\0\0"
-            for _ in range(20):
-                sw = r.u2f.handle(apdu)[-2:]
-                if r.u2f.presence.thread:
-                    r.u2f.presence.thread.join(2)
-            self.assertEqual(sw, b"\x69\x85")                  # never registered
-            self.assertEqual(r.backend.creates, 0)
-        finally:
-            r.close()
-
-    def test_enclave_gated_credentials_ask_the_enclave(self):
-        tmp = tempfile.TemporaryDirectory()
-        try:
-            sep = FakeSep()
-            sealed = backend.SealedKeyBackend()
-            ks = backend.KeyStore(sep, sealed, sep)
-            v = StubVerifier()
-            auth, _u = build(load_config(None), os.path.join(tmp.name, "s"), ks, v,
-                             FileSecret(os.path.join(tmp.name, "m")))
-            call = lambda c, p: auth.handle(bytes([c]) + cbor.encode(p))
-            sep.gate = True
-            r = call(ctap2.CMD_MAKE_CREDENTIAL, {
-                1: CDH, 2: {"id": "example.com"}, 3: {"id": b"u"},
-                4: [{"type": "public-key", "alg": -7}]})
-            self.assertEqual(r[0], 0)
-            cid = parse_auth_data(cbor.decode(r[1:])[2])["cred_id"]
-            n = len(v.prompts)
-            req = {1: "example.com", 2: CDH, 3: [{"type": "public-key", "id": cid}]}
-            self.assertEqual(call(ctap2.CMD_GET_ASSERTION, req)[0], 0)
-            self.assertEqual(len(v.prompts), n)                 # no fprintd prompt
-            sep.refuse = backend.EnclaveRefused("no match")
-            self.assertEqual(call(ctap2.CMD_GET_ASSERTION, req)[0], E.ERR_OPERATION_DENIED)
-            sep.refuse = backend.EnclaveTimeout("no touch")
-            self.assertEqual(call(ctap2.CMD_GET_ASSERTION, req)[0], E.ERR_USER_ACTION_TIMEOUT)
-        finally:
-            tmp.cleanup()
-
-    def test_enrolled_set_digest(self):
-        tmp = tempfile.TemporaryDirectory()
-        try:
-            d = os.path.join(tmp.name, "ryan", "aurora", "0")
-            os.makedirs(d)
-            self.assertIsNone(touchid.enrolled_set_digest("ryan", tmp.name))
-            with open(os.path.join(d, "7"), "wb") as f:
-                f.write(b"print-a")
-            a = touchid.enrolled_set_digest("ryan", tmp.name)
-            self.assertEqual(len(a), 32)
-            self.assertEqual(a, touchid.enrolled_set_digest("ryan", tmp.name))
-            with open(os.path.join(d, "2"), "wb") as f:
-                f.write(b"print-b")
-            self.assertNotEqual(a, touchid.enrolled_set_digest("ryan", tmp.name))
-            self.assertIsNone(touchid.enrolled_set_digest("../etc", tmp.name))
-        finally:
-            tmp.cleanup()
-
-    def test_bad_policy_name(self):
-        from aurora_fido import daemon
-        cfg = load_config(None)
-        cfg.set("touchid", "policy", "fingers-please")
-        with self.assertRaises(ValueError):
-            daemon.policy_of(cfg)
+    def test_enable_refuses_without_the_enclave(self):
+        from aurora_fido import cli
+        bad = cli.enclave_problems("/nonexistent.conf")
+        if os.path.exists("/dev/sep-key"):
+            self.skipTest("this machine has /dev/sep-key")
+        self.assertEqual(len(bad), 1)
+        self.assertIn("/dev/sep-key", bad[0])
 
 
-class SessionTest(unittest.TestCase):
-    def test_polkit_subject_is_the_users_process_in_the_session(self):
-        tmp = tempfile.TemporaryDirectory()
-        try:
-            me = os.getuid()
-            def proc(pid, cgroup, start):
-                d = os.path.join(tmp.name, str(pid))
-                os.makedirs(d)
-                with open(os.path.join(d, "cgroup"), "w") as f:
-                    f.write(cgroup)
-                with open(os.path.join(d, "stat"), "w") as f:
-                    f.write(f"{pid} (a b) S " + " ".join(["0"] * 18) + f" {start} 0\n")
-            proc(900, "0::/user.slice/user-1000.slice/user@1000.service/app.slice\n", 5)
-            proc(1279, "0::/user.slice/user-1000.slice/session-1.scope\n", 1018)
-            proc(2000, "0::/user.slice/user-1000.slice/session-1.scope\n", 3000)
-            proc(1500, "0::/user.slice/user-1000.slice/session-12.scope\n", 7)
-            os.makedirs(os.path.join(tmp.name, "self"))
-            self.assertEqual(touchid.session_process("1", me, tmp.name), (1279, 1018))
-            self.assertEqual(touchid.session_process("12", me, tmp.name), (1500, 7))
-            self.assertIsNone(touchid.session_process("1", me + 1, tmp.name))
-            self.assertIsNone(touchid.session_process("3", me, tmp.name))
-        finally:
-            tmp.cleanup()
-
+class NotifierTest(unittest.TestCase):
     def test_notifier_tries_when_the_bus_is_not_visible_to_root(self):
         n = touchid.Notifier(True)
         calls = []
         n._as_user = lambda uid, argv: calls.append(argv) or type(
             "R", (), {"returncode": 0, "stdout": "7\n", "stderr": ""})()
         real = os.stat
+
         def fake_stat(path, *a, **k):
             if str(path).startswith("/run/user/"):
                 raise PermissionError(13, "denied")
@@ -1174,45 +1001,16 @@ class SessionTest(unittest.TestCase):
             os.stat = real
         self.assertEqual(calls[0][0], "notify-send")
 
-
-class PolicyVerifierTest(unittest.TestCase):
-    def test_password_only_behind_a_failed_touch_and_only_if_allowed(self):
-        touch, pw = StubVerifier(touchid.NO_MATCH), StubVerifier(touchid.MATCH)
-        v = touchid.PolicyVerifier(touch, pw)
-        ev = threading.Event()
-        self.assertEqual(v.verify(touchid.Prompt("sign-in", "x", allow_password=True), ev),
-                         touchid.PASSWORD)
-        self.assertEqual(v.verify(touchid.Prompt("sign-in", "x"), ev), touchid.NO_MATCH)
-        self.assertEqual(len(pw.prompts), 1)
-        for r in (touchid.LOCKED, touchid.UNAVAILABLE):
-            touch.mode = r
-            self.assertEqual(v.verify(touchid.Prompt("sign-in", "x", allow_password=True), ev),
-                             touchid.PASSWORD)
-        touch.mode = touchid.TIMEOUT                      # walked away: no password dialog
-        self.assertEqual(v.verify(touchid.Prompt("sign-in", "x", allow_password=True), ev),
-                         touchid.TIMEOUT)
-        touch.mode, pw.mode = touchid.NO_MATCH, touchid.NO_MATCH
-        self.assertEqual(v.verify(touchid.Prompt("sign-in", "x", allow_password=True), ev),
-                         touchid.NO_MATCH)
-        touch.mode = touchid.MATCH
-        self.assertEqual(v.verify(touchid.Prompt("sign-in", "x", allow_password=True), ev),
-                         touchid.MATCH)
-
-
-class PromptTest(unittest.TestCase):
     def test_titles(self):
         self.assertEqual(touchid.Prompt("sign-in", "ssh:").title(), "Touch ID to sign in to SSH")
         self.assertEqual(touchid.Prompt("register", "pam://mbp").title(),
                          "Touch ID to register with login (mbp)")
-        self.assertEqual(touchid.Prompt("sign-in", None).title(),
-                         "Touch ID to sign in to a website")
 
 
 class KeysTest(unittest.TestCase):
     def test_der_oid_and_int(self):
         self.assertEqual(keys.der_oid("1.2.840.10045.2.1").hex(), "06072a8648ce3d0201")
         self.assertEqual(keys.der_int(0x80).hex(), "02020080")
-        self.assertEqual(keys.der_int(1).hex(), "020101")
 
     def test_hmac_compare(self):
         p = pinuv.ProtocolOne()

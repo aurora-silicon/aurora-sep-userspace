@@ -3,15 +3,25 @@
 
 U2F has no way to wait for the user inside a request: the client repeats the
 request while the authenticator answers "conditions not satisfied" (0x6985).
-So a request that needs the user starts one Touch ID prompt in the
-background and answers 0x6985 until it finishes; a match is then good for one
-operation on that application within 10 seconds. A refused or timed-out
-prompt is not restarted while the client keeps polling; a new ceremony (no
-request for 3 seconds) starts a new prompt.
+So a request that needs the user starts one enclave call in the background
+and answers 0x6985 until it finishes:
+
+- authenticate (enforce presence): the credential's own signature over the
+  request, which the Secure Enclave makes only after a Touch ID match it
+  checked; the client's next poll of the same request gets it.
+- register: an enclave-checked touch with the presence key (enclave.py); the
+  new credential's key signs nothing until it is used.
+
+A refused or timed-out prompt is not restarted while the client keeps
+polling; a new ceremony (no request for 3 seconds) starts a new prompt.
 
 Key handles are credential IDs wrapped for the application parameter (the
-U2F twin of the CTAP2 rpIdHash), at most 255 bytes. Registration uses self
-attestation: a certificate made and signed by the new key itself.
+U2F twin of the CTAP2 rpIdHash), at most 255 bytes. The registration
+signature and its certificate come from a software key this daemon run
+makes (U2F attestation proves nothing about the hardware here; see
+docs/fido.md). "Don't enforce presence" (p1 0x08) is answered without a
+touch and without the UP bit, with a signature that verifies against no
+credential, because the enclave signs only after a match.
 """
 
 import hashlib
@@ -21,9 +31,14 @@ import struct
 import threading
 import time
 
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.asymmetric.utils import Prehashed
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
 from . import keys, touchid
 from .backend import InvalidHandle
-from .creds import ID_MAX_U2F, POLICY_TOUCHID_CURRENT, POLICY_TOUCHID_OR_PASSWORD, Credential
+from .creds import ID_MAX_U2F, Credential
 
 log = logging.getLogger("aurora-fido")
 
@@ -38,6 +53,7 @@ INS_REGISTER = 0x01
 INS_AUTHENTICATE = 0x02
 INS_VERSION = 0x03
 
+# A finished enclave call is handed to the client's next poll within this long.
 GRANT_LIFETIME = 10.0
 NEW_CEREMONY_GAP = 3.0
 
@@ -71,47 +87,50 @@ def parse_apdu(apdu):
     return cla, ins, p1, p2, data
 
 
-class Presence:
-    """The background Touch ID prompt that U2F polls."""
+class Background:
+    """The background enclave call that U2F polls, one request at a time."""
 
-    def __init__(self, verifier, clock=time.monotonic):
-        self.verifier = verifier
+    def __init__(self, clock=time.monotonic):
         self.clock = clock
         self.lock = threading.Lock()
-        self.app = None
+        self.key = None
         self.thread = None
-        self.result = None
+        self.result = None          # (touchid result, value)
         self.result_at = 0.0
         self.last_poll = -1e9
         self.cancel = threading.Event()
 
-    def _run(self, prompt, cancel):
-        r = self.verifier.verify(prompt, cancel)
+    def _run(self, fn, cancel):
+        try:
+            r = fn(cancel)
+        except Exception as e:          # the enclave or the key failed: a refusal
+            log.error("U2F: %s", e)
+            r = (touchid.UNAVAILABLE, None)
         with self.lock:
             self.result, self.result_at = r, self.clock()
 
-    def check(self, app, prompt):
-        """True once (consumed) when a fresh match for app exists; else start or keep waiting."""
+    def poll(self, key, fn):
+        """The value once fn(cancel) matched for key (consumed); else None (start or wait)."""
         with self.lock:
             now = self.clock()
             gap = now - self.last_poll
             self.last_poll = now
             running = self.thread is not None and self.thread.is_alive()
-            granted = self.result == touchid.MATCH or (
-                self.result == touchid.PASSWORD and prompt.allow_password)
-            if self.app == app and granted and now - self.result_at <= GRANT_LIFETIME:
+            if self.key == key and self.result is not None \
+                    and self.result[0] == touchid.MATCH and now - self.result_at <= GRANT_LIFETIME:
+                value = self.result[1]
                 self.result = None
-                return True
+                return value
             if running:
-                return False
-            if self.app == app and self.result is not None and gap < NEW_CEREMONY_GAP:
-                return False          # refused or timed out: no new prompt while polling
-            self.app, self.result = app, None
+                return None
+            if self.key == key and self.result is not None and gap < NEW_CEREMONY_GAP:
+                return None           # refused or timed out: no new prompt while polling
+            self.key, self.result = key, None
             self.cancel = threading.Event()
-            self.thread = threading.Thread(target=self._run, args=(prompt, self.cancel),
-                                           name="u2f-touchid", daemon=True)
+            self.thread = threading.Thread(target=self._run, args=(fn, self.cancel),
+                                           name="u2f-enclave", daemon=True)
             self.thread.start()
-            return False
+            return None
 
     def stop(self):
         self.cancel.set()
@@ -119,8 +138,16 @@ class Presence:
 
 class U2F:
     def __init__(self, auth):
-        self.auth = auth            # the CTAP2 Authenticator: backend, vault, counter
-        self.presence = Presence(auth.verifier)
+        self.auth = auth            # the CTAP2 Authenticator: backend, vault, counter, user
+        self.presence = Background()
+        self._att = ec.generate_private_key(ec.SECP256R1())
+        self._att_point = self._att.public_key().public_bytes(
+            Encoding.X962, PublicFormat.UncompressedPoint)
+        self._att_cert = keys.self_signed_cert(
+            self._att_point, self._att_sign, int.from_bytes(os.urandom(8), "big") >> 1)
+
+    def _att_sign(self, digest):
+        return self._att.sign(digest, ec.ECDSA(Prehashed(hashes.SHA256())))
 
     def handle(self, apdu):
         try:
@@ -146,48 +173,48 @@ class U2F:
             return _sw(SW_WRONG_LENGTH)
         chal, app = data[:32], data[32:]
         a = self.auth
-        if not self.presence.check(app, touchid.Prompt(
-                "register", None, "U2F",
-                allow_password=a.policy == POLICY_TOUCHID_OR_PASSWORD)):
+        prompt = touchid.Prompt("register", None, "U2F")
+        ok = self.presence.poll(("reg", app, chal), lambda cancel: (
+            a.user.verify(prompt, cancel), True))
+        if ok is None:
             return _sw(SW_CONDITIONS_NOT_SATISFIED)
-        bio_set = None
-        if a.policy == POLICY_TOUCHID_CURRENT:
-            bio_set = a.enrolled_set()
-            if bio_set is None:
-                return _sw(SW_CONDITIONS_NOT_SATISFIED)
-        handle, point = a.backend.create(a.policy)
-        cred = Credential(handle, os.urandom(32), 1, a.policy, bio_set)
+        handle, point = a.backend.create(a.flags)
+        cred = Credential(handle, 1, a.policy)
         kh = a.vault.wrap(app, cred, ID_MAX_U2F)
-
-        def sign(digest):
-            return a.backend.sign(handle, digest)
-
-        cert = keys.self_signed_cert(point, sign, int.from_bytes(os.urandom(8), "big") >> 1)
-        sig = sign(hashlib.sha256(b"\x00" + app + chal + kh + point).digest())
+        sig = self._att_sign(hashlib.sha256(b"\x00" + app + chal + kh + point).digest())
         log.info("U2F registration")
-        return _sw(SW_NO_ERROR, b"\x05" + point + bytes([len(kh)]) + kh + cert + sig)
+        return _sw(SW_NO_ERROR, b"\x05" + point + bytes([len(kh)]) + kh + self._att_cert + sig)
 
     def authenticate(self, p1, data):
         if len(data) < 65 or len(data) != 65 + data[64]:
             return _sw(SW_WRONG_LENGTH)
         chal, app, kh = data[:32], data[32:64], data[65:]
         cred = self.auth.vault.unwrap(app, kh)
-        if cred is None:
+        if cred is None or not self.auth._usable(cred, "U2F"):
             return _sw(SW_WRONG_DATA)
-        if cred.policy == POLICY_TOUCHID_CURRENT and cred.bio_set != self.auth.enrolled_set():
-            return _sw(SW_WRONG_DATA)          # the enrolled fingers changed: retired
         if p1 == 0x07:                                  # check-only
             return _sw(SW_CONDITIONS_NOT_SATISFIED)
-        if p1 == 0x03:                                  # enforce user presence
-            if not self.presence.check(app, touchid.Prompt(
-                    "sign-in", None, "U2F", allow_password=cred.allow_password)):
-                return _sw(SW_CONDITIONS_NOT_SATISFIED)
-            up = 0x01
-        elif p1 == 0x08:                                # don't enforce
-            up = 0x00
-        else:
+        if p1 == 0x08:                                  # don't enforce: no enclave signature
+            ctr = struct.pack(">I", self.auth.counter.next())
+            sig = self.auth._probe_sign(app + b"\x00" + ctr + chal)
+            return _sw(SW_NO_ERROR, b"\x00" + ctr + sig)
+        if p1 != 0x03:
             return _sw(SW_WRONG_DATA)
-        ctr = struct.pack(">I", self.auth.counter.next())
-        sig = self.auth.backend.sign(
-            cred.handle, hashlib.sha256(app + bytes([up]) + ctr + chal).digest())
-        return _sw(SW_NO_ERROR, bytes([up]) + ctr + sig)
+        user = self.auth.user
+        prompt = touchid.Prompt("sign-in", None, "U2F")
+
+        def job(cancel):
+            ctr = struct.pack(">I", self.auth.counter.next())
+            try:
+                r, sig = user.sign(cred.handle,
+                                   hashlib.sha256(app + b"\x01" + ctr + chal).digest(),
+                                   prompt, cancel)
+            except InvalidHandle:
+                return touchid.NO_MATCH, None
+            return r, (ctr, sig)
+
+        got = self.presence.poll(("auth", app, chal, kh), job)
+        if got is None:
+            return _sw(SW_CONDITIONS_NOT_SATISFIED)
+        ctr, sig = got
+        return _sw(SW_NO_ERROR, b"\x01" + ctr + sig)

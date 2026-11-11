@@ -154,8 +154,6 @@ jobs:
           sudo modprobe uhid || { sudo apt-get install -y "linux-modules-extra-$(uname -r)" && sudo modprobe uhid; }
           sudo modprobe -a hid-generic hidraw 2>/dev/null || true
           sudo make -C fido check-uhid
-      - name: uhid device on the shipped sealed key store
-        run: sudo KEYS=sealed make -C fido check-uhid
 
   build:
     runs-on: ubuntu-latest
