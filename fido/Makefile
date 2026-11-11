@@ -54,6 +54,7 @@ FORCE:
 check:
 	$(PYTHON) tests/test_ctap.py
 	$(PYTHON) tests/test_agent.py
+	$(PYTHON) tests/test_provider.py
 
 # As root: the real uhid device with libfido2, OpenSSH, pam_u2f, cryptenroll.
 check-uhid:
