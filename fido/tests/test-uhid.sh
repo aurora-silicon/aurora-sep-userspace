@@ -2,14 +2,15 @@
 # shellcheck disable=SC2015 # ok/no always succeed
 # SPDX-License-Identifier: MIT
 # End to end through a real /dev/uhid device with libfido2's tools, OpenSSH
-# and (when installed) pam_u2f and systemd-cryptenroll. Software keys and a
-# scripted Touch ID from tests/stub.py stand in for the Secure Enclave and
-# fprintd. Needs root and the uhid module.
+# and (when installed) pam_u2f and systemd-cryptenroll. Software keys with a
+# scripted enclave touch from tests/stub.py stand in for the Secure Enclave.
+# Needs root and the uhid module.
 #
 #   sudo tests/test-uhid.sh            all checks
 #   sudo KEEP=1 tests/test-uhid.sh     keep the work dir for a look afterwards
-#   sudo KEYS=sealed tests/test-uhid.sh  the shipped sealed key store
-#   sudo KEYS=sep tests/test-uhid.sh   keys in the Secure Enclave (/dev/sep-key)
+#   sudo KEYS=sep tests/test-uhid.sh   keys in the Secure Enclave (/dev/sep-key):
+#                                      every step needs a real finger, and the
+#                                      refusal steps need you NOT to touch
 set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 work=$(mktemp -d "${TMPDIR:-/var/tmp}/aurora-fido-uhid.XXXXXX")
@@ -74,9 +75,14 @@ start match && ok "device appears in fido2-token -L: $dev" || { no "no device"; 
 
 info=$(fido2-token -I "$dev" 2>&1)
 echo "$info" | sed 's/^/    /'
-for want in "FIDO_2_1" "U2F_V2" "credMgmt" "uv" "rk" "pinUvAuthToken" "hmac-secret" "credProtect" "es256"; do
+for want in "FIDO_2_1" "U2F_V2" "credMgmt" "uv" "rk" "pinUvAuthToken" "credProtect" "es256"; do
 	grep -q -- "$want" <<<"$info" && ok "getInfo lists $want" || no "getInfo lacks $want"
 done
+hmac=yes
+if ! grep -q -- "hmac-secret" <<<"$info"; then
+	[ "${KEYS:-stub}" = sep ] && { hmac=; sk "hmac-secret not offered (kernel cannot seal to enclave keys)"; } ||
+		no "getInfo lacks hmac-secret"
+fi
 grep -q -- "clientPin" <<<"$info" && no "getInfo claims a PIN" || ok "no PIN offered"
 
 # makeCredential + verify (packed self attestation), getAssertion + verify.
@@ -108,7 +114,9 @@ fido2-assert -G -i "$work/as2.in" -o /dev/null "$dev" 2>"$work/err" &&
 
 # hmac-secret (what systemd-cryptenroll uses).
 printf '%s\n%s\n%s\n%s\n' "$cdh" "hmac.example" "ryan" "$uid" >"$work/hcred.in"
-if fido2-cred -M -h -i "$work/hcred.in" -o "$work/hcred.out" "$dev" es256 2>"$work/err"; then
+if [ -z "$hmac" ]; then
+	:
+elif fido2-cred -M -h -i "$work/hcred.in" -o "$work/hcred.out" "$dev" es256 2>"$work/err"; then
 	salt=$(head -c32 /dev/urandom | b64)
 	printf '%s\n%s\n%s\n%s\n' "$cdh2" "hmac.example" "$(sed -n 5p "$work/hcred.out")" "$salt" >"$work/has.in"
 	h1=$(fido2-assert -G -h -i "$work/has.in" "$dev" 2>/dev/null | tail -1)
@@ -182,7 +190,9 @@ else
 fi
 
 # systemd-cryptenroll on a LUKS2 loop file.
-if command -v systemd-cryptenroll >/dev/null && command -v cryptsetup >/dev/null && command -v losetup >/dev/null; then
+if [ -z "$hmac" ]; then
+	sk "systemd-cryptenroll: no hmac-secret"
+elif command -v systemd-cryptenroll >/dev/null && command -v cryptsetup >/dev/null && command -v losetup >/dev/null; then
 	truncate -s 32M "$work/luks.img"
 	echo -n "test-passphrase" >"$work/pass"
 	if cryptsetup luksFormat -q --type luks2 --pbkdf pbkdf2 --pbkdf-force-iterations 1000 \
@@ -230,23 +240,16 @@ fido2-assert -G -p -i "$work/as.in" -o /dev/null "$dev" 2>"$work/err" &&
 		ok "replay of a refused request: refused again without a Touch ID prompt" ||
 		no "replay of a refused request asked Touch ID again"
 }
-# Touch ID failed, the password was accepted: fine for the default policy
-# (the credential above was made under it), refused for a Touch ID only one.
-start password || no "restart with a password answer"
-cdh3=$(head -c32 /dev/urandom | b64)
-printf '%s\n%s\n%s\n' "$cdh3" "fido.example" "$credid" >"$work/as3.in"
-fido2-assert -G -p -i "$work/as3.in" -o /dev/null "$dev" 2>"$work/err" &&
-	ok "touchid-or-password credential: the password approves it" || no "password: $(cat "$work/err")"
-printf '[touchid]\npolicy = touchid-any\n' >"$work/strict.conf"
-start match --config "$work/strict.conf" || no "restart with touchid-any"
-printf '%s\n%s\n%s\n%s\n' "$cdh" "strict.example" "ryan" "$uid" >"$work/strict.in"
-fido2-cred -M -i "$work/strict.in" -o "$work/strict.out" "$dev" es256 2>"$work/err" &&
-	ok "touchid-any credential made with Touch ID" || no "strict make: $(cat "$work/err")"
-start password --config "$work/strict.conf" || no "restart (touchid-any, password answer)"
-printf '%s\n%s\n%s\n' "$cdh3" "strict.example" "$(sed -n 5p "$work/strict.out")" >"$work/strict-as.in"
-fido2-assert -G -p -i "$work/strict-as.in" -o /dev/null "$dev" 2>"$work/err" &&
-	no "touchid-any credential approved by password" ||
-	ok "touchid-any credential: the password is refused ($(tail -1 "$work/err"))"
+# A policy the enclave cannot enforce is refused, never weakened.
+printf '[touchid]\npolicy = touchid-or-password\n' >"$work/pw.conf"
+if python3 "$here/run-stub-daemon.py" --state-dir "$work/state" --keys "${KEYS:-stub}" \
+	--config "$work/pw.conf" >"$work/pw.log" 2>&1 & p2=$!; sleep 3; kill -0 $p2 2>/dev/null; then
+	kill $p2; wait $p2 2>/dev/null
+	no "touchid-or-password started without an enclave password check"
+else
+	grep -q "root approve without you" "$work/pw.log" && ok "touchid-or-password refused: $(grep -m1 -o 'needs the Secure Enclave[^.]*' "$work/pw.log")" ||
+		no "touchid-or-password: $(tail -2 "$work/pw.log")"
+fi
 start timeout || no "restart with a timing-out Touch ID"
 fido2-assert -G -p -i "$work/as.in" -o /dev/null "$dev" 2>"$work/err" &&
 	no "assertion after a timeout" || {

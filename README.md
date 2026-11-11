@@ -96,14 +96,12 @@ device through `/dev/uhid` and speaks CTAP 2.1 and CTAP1/U2F, for WebAuthn and
 passkeys in Firefox and Chromium, SSH `ecdsa-sk` keys, pam_u2f and
 `systemd-cryptenroll --fido2-device`. It is opt in: installed off, turned on
 with `sudo aurora-fido enable` and off with `sudo aurora-fido disable`;
-`aurora-fido status` says which key store it uses. Credentials are P-256 keys
-inside the Secure Enclave (`/dev/sep-key`) when the kernel has it, and keys
-sealed by the Secure Enclave otherwise (root on the Mac can copy those; the
-status line says so). Every operation that needs the user asks for a Touch ID
-match through fprintd. Attestation is self or none: nothing here can prove
-Apple hardware to a website. Until the enclave itself enforces a biometric
-access control on the keys, the touch is checked by the daemon in software,
-so root can sign without one. See [docs/fido.md](docs/fido.md).
+Credentials are P-256 keys inside the Secure Enclave (`/dev/sep-key`), made
+with a biometric access-control list the enclave enforces: the enclave
+signs only after a Touch ID match it checked itself, so root on the Mac
+cannot sign without a finger. Without `/dev/sep-key` and those access
+controls, `aurora-fido enable` refuses. Attestation is self or none: nothing
+here can prove Apple hardware to a website. See [docs/fido.md](docs/fido.md).
 
     make -C fido && sudo make -C fido install && sudo aurora-fido enable
     make -C fido check                 # unit tests, software stand-ins

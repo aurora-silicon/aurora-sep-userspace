@@ -3,9 +3,9 @@
 Description=Touch ID security key (FIDO2/U2F)
 Documentation=file:///usr/share/doc/aurora-fido/fido.md
 # Opt in: installed disabled. `aurora-fido enable` turns it on, `aurora-fido
-# disable` off. Keys go into the Secure Enclave through /dev/sep-key when the
-# kernel has it, otherwise they are sealed by it (aurora-fido status says which).
-After=aurora-sep.service dbus.service systemd-logind.service fprintd.service
+# disable` off. Keys live in the Secure Enclave (/dev/sep-key), which checks
+# the Touch ID match inside each signature; without it the service does not start.
+After=aurora-sep.service dbus.service systemd-logind.service
 Wants=aurora-sep.service
 
 [Service]

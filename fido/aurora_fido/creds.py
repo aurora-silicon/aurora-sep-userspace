@@ -14,8 +14,10 @@ Credential ID, version 1 (every credential, resident or not):
   0x01 | kind | nonce[12] | AES-256-GCM(cred, nonce, payload, aad) (ct || tag)
   aad = "aurora-fido/cred/1" | kind | rpIdHash
 
-  kind 0x00: payload is CBOR {1: key handle, 2: seed[32], 3: credProtect,
-             4: policy (absent = 0), 6: enrolled-set digest[32] (policy 2)}
+  kind 0x00: payload is CBOR {1: key handle, 3: credProtect, 4: policy,
+             7: hmac-secret CredRandom pair sealed to the key by the enclave}
+             (aurora-fido 0.1 also wrote 2: seed[32] and 6: an enrolled-set
+             digest; such credentials are legacy and refused)
   kind 0x01: payload is CBOR {5: ref[16]}, and the kind-0 payload lives in
              handles/<ref>, wrapped with the same key; used when the key
              handle would make the ID longer than the protocol allows
@@ -23,11 +25,12 @@ Credential ID, version 1 (every credential, resident or not):
 
 The rpIdHash in the additional data binds an ID to its relying party: an ID
 presented for any other RP fails authentication and is treated as unknown.
-The seed is the per-credential secret for hmac-secret.
+Nothing in an ID is a secret the host can use: the key handle signs only with
+a Touch ID match the enclave checks, and the hmac-secret CredRandom pair is
+sealed to that key and released by the enclave only with such a signature.
 """
 
 import hashlib
-import hmac
 import os
 import secrets
 import time
@@ -68,35 +71,32 @@ def atomic_write(path, data, mode=0o600):
 
 
 # Who may approve a credential's use, fixed when it is made (like a macOS
-# key's access control): config [touchid] policy.
-POLICY_TOUCHID_OR_PASSWORD = 0   # Touch ID, or the user's password (macOS .userPresence)
+# key's access control): config [touchid] policy. Each one is an access-control
+# list the Secure Enclave enforces; the kernel CREATE flag is named next to it.
+POLICY_TOUCHID_OR_PASSWORD = 0   # Touch ID, or the user's password checked by the
+                                 # enclave (.userPresence, SEP_KEY_CREATE_USER_PRESENCE)
 POLICY_TOUCHID_ANY = 1           # Touch ID only, any enrolled finger (.biometryAny)
-POLICY_TOUCHID_CURRENT = 2       # Touch ID only, and only the fingers enrolled now
+POLICY_TOUCHID_CURRENT = 2       # Touch ID only, the fingers enrolled now
                                  # (.biometryCurrentSet): an enrolment change retires it
 POLICIES = {"touchid-or-password": POLICY_TOUCHID_OR_PASSWORD,
             "touchid-any": POLICY_TOUCHID_ANY,
             "touchid-current": POLICY_TOUCHID_CURRENT}
 POLICY_NAMES = {v: k for k, v in POLICIES.items()}
+# SEP_KEY_CREATE_* flag for each policy (include/uapi/linux/apple-sep.h).
+POLICY_FLAGS = {POLICY_TOUCHID_OR_PASSWORD: 0x4, POLICY_TOUCHID_ANY: 0x2,
+                POLICY_TOUCHID_CURRENT: 0x1}
 
 
 class Credential:
     """What a credential ID opens to."""
 
-    def __init__(self, handle, seed, cred_protect=1, policy=POLICY_TOUCHID_OR_PASSWORD,
-                 bio_set=None):
+    def __init__(self, handle, cred_protect=1, policy=POLICY_TOUCHID_ANY, sealed=None,
+                 legacy=None):
         self.handle = handle
-        self.seed = seed
         self.cred_protect = cred_protect
         self.policy = policy
-        self.bio_set = bio_set
-
-    @property
-    def allow_password(self):
-        return self.policy == POLICY_TOUCHID_OR_PASSWORD
-
-    def cred_random(self, uv):
-        """hmac-secret CredRandom: separate values with and without UV."""
-        return hmac.new(self.seed, b"uv" if uv else b"no-uv", hashlib.sha256).digest()
+        self.sealed = sealed        # hmac-secret CredRandom pair, sealed to the key
+        self.legacy = legacy        # why this credential is refused, or None
 
 
 class Vault:
@@ -121,11 +121,9 @@ class Vault:
         return bytes([CRED_VERSION, kind]) + nonce + ct
 
     def wrap(self, rp_id_hash, cred, max_len=ID_MAX_CTAP2):
-        payload = {1: cred.handle, 2: cred.seed, 3: cred.cred_protect}
-        if cred.policy:
-            payload[4] = cred.policy
-        if cred.bio_set is not None:
-            payload[6] = cred.bio_set
+        payload = {1: cred.handle, 3: cred.cred_protect, 4: cred.policy}
+        if cred.sealed is not None:
+            payload[7] = cred.sealed
         cid = self._seal(KIND_INLINE, rp_id_hash, payload)
         if len(cid) <= max_len:
             return cid
@@ -163,14 +161,18 @@ class Vault:
             p = self._open(KIND_INLINE, rp_id_hash, cred_id)
         if not p:
             return None
-        h, s, cp = p.get(1), p.get(2), p.get(3, 1)
-        pol, bio = p.get(4, POLICY_TOUCHID_OR_PASSWORD), p.get(6)
-        if not (isinstance(h, bytes) and isinstance(s, bytes) and len(s) == 32
-                and cp in (1, 2, 3) and pol in POLICY_NAMES):
+        h, cp = p.get(1), p.get(3, 1)
+        pol, sealed = p.get(4, POLICY_TOUCHID_OR_PASSWORD), p.get(7)
+        if not (isinstance(h, bytes) and cp in (1, 2, 3) and pol in POLICY_NAMES):
             return None
-        if pol == POLICY_TOUCHID_CURRENT and not (isinstance(bio, bytes) and len(bio) == 32):
+        if sealed is not None and not isinstance(sealed, bytes):
             return None
-        return Credential(h, s, cp, pol, bio if pol == POLICY_TOUCHID_CURRENT else None)
+        legacy = None
+        if 2 in p:
+            legacy = "made by aurora-fido 0.1, when the touch was checked outside the enclave"
+        elif h[:4] == b"AFSK":
+            legacy = "a sealed software key of aurora-fido 0.1"
+        return Credential(h, cp, pol, sealed, legacy)
 
     def seal_record(self, record):
         nonce = secrets.token_bytes(12)
@@ -257,7 +259,12 @@ class ResidentStore:
 
 
 class Counter:
-    """One global signature counter, kept by the host (not by the SEP)."""
+    """One global signature counter, kept by the host (not by the SEP).
+
+    Root can rewind it. It is kept because relying parties already saw it
+    grow; clone detection, its purpose, has nothing to detect here: enclave
+    keys cannot be copied.
+    """
 
     def __init__(self, state_dir):
         self.path = os.path.join(state_dir, "counter")

@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: MIT
 """PIN/UV auth protocols 1 and 2 (CTAP 2.1 section 6.5.6 and 6.5.7), authenticator side.
 
-There is no PIN. The protocols exist here because CTAP 2.1 routes built-in
-user verification (Touch ID) through a pinUvAuthToken
-(getPinUvAuthTokenUsingUvWithPermissions), credential management needs that
-token, and hmac-secret uses the same key agreement.
+There is no PIN (docs/fido.md says why). The protocols exist here because
+CTAP 2.1 routes built-in user verification (Touch ID) through a
+pinUvAuthToken (getPinUvAuthTokenUsingUvWithPermissions), credential
+management needs that token, and hmac-secret uses the same key agreement.
+The token is only a session object: the user verification that relying
+parties see is always an enclave-checked touch at the signature itself.
 """
 
 import hashlib
@@ -141,13 +143,15 @@ class Token:
         self.user_present = False
         self.started = 0.0
 
-    def begin(self, permissions, rp_id):
+    def begin(self, permissions, rp_id, verified=True):
+        """verified=False: a token for makeCredential/getAssertion only; the
+        enclave's touch at each signature is the user verification."""
         self.reset()
         self.in_use = True
         self.permissions = permissions
         self.rp_id = rp_id
-        self.user_verified = True
-        self.user_present = True
+        self.user_verified = verified
+        self.user_present = verified
         self.started = self.clock()
 
     def expired(self):

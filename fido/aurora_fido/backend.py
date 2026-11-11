@@ -1,49 +1,36 @@
 # SPDX-License-Identifier: MIT
-"""Where credential private keys live.
+"""Credential keys in the Secure Enclave, with the touch checked by the enclave.
 
-A KeyBackend creates P-256 keys and signs SHA-256 digests with them. The
-daemon only ever holds an opaque key handle; what the handle means is the
-backend's business.
+Every credential key is a P-256 key the Secure Enclave makes through
+/dev/sep-key (drivers/soc/apple/key.rs). It is created with a biometric
+access-control list that the enclave itself enforces: a signature needs a
+credential context in which the enclave saw a Touch ID match, and the kernel
+makes that context, runs the match and signs inside one SIGN call. The daemon
+holds only the handle; it never decides that a touch happened, and neither
+does anything else on the host. Root can make the enclave sign only by
+getting a finger on the sensor.
 
-Two backends ship, and KeyStore puts them together:
+There is no other key store. A kernel without /dev/sep-key, or one whose
+/dev/sep-key cannot create keys with the access-control list a policy needs,
+is refused (BackendError) instead of falling back to keys the host can use.
 
-SepKeyBackend: /dev/sep-key from the apple_sep driver, where the private half
-is an enclave ref-key that never leaves this Mac's Secure Enclave. The handle
-is the kernel's "SEPK" header plus the wrapped ref-key record; it is useless
-on any other Mac or any other Linux install on this one. The ioctl layout
-follows the apple_sep key interface, versions 1 and 2 (drivers/soc/apple/
-key.rs; version 2 only adds a create flag this daemon does not set). If the
-kernel reports another version the backend refuses to start instead of
-guessing.
+Handles made before this rule (software keys sealed under the master secret,
+"AFSK", and enclave keys without an access-control list) are "legacy": the
+daemon refuses them and asks for the credential to be registered again.
 
-SealedKeyBackend: for kernels without /dev/sep-key. P-256 keys made by the
-daemon, whose private scalar is AES-256-GCM wrapped under a key derived from
-the master secret that this Mac's Secure Enclave seals. A copy of the disk is
-useless elsewhere, but the private key is in the daemon's memory while it
-signs, so root on this Mac can take a key away. docs/fido.md has the threat
-model; `aurora-fido status` says which store is in use.
+Interface versions: 2 (biometric CREATE flags) and 3 (adds CANCEL for a
+waiting SIGN or UNSEAL, and SEAL / UNSEAL: a secret sealed to a credential
+key that the enclave releases only after a Touch ID match it checked, like a
+signature; used for hmac-secret).
 
-New credentials go to the Secure Enclave whenever /dev/sep-key works; a
-credential made earlier with a sealed key keeps working, since KeyStore picks
-the backend from the handle's magic.
-
-Tests also use a software backend from tests/stub.py. It is not installed and
-the daemon cannot select it.
+Tests use a software backend from tests/stub.py. It is not installed and the
+daemon cannot select it.
 """
 
 import errno
 import fcntl
 import os
-import secrets
 import struct
-
-from cryptography.exceptions import InvalidTag
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.asymmetric import ec
-from cryptography.hazmat.primitives.asymmetric.utils import Prehashed
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 # Linux value; also defined here so the module imports on other systems.
 EKEYREJECTED = getattr(errno, "EKEYREJECTED", 129)
@@ -56,37 +43,52 @@ class BackendError(Exception):
 
 
 class InvalidHandle(BackendError):
-    """The handle is not one this backend (this enclave) can use."""
+    """The handle is not one this enclave can use."""
 
 
 class EnclaveRefused(BackendError):
-    """An enclave-gated key: the Secure Enclave's own Touch ID check did not match."""
+    """The enclave's own Touch ID check did not match (or Touch ID is locked out)."""
 
 
 class EnclaveTimeout(BackendError):
-    """An enclave-gated key: no finger within the enclave's wait."""
+    """No finger within the enclave's wait."""
+
+
+class EnclaveCancelled(BackendError):
+    """The waiting signature was cancelled (SEP_KEY_CANCEL)."""
 
 
 class KeyBackend:
     name = "abstract"
-    #: True when the private key cannot be read by anything on the host.
-    non_extractable = False
+    #: CREATE flags this backend offers (SEP_KEY_CREATE_*).
+    flags_supported = 0
+    #: SEAL / UNSEAL: secrets the enclave releases only after a match.
+    can_unseal = False
+    #: CANCEL: a waiting signature can be ended.
+    can_cancel = False
 
-    def create(self, policy=0):
-        """Return (handle: bytes, public_point: 65-byte uncompressed P-256).
-
-        policy: the credential's creds.POLICY_*; only a backend that can
-        have the Secure Enclave enforce it looks at it.
-        """
+    def create(self, flags):
+        """Return (handle: bytes, public_point: 65-byte uncompressed P-256)."""
         raise NotImplementedError
 
-    def enclave_gated(self, handle):
-        """True when signing with handle makes the enclave ask for Touch ID itself."""
+    def gated(self, handle):
+        """True when the enclave asks for Touch ID itself to sign with handle."""
         return False
 
     def sign(self, handle, digest):
-        """Return a DER ECDSA-Sig-Value over the 32-byte digest."""
+        """DER ECDSA-Sig-Value over the 32-byte digest, waiting for a touch."""
         raise NotImplementedError
+
+    def seal(self, handle, secret):
+        """secret (<= 64 bytes) sealed to handle's key (no touch: sealing is public-key)."""
+        raise BackendError("this kernel cannot seal secrets to a credential key")
+
+    def unseal(self, handle, sealed):
+        """The secret seal() sealed, released by the enclave after a match (waits)."""
+        raise BackendError("this kernel cannot unseal secrets")
+
+    def cancel(self):
+        """End a sign() that is waiting for a touch, if the kernel can."""
 
     def public(self, handle):
         raise NotImplementedError
@@ -96,36 +98,66 @@ def _ioc(direction, magic, nr, size):
     return direction << 30 | size << 16 | magic << 8 | nr
 
 
-_IOC_WRITE, _IOC_READ = 1, 2
+_IOC_NONE, _IOC_WRITE, _IOC_READ = 0, 1, 2
 _MAGIC = 0xB1
 _HANDLE_MAX = 2048
 _SIG_MAX = 72
+_SECRET_MAX = 64
+_SEALED_MAX = 256
 _INFO = struct.Struct("<IIII")                                    # 16
 _CREATE = struct.Struct(f"<II{PUB_LEN}s3s{_HANDLE_MAX}s")          # 2124
 _SIGN = struct.Struct(f"<II{DIGEST_LEN}sI{_SIG_MAX}s{_HANDLE_MAX}s")  # 2164
 _PUBLIC = _CREATE
+# struct sep_key_seal, for SEAL (secret in, sealed out) and UNSEAL (sealed in,
+# secret out): flags, handle_len, secret_len, sealed_len, secret, sealed, handle
+_SEAL = struct.Struct(f"<IIII{_SECRET_MAX}s{_SEALED_MAX}s{_HANDLE_MAX}s")    # 2384
 
 IOC_INFO = _ioc(_IOC_READ, _MAGIC, 0x20, _INFO.size)
 IOC_CREATE = _ioc(_IOC_READ | _IOC_WRITE, _MAGIC, 0x21, _CREATE.size)
 IOC_SIGN = _ioc(_IOC_READ | _IOC_WRITE, _MAGIC, 0x22, _SIGN.size)
 IOC_PUBLIC = _ioc(_IOC_READ | _IOC_WRITE, _MAGIC, 0x23, _PUBLIC.size)
-IFACE_VERSIONS = (1, 2)
-# CREATE flags. Version 2 has BIOMETRY_CURRENT_SET; the others are the names
-# proposed to lane SEPKEY (11-08) for the macOS-matching policies and are
-# used only if the kernel lists them in INFO flags_supported.
+IOC_CANCEL = _ioc(_IOC_NONE, _MAGIC, 0x25, 0)
+IOC_SEAL = _ioc(_IOC_READ | _IOC_WRITE, _MAGIC, 0x26, _SEAL.size)
+IOC_UNSEAL = _ioc(_IOC_READ | _IOC_WRITE, _MAGIC, 0x27, _SEAL.size)
+IFACE_VERSIONS = (2, 3)
+# CREATE flags (include/uapi/linux/apple-sep.h).
 CREATE_BIOMETRY_CURRENT_SET = 0x1     # .biometryCurrentSet
-CREATE_BIOMETRY_ANY = 0x2             # .biometryAny (proposed)
+CREATE_BIOMETRY_ANY = 0x2             # .biometryAny
+CREATE_USER_PRESENCE = 0x4            # .userPresence (Touch ID or the user's password)
+# INFO features (version 3; the 'reserved' word of version 2).
+FEATURE_CANCEL = 0x1
+FEATURE_SEAL = 0x2
 HANDLE_FLAG_BIOMETRY = 0x01           # handle byte 5: the record carries a biometric ACL
 SEP_MAGIC = b"SEPK"
+LEGACY_SEALED_MAGIC = b"AFSK"         # software keys of aurora-fido 0.1 (removed)
 
 assert (_INFO.size, _CREATE.size, _SIGN.size) == (16, 2124, 2164)
+assert _SEAL.size == 2384
+
+
+def is_gated_handle(handle):
+    """A /dev/sep-key handle whose record carries a biometric access-control list."""
+    return (isinstance(handle, bytes) and handle[:4] == SEP_MAGIC and len(handle) > 5
+            and bool(handle[5] & HANDLE_FLAG_BIOMETRY))
+
+
+def legacy_kind(handle):
+    """Why a handle is legacy ("sealed", "sep-key without access control"), or None."""
+    if not isinstance(handle, bytes):
+        return "unknown"
+    if handle[:4] == LEGACY_SEALED_MAGIC:
+        return "sealed software key"
+    if handle[:4] == SEP_MAGIC and not is_gated_handle(handle):
+        return "Secure Enclave key without access control"
+    if handle[:4] != SEP_MAGIC:
+        return "unknown"
+    return None
 
 
 class SepKeyBackend(KeyBackend):
     """P-256 keys inside the Secure Enclave, through /dev/sep-key."""
 
     name = "sep-key"
-    non_extractable = True
 
     def __init__(self, path="/dev/sep-key"):
         try:
@@ -139,47 +171,52 @@ class SepKeyBackend(KeyBackend):
         except OSError as e:
             os.close(self.fd)
             raise BackendError(f"{path}: info ioctl failed: {e.strerror}") from e
-        version, flags_supported, handle_max, _ = _INFO.unpack(buf)
-        self.flags_supported = flags_supported if version >= 2 else 0
-        self.enclave_policies = False     # config [keys] enclave_policy
+        version, flags_supported, handle_max, features = _INFO.unpack(buf)
         if version not in IFACE_VERSIONS:
             os.close(self.fd)
-            raise BackendError(f"{path}: interface version {version}, this daemon "
-                               f"speaks {', '.join(map(str, IFACE_VERSIONS))}")
+            raise BackendError(
+                f"{path}: interface version {version}; enclave-checked Touch ID needs "
+                f"version {' or '.join(map(str, IFACE_VERSIONS))} (linux#1196 or newer)")
         self.version = version
+        self.flags_supported = flags_supported
+        self.features = features if version >= 3 else 0
+        self.can_cancel = bool(self.features & FEATURE_CANCEL)
+        self.can_unseal = bool(self.features & FEATURE_SEAL)
         self.handle_max = min(handle_max, _HANDLE_MAX)
+
+    @staticmethod
+    def _error(e):
+        if e.errno in (errno.EINVAL, EKEYREJECTED):
+            return InvalidHandle(e.strerror)
+        if e.errno == errno.EACCES:
+            return EnclaveRefused("no Touch ID match")
+        if e.errno == errno.ETIMEDOUT:
+            return EnclaveTimeout("no touch")
+        if e.errno == errno.ECANCELED:
+            return EnclaveCancelled("cancelled")
+        return BackendError(e.strerror)
 
     def _call(self, req, buf):
         try:
             fcntl.ioctl(self.fd, req, buf, True)
         except OSError as e:
-            if e.errno in (errno.EINVAL, EKEYREJECTED):
-                raise InvalidHandle(e.strerror) from e
-            if e.errno == errno.EACCES:
-                raise EnclaveRefused("no Touch ID match") from e
-            if e.errno == errno.ETIMEDOUT:
-                raise EnclaveTimeout("no touch") from e
-            raise BackendError(e.strerror) from e
+            raise self._error(e) from e
 
-    def create_flags(self, policy):
-        """The CREATE flag that has the enclave enforce policy, or 0 (daemon checks it)."""
-        from .creds import POLICY_TOUCHID_ANY, POLICY_TOUCHID_CURRENT
-        want = {POLICY_TOUCHID_CURRENT: CREATE_BIOMETRY_CURRENT_SET,
-                POLICY_TOUCHID_ANY: CREATE_BIOMETRY_ANY}.get(policy, 0)
-        if self.enclave_policies and want and self.flags_supported & want == want:
-            return want
-        return 0
+    def gated(self, handle):
+        return is_gated_handle(handle)
 
-    def enclave_gated(self, handle):
-        return handle[:4] == SEP_MAGIC and len(handle) > 5 and bool(handle[5] & HANDLE_FLAG_BIOMETRY)
-
-    def create(self, policy=0):
-        buf = bytearray(_CREATE.pack(self.create_flags(policy), 0, b"", b"", b""))
+    def create(self, flags):
+        if not flags or self.flags_supported & flags != flags:
+            raise BackendError(f"/dev/sep-key cannot create keys with flags 0x{flags:x}")
+        buf = bytearray(_CREATE.pack(flags, 0, b"", b"", b""))
         self._call(IOC_CREATE, buf)
         _f, n, point, _r, handle = _CREATE.unpack(buf)
         if not 0 < n <= self.handle_max or point[0] != 4:
             raise BackendError("malformed create reply")
-        return handle[:n], point
+        handle = handle[:n]
+        if not is_gated_handle(handle):
+            raise BackendError("the kernel made a key without the access-control list asked for")
+        return handle, point
 
     def _check(self, handle):
         if not 0 < len(handle) <= self.handle_max:
@@ -196,6 +233,40 @@ class SepKeyBackend(KeyBackend):
             raise BackendError("malformed sign reply")
         return sig[:sig_len]
 
+    def unseal(self, handle, sealed):
+        self._check(handle)
+        if not self.can_unseal:
+            raise BackendError("this kernel cannot unseal secrets")
+        if not 0 < len(sealed) <= _SEALED_MAX:
+            raise InvalidHandle("sealed secret length")
+        buf = bytearray(_SEAL.pack(0, len(handle), 0, len(sealed), b"", sealed, handle))
+        self._call(IOC_UNSEAL, buf)
+        _f, _n, secret_len, _sl, secret, _s, _h = _SEAL.unpack(buf)
+        if not 0 < secret_len <= _SECRET_MAX:
+            raise BackendError("malformed unseal reply")
+        return secret[:secret_len]
+
+    def seal(self, handle, secret):
+        self._check(handle)
+        if not self.can_unseal:
+            raise BackendError("this kernel cannot seal secrets to a credential key")
+        if not 0 < len(secret) <= _SECRET_MAX:
+            raise ValueError("secret length")
+        buf = bytearray(_SEAL.pack(0, len(handle), len(secret), 0, secret, b"", handle))
+        self._call(IOC_SEAL, buf)
+        _f, _n, _sl, sealed_len, _s, sealed, _h = _SEAL.unpack(buf)
+        if not 0 < sealed_len <= _SEALED_MAX:
+            raise BackendError("malformed seal reply")
+        return sealed[:sealed_len]
+
+    def cancel(self):
+        if not self.can_cancel:
+            return
+        try:
+            fcntl.ioctl(self.fd, IOC_CANCEL, 0)
+        except OSError:
+            pass
+
     def public(self, handle):
         self._check(handle)
         buf = bytearray(_PUBLIC.pack(0, len(handle), b"", b"", handle))
@@ -203,138 +274,25 @@ class SepKeyBackend(KeyBackend):
         return _PUBLIC.unpack(buf)[2]
 
 
-SEALED_MAGIC = b"AFSK"
-_SEALED_VERSION = 1
-_SEALED_AAD = SEALED_MAGIC + bytes([_SEALED_VERSION])
-_SEALED_LEN = 4 + 1 + 12 + 32 + 16
+STORES = ("auto", "sep-key")
 
 
-class SealedKeyBackend(KeyBackend):
-    """P-256 keys wrapped under a key derived from the SEP-sealed master secret.
+def open_backend(store="auto", sep_path="/dev/sep-key"):
+    """The Secure Enclave key backend, or BackendError saying why there is none.
 
-    Handle: "AFSK" | 0x01 | nonce[12] | AES-256-GCM(k, nonce, scalar[32],
-    aad = "AFSK" 0x01) (ct || tag), 65 bytes; k = HKDF-SHA256(master,
-    info "aurora-fido sealed keys v1"). A new master secret (reset) makes
-    every earlier handle unusable, like every credential ID.
+    'auto' and 'sep-key' mean the same now; 'sealed' (aurora-fido 0.1) is refused.
     """
-
-    name = "sealed"
-    non_extractable = False
-
-    def __init__(self, master=None):
-        self._aead = None
-        if master is not None:
-            self.rekey(master)
-
-    def rekey(self, master):
-        if len(master) != 64:
-            raise ValueError("master secret must be 64 bytes")
-        k = HKDF(algorithm=hashes.SHA256(), length=32, salt=None,
-                 info=b"aurora-fido sealed keys v1").derive(master)
-        self._aead = AESGCM(k)
-
-    def _need_key(self):
-        if self._aead is None:
-            raise BackendError("sealed key store has no master secret")
-
-    def create(self, policy=0):
-        self._need_key()
-        priv = ec.generate_private_key(ec.SECP256R1())
-        scalar = priv.private_numbers().private_value.to_bytes(32, "big")
-        nonce = secrets.token_bytes(12)
-        handle = _SEALED_AAD + nonce + self._aead.encrypt(nonce, scalar, _SEALED_AAD)
-        return handle, self._point(priv)
-
-    @staticmethod
-    def _point(priv):
-        return priv.public_key().public_bytes(Encoding.X962, PublicFormat.UncompressedPoint)
-
-    def _priv(self, handle):
-        self._need_key()
-        if len(handle) != _SEALED_LEN or handle[:5] != _SEALED_AAD:
-            raise InvalidHandle("not a sealed key handle")
-        try:
-            scalar = self._aead.decrypt(handle[5:17], handle[17:], _SEALED_AAD)
-        except InvalidTag as e:
-            raise InvalidHandle("sealed key from another master secret") from e
-        return ec.derive_private_key(int.from_bytes(scalar, "big"), ec.SECP256R1())
-
-    def sign(self, handle, digest):
-        if len(digest) != DIGEST_LEN:
-            raise ValueError("digest must be 32 bytes")
-        return self._priv(handle).sign(digest, ec.ECDSA(Prehashed(hashes.SHA256())))
-
-    def public(self, handle):
-        return self._point(self._priv(handle))
-
-
-class KeyStore(KeyBackend):
-    """New keys from the primary backend; each handle signs with the backend that made it."""
-
-    def __init__(self, primary, sealed, sep=None):
-        self.primary = primary
-        self.sealed = sealed
-        self.sep = sep
-        self.name = primary.name
-        self.non_extractable = primary.non_extractable
-
-    def rekey(self, master):
-        self.sealed.rekey(master)
-
-    def _for(self, handle):
-        if handle[:4] == SEP_MAGIC:
-            if self.sep is None:
-                raise BackendError("this credential's key is in the Secure Enclave, and "
-                                   "/dev/sep-key is not available in this kernel")
-            return self.sep
-        if handle[:4] == SEALED_MAGIC:
-            return self.sealed
-        raise InvalidHandle("unknown key handle")
-
-    def create(self, policy=0):
-        return self.primary.create(policy)
-
-    def enclave_gated(self, handle):
-        return self.sep is not None and self.sep.enclave_gated(handle)
-
-    def sign(self, handle, digest):
-        return self._for(handle).sign(handle, digest)
-
-    def public(self, handle):
-        return self._for(handle).public(handle)
-
-
-STORES = ("auto", "sep-key", "sealed")
-
-
-def open_store(store="auto", sep_path="/dev/sep-key", enclave_policy=False):
-    """(KeyStore, why /dev/sep-key is not used or None).
-
-    auto: the Secure Enclave when /dev/sep-key works, else sealed keys.
-    sep-key: the Secure Enclave or nothing (BackendError).
-    sealed: sealed keys for new credentials; SEP credentials still sign.
-    """
+    if store == "sealed":
+        raise BackendError("[keys] store = sealed is no longer supported: keys the host "
+                           "can unwrap are not a security key. Remove the line; keys live "
+                           "in the Secure Enclave only")
     if store not in STORES:
         raise BackendError(f"keys: store = {store!r}; use {', '.join(STORES)}")
-    sep, why = None, None
-    if store == "sealed" and not os.path.exists(sep_path):
-        pass
-    elif not os.path.exists(sep_path):
-        why = f"{sep_path} not present (kernel without Secure Enclave keys)"
-        if store == "sep-key":
-            raise BackendError(why)
-    else:
-        # The node exists: any failure is an error, never a quiet fall back
-        # to sealed keys (a late or broken driver must not weaken new keys).
-        try:
-            sep = SepKeyBackend(sep_path)
-        except BackendError:
-            if store != "sealed":
-                raise
-        if sep is not None:
-            sep.enclave_policies = bool(enclave_policy)
-    sealed = SealedKeyBackend()
-    primary = sep if (sep is not None and store != "sealed") else sealed
-    if store == "sealed" and sep is not None:
-        why = "keys: store = sealed in the config"
-    return KeyStore(primary, sealed, sep), why
+    if not os.path.exists(sep_path):
+        raise BackendError(f"{sep_path} not present: this kernel has no Secure Enclave "
+                           "keys (apple_sep with linux#1196 or newer is needed)")
+    sep = SepKeyBackend(sep_path)
+    if not sep.flags_supported & (CREATE_BIOMETRY_ANY | CREATE_BIOMETRY_CURRENT_SET):
+        raise BackendError(f"{sep_path} cannot make keys with an enclave-checked Touch ID "
+                           "access-control list")
+    return sep

@@ -1,16 +1,20 @@
 # SPDX-License-Identifier: MIT
-"""The CTAP 2.1 authenticator: one Touch ID match is user presence and user verification.
+"""The CTAP 2.1 authenticator: every approval is a Touch ID match the Secure Enclave checks.
 
 Commands: makeCredential, getAssertion, getNextAssertion, getInfo, clientPIN
 (key agreement, getPinUvAuthTokenUsingUvWithPermissions, getUVRetries only:
-there is no PIN), reset, credentialManagement (and the 2.1 preview command
-number), selection. Extensions: credProtect, hmac-secret.
+there is no PIN, see docs/fido.md), reset, credentialManagement (and the 2.1
+preview command number), selection. Extensions: credProtect, and
+hmac-secret when the kernel can seal a secret to a credential key.
 
-User presence is never just a touch: every operation that needs the user
-asks for a Touch ID match, so UP and UV are set together. A request with
-up=false and no uv is answered without asking anybody and without either
-flag, as CTAP requires (relying parties reject such assertions for sign-in;
-libfido2 and browsers use them to probe for credentials).
+User presence is never just a touch: the enclave signs only after a match,
+so UP and UV are set together, and only on a response whose signature the
+enclave made with a finger on the sensor. A request with up=false and no uv
+(browsers and libfido2 probing which credentials exist) cannot get an
+enclave signature without a touch, so it is answered without one: the
+response carries no flags and its signature is made by a throwaway software
+key of this daemon run, so it verifies against no credential. Relying
+parties reject such assertions for sign-in anyway.
 """
 
 import hashlib
@@ -25,9 +29,8 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec
 
 from . import cbor, keys, pinuv, touchid
-from .backend import BackendError, EnclaveRefused, EnclaveTimeout, InvalidHandle
-from .creds import (ID_MAX_CTAP2, POLICY_TOUCHID_CURRENT, POLICY_TOUCHID_OR_PASSWORD,
-                    Credential)
+from .backend import BackendError, InvalidHandle
+from .creds import ID_MAX_CTAP2, POLICY_FLAGS, POLICY_TOUCHID_ANY, Credential
 from .errors import *  # noqa: F401,F403
 from .errors import CtapError
 
@@ -125,14 +128,14 @@ def _options(params, key):
 
 
 class Authenticator:
-    def __init__(self, backend, verifier, vault, store, counter,
+    def __init__(self, backend, user, vault, store, counter,
                  attestation="self", new_vault=None, clock=time.monotonic,
-                 policy=POLICY_TOUCHID_OR_PASSWORD, enrolled_set=lambda: None):
+                 policy=POLICY_TOUCHID_ANY, on_legacy=lambda rp_id, why: None):
         self.backend = backend
-        self.verifier = verifier
+        self.user = user                  # enclave.EnclaveUser: every approval
         self.policy = policy              # for new credentials (config [touchid] policy)
-        self.enrolled_set = enrolled_set  # () -> digest of the seat user's prints, or None
-        self.token_method = None          # how the current pinUvAuthToken was approved
+        self.flags = POLICY_FLAGS[policy]
+        self.on_legacy = on_legacy        # a refused pre-enclave credential was presented
         self.vault = vault
         self.store = store
         self.counter = counter
@@ -146,6 +149,8 @@ class Authenticator:
         self._next = None                 # getNextAssertion state
         self._cm = None                   # credential management enumeration state
         self._refused = None              # (request digest, when) of the last refusal
+        # Signs the answers to silent (up=false) probes; never a credential key.
+        self._probe_key = ec.generate_private_key(ec.SECP256R1())
 
     # -- plumbing ---------------------------------------------------------------
 
@@ -189,12 +194,6 @@ class Authenticator:
         except CtapError as e:
             log.info("command 0x%02x: %s", cmd, e)
             return bytes([e.code])
-        except EnclaveRefused as e:
-            log.info("command 0x%02x: Secure Enclave: %s", cmd, e)
-            return bytes([ERR_OPERATION_DENIED])
-        except EnclaveTimeout as e:
-            log.info("command 0x%02x: Secure Enclave: %s", cmd, e)
-            return bytes([ERR_USER_ACTION_TIMEOUT])
         except BackendError as e:
             log.error("key backend: %s", e)
             return bytes([ERR_OTHER])
@@ -209,40 +208,64 @@ class Authenticator:
             h.update(len(b).to_bytes(4, "big") + b)
         return h.digest()
 
-    def ask(self, ctx, prompt, request=None):
-        """Touch ID (or the password, if prompt.allow_password).
-
-        Returns "touchid" or "password"; raises the CTAP error otherwise.
-
-        request: request_digest() of the operation; a replay of one that was
-        just refused is refused again at once (REFUSAL_REPLAY_WINDOW).
-        """
+    def _replayed_refusal(self, prompt, request):
+        if request is None or self._refused is None:
+            return
+        digest, when = self._refused
         now = self.clock()
-        if request is not None and self._refused is not None:
-            digest, when = self._refused
-            if digest == request and now - when <= REFUSAL_REPLAY_WINDOW:
-                log.info("%s: repeat of a request Touch ID refused %.1f s ago; "
-                         "refused again without a new prompt", prompt.title(), now - when)
-                raise CtapError(ERR_OPERATION_DENIED, "repeat of a refused request")
-        result = self.verifier.verify(prompt, ctx.cancel, ctx.on_up_needed)
-        if result == touchid.PASSWORD and not prompt.allow_password:
-            result = touchid.NO_MATCH
+        if digest == request and now - when <= REFUSAL_REPLAY_WINDOW:
+            log.info("%s: repeat of a request Touch ID refused %.1f s ago; "
+                     "refused again without a new prompt", prompt.title(), now - when)
+            raise CtapError(ERR_OPERATION_DENIED, "repeat of a refused request")
+
+    def _outcome(self, ctx, result, request):
+        """Raise the CTAP error for a result that is not a match; remember refusals."""
         if result in (touchid.NO_MATCH, touchid.LOCKED) and request is not None:
             self._refused = (request, self.clock())
-        elif result in (touchid.MATCH, touchid.PASSWORD):
+        elif result == touchid.MATCH:
             self._refused = None
-        if result == touchid.MATCH:
-            return "touchid"
-        if result == touchid.PASSWORD:
-            return "password"
+            return
         if ctx.cancel.is_set() or result == touchid.CANCELLED:
             raise CtapError(ERR_KEEPALIVE_CANCEL, "cancelled")
         if result == touchid.TIMEOUT:
             raise CtapError(ERR_USER_ACTION_TIMEOUT, "no touch")
         raise CtapError(ERR_OPERATION_DENIED, f"Touch ID: {result}")
 
-    def _sign(self, cred, msg):
-        return self.backend.sign(cred.handle, hashlib.sha256(msg).digest())
+    def ask(self, ctx, prompt, request=None):
+        """An enclave-checked Touch ID approval that signs nothing for an RP (presence key).
+
+        request: request_digest() of the operation; a replay of one that was
+        just refused is refused again at once (REFUSAL_REPLAY_WINDOW).
+        """
+        self._replayed_refusal(prompt, request)
+        result = self.user.verify(prompt, ctx.cancel, ctx.on_up_needed)
+        self._outcome(ctx, result, request)
+        return "touchid"
+
+    def _gated(self, ctx, prompt, cred, op, request=None):
+        self._replayed_refusal(prompt, request)
+        try:
+            result, value = op(prompt, ctx.cancel, ctx.on_up_needed)
+        except InvalidHandle as e:
+            # The enclave refused the key itself: made by another SEP or
+            # install, or a touchid-current key after an enrolment change.
+            raise CtapError(ERR_INVALID_CREDENTIAL, str(e)) from e
+        self._outcome(ctx, result, request)
+        return value
+
+    def _gated_sign(self, ctx, prompt, cred, msg, request=None):
+        """The credential's signature over msg: the enclave waits for the finger."""
+        digest = hashlib.sha256(msg).digest()
+        return self._gated(ctx, prompt, cred,
+                           lambda *a: self.user.sign(cred.handle, digest, *a), request)
+
+    def _gated_unseal(self, ctx, prompt, cred, request=None):
+        """The credential's sealed hmac-secret CredRandom pair, released after a match."""
+        return self._gated(ctx, prompt, cred,
+                           lambda *a: self.user.unseal(cred.handle, cred.sealed, *a), request)
+
+    def _probe_sign(self, msg):
+        return self._probe_key.sign(msg, ec.ECDSA(hashes.SHA256()))
 
     def _pin_protocol(self, params, key):
         v = _need(params, key, int)
@@ -251,12 +274,23 @@ class Authenticator:
             raise CtapError(ERR_INVALID_PARAMETER, "pinUvAuthProtocol")
         return p
 
+    def _usable(self, cred, rp_id):
+        """False for a credential made before the enclave checked the touch."""
+        if cred.legacy is None and self.backend.gated(cred.handle):
+            return True
+        why = cred.legacy or "its key has no enclave access-control list"
+        log.warning("refused a credential for %s: %s. Register this key with %s again",
+                    rp_id, why, rp_id)
+        self.on_legacy(rp_id, why)
+        return False
+
     # -- getInfo -------------------------------------------------------------------
 
     def get_info(self, _params, _ctx):
+        ext = ["credProtect"] + (["hmac-secret"] if self.backend.can_unseal else [])
         return {
             1: ["U2F_V2", "FIDO_2_0", "FIDO_2_1"],
-            2: ["credProtect", "hmac-secret"],
+            2: ext,
             3: AAGUID,
             4: {"rk": True, "up": True, "uv": True, "plat": False,
                 "credMgmt": True, "credentialMgmtPreview": True,
@@ -316,7 +350,6 @@ class Authenticator:
         prompt = touchid.Prompt("register", rp_id, user_line(user))
 
         # pinUvAuthParam: empty = "touch to select" probe from old platforms.
-        token_up = False
         if auth_param is not None:
             if not isinstance(auth_param, bytes):
                 raise CtapError(ERR_CBOR_UNEXPECTED_TYPE, "pinUvAuthParam")
@@ -329,38 +362,32 @@ class Authenticator:
                 raise CtapError(ERR_PIN_AUTH_INVALID, "token permission or RP")
             if not ok:
                 raise CtapError(ERR_PIN_AUTH_INVALID)
-            token_up = self.token.user_present
 
         cred_protect = ext.get("credProtect")
         if cred_protect is not None and cred_protect not in (1, 2, 3):
             cred_protect = None
-        hmac_secret = ext.get("hmac-secret") is True
+        hmac_secret = ext.get("hmac-secret") is True and self.backend.can_unseal
 
         for cid in exclude:
             if self.vault.unwrap(rp_hash, cid) is not None:
-                if not token_up:
-                    self.ask(ctx, touchid.Prompt("register", rp_id,
-                                                 "This key is already registered here"))
+                self.ask(ctx, touchid.Prompt("register", rp_id,
+                                             "This key is already registered here"))
                 self.token.consumed_by_mc_ga()
                 raise CtapError(ERR_CREDENTIAL_EXCLUDED)
 
         if rk and self.store.remaining() <= 0:
             raise CtapError(ERR_KEY_STORE_FULL)
 
-        strict = self.policy != POLICY_TOUCHID_OR_PASSWORD
-        prompt.allow_password = not strict
-        if not token_up or (strict and self.token_method == "password"):
-            self.ask(ctx, prompt, self.request_digest("mc", rp_hash, cdh, uid, sorted(opts.items())))
-        if auth_param is not None:
-            self.token.consumed_by_mc_ga()
-
-        bio_set = None
-        if self.policy == POLICY_TOUCHID_CURRENT:
-            bio_set = self.enrolled_set()
-            if bio_set is None:
-                raise CtapError(ERR_OPERATION_DENIED, "no enrolled fingers to bind to")
-        handle, point = self.backend.create(self.policy)
-        cred = Credential(handle, os.urandom(32), cred_protect or 1, self.policy, bio_set)
+        # The new key, with the enclave's access-control list. It signs
+        # nothing without a finger, so making it needs no approval; the
+        # approval is its first signature below.
+        handle, point = self.backend.create(self.flags)
+        sealed = None
+        if hmac_secret:
+            # CredRandomWithUV || CredRandomWithoutUV, released by the
+            # enclave only together with a touch-approved signature.
+            sealed = self.backend.seal(handle, os.urandom(64))
+        cred = Credential(handle, cred_protect or 1, self.policy, sealed)
         cred_id = self.vault.wrap(rp_hash, cred, ID_MAX_CTAP2)
 
         ext_out = {}
@@ -373,6 +400,16 @@ class Authenticator:
                      + AAGUID + struct.pack(">H", len(cred_id)) + cred_id
                      + keys.encode_cose_es256(point)
                      + (cbor.encode(ext_out) if ext_out else b""))
+
+        # One touch: the enclave signs the attestation (or, with
+        # attestation = none, the same bytes as a check) only after a match.
+        sig = self._gated_sign(ctx, prompt, cred, auth_data + cdh,
+                               self.request_digest("mc", rp_hash, cdh, uid,
+                                                   sorted(opts.items())))
+        if not verify_es256(point, auth_data + cdh, sig):
+            raise BackendError("the new key's signature does not verify")
+        if auth_param is not None:
+            self.token.consumed_by_mc_ga()
 
         if rk:
             ok = self.store.put({
@@ -387,7 +424,6 @@ class Authenticator:
         if self.attestation == "none":
             fmt, att = "none", {}
         else:
-            sig = self._sign(cred, auth_data + cdh)
             fmt, att = "packed", {"alg": keys.ES256, "sig": sig}
         log.info("registered %s credential for %s", "discoverable" if rk else "a", rp_id)
         return {1: fmt, 2: auth_data, 3: att}
@@ -411,7 +447,6 @@ class Authenticator:
         uv = opts.get("uv", False)
         rp_hash = _rp_hash(rp_id)
 
-        token_up = token_uv = False
         if auth_param is not None:
             if not isinstance(auth_param, bytes):
                 raise CtapError(ERR_CBOR_UNEXPECTED_TYPE, "pinUvAuthParam")
@@ -422,34 +457,26 @@ class Authenticator:
             ok = self.token.check(proto, cdh, auth_param, pinuv.PERM_GA, rp_id)
             if not ok:
                 raise CtapError(ERR_PIN_AUTH_INVALID)
-            token_up, token_uv = self.token.user_present, self.token.user_verified
-            uv = False
+            # The token asks for UV. Its UV is the enclave's touch at the
+            # signature, so a silent (up=false) request with it stays silent.
+            uv = up
 
-        # Touch ID is UV; any request that will ask for it counts as verified
-        # when deciding which credProtect levels are visible.
-        will_verify = token_uv or uv or (up and not token_up)
+        # Every signature with up (or uv) is a touch the enclave checks, so a
+        # request that will be signed that way counts as verified when
+        # deciding which credProtect levels are visible.
+        touch = up or uv
 
         found = []
-        current = None
-
-        def usable(c):
-            nonlocal current
-            if c.policy != POLICY_TOUCHID_CURRENT:
-                return True
-            if current is None:
-                current = self.enrolled_set() or b""
-            return c.bio_set == current     # the enrolled fingers changed: retired
-
+        legacy = 0
         if allow:
             for cid in allow:
                 c = self.vault.unwrap(rp_hash, cid)
                 if c is None:
                     continue
-                if c.cred_protect == 3 and not will_verify:
+                if not self._usable(c, rp_id):
+                    legacy += 1
                     continue
-                if not usable(c):
-                    log.info("credential for %s is bound to fingers that are no longer "
-                             "all enrolled; refusing it", rp_id)
+                if c.cred_protect == 3 and not touch:
                     continue
                 found.append((cid, c, self.store.find(cid)))
                 break
@@ -458,46 +485,34 @@ class Authenticator:
                 c = self.vault.unwrap(rp_hash, rec["credId"])
                 if c is None:
                     continue
-                if c.cred_protect >= 2 and not will_verify:
+                if not self._usable(c, rp_id):
+                    legacy += 1
                     continue
-                if not usable(c):
+                if c.cred_protect >= 2 and not touch:
                     continue
                 found.append((rec["credId"], c, rec))
         if not found:
-            raise CtapError(ERR_NO_CREDENTIALS)
+            raise CtapError(ERR_NO_CREDENTIALS,
+                            "only credentials made before the enclave checked Touch ID"
+                            if legacy else "")
 
-        verified = token_uv
-        present = token_up and up    # up=false: UP stays clear even with a token
-        allow_password = all(c.allow_password for _cid, c, _r in found)
-        gated = all(self.backend.enclave_gated(c.handle) for _cid, c, _r in found)
-        if gated and ((up and not token_up) or uv):
-            # The enclave asks for the finger inside the signature itself.
-            ctx.on_up_needed()
-            verified = True
-            present = up
-        elif (up and not token_up) or uv or (
-                token_up and self.token_method == "password" and not allow_password):
-            self.ask(ctx, touchid.Prompt("sign-in", rp_id, allow_password=allow_password),
-                     self.request_digest("ga", rp_hash, cdh, sorted(opts.items()),
-                                         *(allow or ())))
-            verified = True
-            present = up
+        hs = ext.get("hmac-secret")
+        state = {"rp_id": rp_id, "rp_hash": rp_hash, "cdh": cdh, "touch": touch, "up": up,
+                 "hs": hs, "rest": found[1:], "total": len(found), "t": self.clock(),
+                 "request": self.request_digest("ga", rp_hash, cdh, sorted(opts.items()),
+                                                *(allow or ()))}
+        resp = self._assertion(found[0], state, ctx, first=True)
         # CTAP 2.1/2.2 getAssertion: the token's flags and permissions are used up
         # only when the response carries UP. A silent pre-flight (up=false, as
         # Firefox sends before the real request) must leave the token usable.
-        if auth_param is not None and present:
+        if auth_param is not None and touch:
             self.token.consumed_by_mc_ga()
-
-        hs = ext.get("hmac-secret")
-        flags = (FLAG_UP if present else 0) | (FLAG_UV if verified else 0)
-        state = {"rp_hash": rp_hash, "cdh": cdh, "flags": flags, "hs": hs,
-                 "rest": found[1:], "total": len(found), "t": self.clock()}
-        resp = self._assertion(found[0], state, first=True)
         if len(found) > 1:
             self._next = state
         return resp
 
-    def _hmac_secret(self, hs, cred, uv):
+    def _hmac_secret(self, hs, secret):
+        """The hmac-secret output from the enclave-released CredRandom (UV half)."""
         if not isinstance(hs, dict):
             raise CtapError(ERR_INVALID_PARAMETER, "hmac-secret input")
         proto = pinuv.PROTOCOLS.get(hs.get(4, 1))
@@ -519,30 +534,44 @@ class Authenticator:
             raise CtapError(ERR_INVALID_LENGTH, "hmac-secret salt") from e
         if len(salts) not in (32, 64):
             raise CtapError(ERR_INVALID_LENGTH, "hmac-secret salt")
-        key = cred.cred_random(uv)
+        # Every enclave signature has UV, so the UV half of the pair is used.
+        key = secret[:32]
         out = b"".join(hmac.new(key, salts[i:i + 32], hashlib.sha256).digest()
                        for i in range(0, len(salts), 32))
         return proto.encrypt(shared, out)
 
-    def _assertion(self, item, state, first):
+    def _assertion(self, item, state, ctx, first):
         cid, cred, rec = item
+        touch = state["touch"]
+        hs = state["hs"]
+        prompt = touchid.Prompt("sign-in", state["rp_id"],
+                                _account_line(rec) if state["total"] > 1 else "")
         ext_out = {}
-        if state["hs"] is not None:
-            ext_out["hmac-secret"] = self._hmac_secret(
-                state["hs"], cred, bool(state["flags"] & FLAG_UV))
-        flags = state["flags"] | (FLAG_ED if ext_out else 0)
+        if hs is not None:
+            if not touch or cred.sealed is None or not self.backend.can_unseal:
+                log.info("hmac-secret for %s: not available (no touch, or a credential "
+                         "made without it)", state["rp_id"])
+            else:
+                # The output goes into the signed authData, so the enclave
+                # releases the secret first (one touch) and signs after (the
+                # second): no secret leaves the enclave without a match.
+                secret = self._gated_unseal(ctx, prompt, cred, state["request"])
+                ext_out["hmac-secret"] = self._hmac_secret(hs, secret)
+                prompt = touchid.Prompt("sign-in", state["rp_id"], "Touch ID again to finish")
+        flags = (FLAG_UP if touch and state["up"] else 0) | (FLAG_UV if touch else 0) \
+            | (FLAG_ED if ext_out else 0)
         auth_data = (state["rp_hash"] + bytes([flags])
                      + struct.pack(">I", self.counter.next())
                      + (cbor.encode(ext_out) if ext_out else b""))
-        try:
-            sig = self._sign(cred, auth_data + state["cdh"])
-        except InvalidHandle as e:
-            # The enclave refused the key: made by another SEP or install.
-            raise CtapError(ERR_INVALID_CREDENTIAL, str(e)) from e
+        if touch:
+            sig = self._gated_sign(ctx, prompt, cred, auth_data + state["cdh"],
+                                   state["request"])
+        else:
+            sig = self._probe_sign(auth_data + state["cdh"])
         resp = {1: {"type": "public-key", "id": cid}, 2: auth_data, 3: sig}
         if rec is not None:
             u = {"id": rec["userId"]}
-            if state["flags"] & FLAG_UV and state["total"] > 1:
+            if touch and state["total"] > 1:
                 for k, rk in (("name", "userName"), ("displayName", "displayName")):
                     if rec.get(rk):
                         u[k] = rec[rk]
@@ -551,14 +580,14 @@ class Authenticator:
             resp[5] = state["total"]
         return resp
 
-    def get_next_assertion(self, _p, _ctx):
+    def get_next_assertion(self, _p, ctx):
         st = self._next
         if not st or not st["rest"] or self.clock() - st["t"] > NEXT_ASSERTION_WINDOW:
             self._next = None
             raise CtapError(ERR_NOT_ALLOWED)
         item = st["rest"].pop(0)
         st["t"] = self.clock()
-        return self._assertion(item, st, first=False)
+        return self._assertion(item, st, ctx, first=False)
 
     # -- clientPIN -----------------------------------------------------------------
 
@@ -568,7 +597,7 @@ class Authenticator:
             self._pin_protocol(p, 1)
             return {1: self.key_agreement.cose()}
         if sub == 0x07:     # getUVRetries
-            return {5: getattr(self.verifier, "max_tries", 3)}
+            return {5: self.user.max_tries}
         if sub == 0x06:     # getPinUvAuthTokenUsingUvWithPermissions
             proto = self._pin_protocol(p, 1)
             ka = _need(p, 3, dict)
@@ -584,13 +613,17 @@ class Authenticator:
                 shared = self.key_agreement.shared_secret(proto, ka)
             except ValueError as e:
                 raise CtapError(ERR_INVALID_PARAMETER, "keyAgreement") from e
-            action = "manage" if perms & pinuv.PERM_CM else (
-                "register" if perms & pinuv.PERM_MC else "sign-in")
             self.token.reset()
-            self.token_method = None
-            self.token_method = self.ask(ctx, touchid.Prompt(
-                action, rp_id, allow_password=self.policy == POLICY_TOUCHID_OR_PASSWORD))
-            self.token.begin(perms, rp_id)
+            if perms & ~(pinuv.PERM_MC | pinuv.PERM_GA):
+                # Credential management signs nothing an RP could check, so
+                # its token takes an enclave-checked touch now (presence key).
+                self.ask(ctx, touchid.Prompt("manage", rp_id))
+                self.token.begin(perms, rp_id)
+            else:
+                # makeCredential / getAssertion: each signature waits for its
+                # own enclave-checked touch, so the token carries no UV and
+                # the one touch happens at the signature, not twice.
+                self.token.begin(perms, rp_id, verified=False)
             return {2: proto.encrypt(shared, self.token.value)}
         if sub in (0x01, 0x03, 0x04, 0x05, 0x09):
             # getPINRetries, setPIN, changePIN, getPinToken, ...UsingPin: no PIN.
@@ -712,6 +745,13 @@ class Authenticator:
         if want == "rp":
             return {3: item[0], 4: item[1]}
         return self._cm_cred(item)
+
+
+def _account_line(rec):
+    if not rec:
+        return ""
+    name = rec.get("displayName") or rec.get("userName")
+    return f"as {name}" if name else ""
 
 
 def user_line(user):
