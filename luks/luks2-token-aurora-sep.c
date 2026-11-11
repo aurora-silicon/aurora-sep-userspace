@@ -14,6 +14,7 @@
 
 #include "sep-seal.h"
 #include "sep-fde.h"
+#include "sep-boot.h"
 
 #define TOKEN_VERSION "1.0"
 
@@ -30,6 +31,26 @@ static int wait_seconds(void)
 	if (*end || v < 0 || v > 600)
 		return SEP_SEAL_WAIT_DEFAULT;
 	return (int)v;
+}
+
+/*
+ * In the initramfs (the root volume and anything else opened before the
+ * switch to the real root), check the boot chain before the Secure Enclave
+ * is asked for a key: fde.conf boot-chain = warn says once per boot that the
+ * chain is not verified and goes on; boot-chain = require refuses, so the
+ * volume asks for its passphrase or recovery key instead.
+ */
+static int boot_chain_gate(struct crypt_device *cd)
+{
+	char msg[256];
+	int first, r;
+
+	if (!sep_boot_in_initrd())
+		return 0;
+	r = sep_boot_chain_gate(msg, sizeof(msg), &first);
+	if (msg[0] && (first || r))
+		crypt_logf(cd, CRYPT_LOG_ERROR, "%s\n", msg);
+	return r;
 }
 
 const char *cryptsetup_token_version(void)
@@ -61,6 +82,10 @@ static int open_password_mode(struct crypt_device *cd, const char *json, const c
 	if (r < 0) {
 		crypt_log(cd, CRYPT_LOG_ERROR, "aurora-sep: malformed password token\n");
 		return r;
+	}
+	if (boot_chain_gate(cd)) {
+		fde_token_free(&t);
+		return -EPERM;
 	}
 	if (!pin || !pin_size) {
 		fde_token_free(&t);
@@ -100,6 +125,13 @@ static int open_password_mode(struct crypt_device *cd, const char *json, const c
 	}
 	if (r == -EACCES)
 		return -ENOANO;		/* wrong password; the enclave counted it */
+	if (r == -EXDEV) {
+		/* Sealed under another OS install on this Mac (FileVault: per volume). */
+		crypt_log(cd, CRYPT_LOG_ERROR,
+			  "aurora-sep: this disk key belongs to another OS install on this Mac; "
+			  "use the recovery key or the volume's passphrase\n");
+		return -EPERM;
+	}
 	if (r < 0) {
 		crypt_logf(cd, CRYPT_LOG_VERBOSE,
 			  "aurora-sep: this Mac's Secure Enclave did not accept this token (%s)\n",
@@ -139,6 +171,8 @@ int cryptsetup_token_open_pin(struct crypt_device *cd, int token, const char *pi
 	/* Machine mode has no PIN: a PIN would not be enforced by the SEP. */
 	if (pin && pin_size)
 		return -ENOANO;
+	if (boot_chain_gate(cd))
+		return -EPERM;
 	uuid = crypt_get_uuid(cd);
 	r = sep_seal_aad(uuid, aad, sizeof(aad));
 	if (r < 0)

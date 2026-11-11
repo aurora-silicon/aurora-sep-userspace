@@ -85,6 +85,10 @@ install() {
     inst_library "$plugin"
     inst_simple "$AURORA_SEP_INITRD_DIR/aurora-sep-cryptsetup.conf" \
         "$systemdsystemunitdir/systemd-cryptsetup@.service.d/aurora-sep.conf"
+    # The disk-key policy (boot-chain = warn | require) applies in the initrd.
+    if [[ -r $dracutsysrootdir/etc/aurora-sep/fde.conf ]]; then
+        inst_simple /etc/aurora-sep/fde.conf
+    fi
 
     if ! _aurora_sep_kernel_ok; then
         dwarning "aurora-sep: apple_sep in $kernel has no key-store-only phase; volumes sealed by the Secure Enclave will ask for their passphrase in the initrd"

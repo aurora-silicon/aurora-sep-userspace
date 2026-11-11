@@ -9,8 +9,9 @@
  *                           [--password-file P] DEVICE
  *   aurora-sep-fde remove-user --user U [--auth-user A] [--auth-password-file F] DEVICE
  *   aurora-sep-fde set-owner --user U --owner|--no-owner [--auth-user A] [--auth-password-file F] DEVICE
- *   aurora-sep-fde recovery [--uid N] --unlock-key-file F [--recovery-key-file OUT]
- *                           [--sep-only|--offline] DEVICE
+ *   aurora-sep-fde recovery [--uid N] [--unlock-key-file F | [--auth-user A]
+ *                           [--auth-password-file F]] [--recovery-key-file OUT]
+ *                           [--sep-only|--offline] [--replace] DEVICE
  *   aurora-sep-fde change-password --user U [--old-file O --new-file P] [DEVICE]
  *   aurora-sep-fde reset-password  --user U (--recovery-key-file R | [--auth-user A]
  *                           [--auth-password-file F]) [--new-file P] DEVICE
@@ -20,6 +21,18 @@
  *   aurora-sep-fde remove-passphrase --unlock-key-file F DEVICE
  *   aurora-sep-fde gate-check --user U [--password-file P] DEVICE
  *   aurora-sep-fde status   [DEVICE]
+ *   aurora-sep-fde boot-chain   (what the initramfs gate decides on this boot)
+ *
+ * Recovery keys are a choice, like Touch ID after boot: by default
+ * (recovery = offline in fde.conf, or --offline) the key also opens a plain
+ * LUKS2 keyslot, so the volume never depends on the enclave alone; --sep-only
+ * (or recovery = sep-only) keeps every unlock inside the enclave, FileVault's
+ * strict form. --replace makes a new recovery key and removes the old one
+ * with its keyslots (the way to switch an existing key between the two).
+ *
+ * Each sealed secret is bound to the OS install it was made under (the key
+ * store OS identity): another install on the same Mac cannot open it with
+ * the password, only with the recovery key's offline keyslot or a passphrase.
  *
  * --uid N names an enclave bag uid directly (tests, enrolments made before
  * --user existed). --auth-user defaults to $SUDO_USER: changes to other users
@@ -46,6 +59,7 @@
 #include "fde-owner.h"
 #include "sep-fde.h"
 #include "sep-seal.h"
+#include "sep-boot.h"
 
 #define SECRET_MAX 1024
 
@@ -53,14 +67,15 @@ struct opts {
 	const char *cmd, *device, *unlock_key_file, *password_file, *old_file, *new_file,
 		*recovery_key_file, *label, *name, *user, *auth_user, *auth_password_file;
 	long uid;
-	int quiet, sep_only, offline, owner;	/* owner: -1 default, 0 no, 1 yes */
+	int quiet, sep_only, offline, replace, owner;	/* owner: -1 default, 0 no, 1 yes */
 	struct fde_conf conf;
 };
 
 static void die_usage(void)
 {
 	fputs("usage: aurora-sep-fde enroll|add-user|remove-user|set-owner|recovery|change-password|\n"
-	      "       reset-password|passwd-hook|sync|test|remove-passphrase|gate-check|status\n"
+	      "       reset-password|passwd-hook|sync|test|remove-passphrase|gate-check|status|\n"
+	      "       boot-chain\n"
 	      "       [options] [DEVICE]\n", stderr);
 	exit(2);
 }
@@ -241,7 +256,8 @@ static int add_offline_recovery_slot(struct crypt_device *cd, long uid, const ch
 	return ks;
 }
 
-static int cmd_enroll(struct crypt_device *cd, const struct opts *o, int recovery)
+static int cmd_enroll(struct crypt_device *cd, const struct opts *o, int recovery,
+		      const char *have, size_t have_len)
 {
 	uint8_t secret[SEP_FDE_SECRET_BYTES];
 	char existing[SECRET_MAX], pw[SECRET_MAX], rk[SEP_FDE_RK_LEN + 1];
@@ -257,9 +273,16 @@ static int cmd_enroll(struct crypt_device *cd, const struct opts *o, int recover
 			o->uid, recovery ? "recovery" : "password");
 		return -EEXIST;
 	}
-	r = get_key(o->unlock_key_file, "Existing LUKS passphrase: ", existing, &elen);
-	if (r)
-		return r;
+	if (have) {
+		if (have_len > sizeof(existing))
+			return -EINVAL;
+		memcpy(existing, have, have_len);
+		elen = have_len;
+	} else {
+		r = get_key(o->unlock_key_file, "Existing LUKS passphrase: ", existing, &elen);
+		if (r)
+			return r;
+	}
 	if (recovery) {
 		r = fde_recovery_key_new(rk);
 		memcpy(pw, rk, strlen(rk));
@@ -304,6 +327,8 @@ static int cmd_enroll(struct crypt_device *cd, const struct opts *o, int recover
 		}
 		if (!o->quiet)
 			printf("offline recovery keyslot %d (opens at the passphrase prompt without the SEP)\n", oks);
+	} else if (recovery && !o->quiet) {
+		printf("SEP-only recovery key: it opens the volume only through this Mac's Secure Enclave\n");
 	}
 	if (recovery) {
 		if (o->recovery_key_file) {
@@ -338,6 +363,10 @@ static const char *errname(int r)
 	case -EEXIST: return "already enrolled";
 	case -EBUSY: return "that is the last owner of this volume";
 	case -ENODEV: return "no Secure Enclave key store";
+	case -EXDEV: return "this disk key belongs to another OS install on this Mac; use the recovery key "
+			    "or the volume's passphrase";
+	case -ENOKEY: return "this kernel names no OS identity for this install, so the disk key cannot be "
+			     "bound to it (check the apple_sep os_uuid pin)";
 	case -ENOSPC: return "the volume's LUKS2 metadata area is full; each password token takes about "
 			     "3 KB, so volumes for several users need a larger area "
 			     "(cryptsetup luksFormat --luks2-metadata-size 256k)";
@@ -771,8 +800,15 @@ static int cmd_remove_passphrase(struct crypt_device *cd, const struct opts *o)
 		}
 	}
 	r = crypt_keyslot_destroy(cd, ks);
-	if (!r && !o->quiet)
+	if (!r && !o->quiet) {
 		printf("removed passphrase keyslot %d\n", ks);
+		if (find_token(cd, -1, SEP_FDE_ROLE_RECOVERY, &t) >= 0) {
+			if (t.offline_keyslot < 0)
+				printf("the recovery key is SEP only: this volume now opens only through this Mac's "
+				       "Secure Enclave (FileVault's strict form)\n");
+			fde_token_free(&t);
+		}
+	}
 	return r;
 refuse:
 	fprintf(stderr, "aurora-sep-fde: enrol a password and a recovery key first\n");
@@ -860,7 +896,8 @@ out:
 
 static int status_one(struct crypt_device *cd, const char *device)
 {
-	int found = 0;
+	char os[SEP_BOOT_UUID_LEN + 1];
+	int found = 0, have_os = sep_boot_os_uuid(os) == 0;
 
 	if (device)
 		printf("%s: %d volume owner(s)\n", device, fde_count_owners(cd));
@@ -896,6 +933,11 @@ static int status_one(struct crypt_device *cd, const char *device)
 			printf(", NO KEYSLOT (damaged)");
 		if (t.offline_keyslot >= 0)
 			printf(", offline recovery keyslot %d", t.offline_keyslot);
+		else if (!strcmp(t.role, SEP_FDE_ROLE_RECOVERY))
+			printf(", SEP only (no offline keyslot)");
+		if (t.os_uuid[0])
+			printf(", OS install %s%s", t.os_uuid,
+			       have_os && strcmp(t.os_uuid, os) ? " (another OS install)" : "");
 		if (fde_bag_state(t.uid, &st) == 0)
 			printf(", enclave: bag state %u, failed attempts %u\n", st.bag_state, st.failed_attempts);
 		else
@@ -907,10 +949,42 @@ static int status_one(struct crypt_device *cd, const char *device)
 	return 0;
 }
 
+static void status_policy(const struct opts *o)
+{
+	char os[SEP_BOOT_UUID_LEN + 1], state[64];
+
+	printf("recovery keys: %s\n", o->conf.recovery_sep_only ?
+	       "SEP only (recovery = sep-only)" : "offline keyslot too (recovery = offline, the default)");
+	if (sep_boot_chain_state(state, sizeof(state)))
+		snprintf(state, sizeof(state), "unknown");
+	printf("boot chain: %s, boot-chain = %s\n", state,
+	       sep_boot_chain_policy_name(sep_boot_chain_policy()));
+	if (sep_boot_os_uuid(os) == 0)
+		printf("OS install: %s\n", os);
+	else
+		printf("OS install: unknown (no OS identity on this boot)\n");
+}
+
+static int cmd_boot_chain(void)
+{
+	char msg[256], state[64];
+	int first, r;
+
+	if (sep_boot_chain_state(state, sizeof(state)))
+		snprintf(state, sizeof(state), "unknown");
+	r = sep_boot_chain_gate(msg, sizeof(msg), &first);
+	printf("boot chain %s, boot-chain = %s: the initramfs %s\n", state,
+	       sep_boot_chain_policy_name(sep_boot_chain_policy()),
+	       r ? "does not ask the Secure Enclave (passphrase or recovery key)" :
+	       msg[0] ? "asks the Secure Enclave and logs a warning" : "asks the Secure Enclave");
+	return 0;
+}
+
 static int cmd_status(struct crypt_device *cd, const struct opts *o)
 {
 	char **v;
 
+	status_policy(o);
 	if (cd)
 		return status_one(cd, NULL);
 	v = fde_volumes_list(&o->conf);
@@ -932,14 +1006,78 @@ static int cmd_status(struct crypt_device *cd, const struct opts *o)
 
 /* Recovery tokens get their own bag uid per volume, so two volumes can have
  * recovery keys made in the same boot. */
-static long recovery_bag_uid(struct crypt_device *cd, const struct fde_conf *c)
+static long recovery_bag_uid(struct crypt_device *cd, const struct fde_conf *c, long avoid)
 {
 	const char *uuid = crypt_get_uuid(cd);
 	uint32_t h = 2166136261u;
+	long u;
 
 	for (const char *p = uuid ? uuid : ""; *p; p++)
 		h = (h ^ (uint8_t)*p) * 16777619u;
-	return (long)c->bag_uid_base - 1 - (long)(h % 9000);
+	u = (long)c->bag_uid_base - 1 - (long)(h % 9000);
+	/* A replacement takes the other uid of the pair: the enclave keeps the
+	 * old bag until reboot and cannot make a second one under its uid. */
+	if (u == avoid)
+		u = (long)c->bag_uid_base - 1 - (long)((h + 4500) % 9000);
+	return u;
+}
+
+/*
+ * A recovery key for the volume, offline (default) or SEP only. With
+ * --replace an existing one is replaced: the new key is made first, then the
+ * old token and its keyslots go. The existing key to add keyslots with is
+ * --unlock-key-file, else a volume owner's password (installs where the
+ * installer passphrase was removed).
+ */
+static int cmd_recovery(struct crypt_device *cd, struct opts *o)
+{
+	uint8_t secret[SEP_FDE_SECRET_BYTES];
+	char have[SEP_FDE_PASS_LEN + 1];
+	struct fde_token old;
+	struct fde_user auth;
+	int old_tok, old_ks = -1, old_off = -1, use_auth = 0, r;
+	long old_uid = -1;
+
+	old_tok = find_token(cd, -1, SEP_FDE_ROLE_RECOVERY, &old);
+	if (old_tok >= 0) {
+		old_ks = token_keyslot(cd, old_tok);
+		old_off = old.offline_keyslot;
+		old_uid = old.uid;
+		fde_token_free(&old);
+		if (!o->replace) {
+			fprintf(stderr, "aurora-sep-fde: this volume has a recovery key; --replace makes a new one "
+				"and removes the old one\n");
+			return -EEXIST;
+		}
+	}
+	if (o->uid < 0)
+		o->uid = recovery_bag_uid(cd, &o->conf, old_uid);
+	if (!o->unlock_key_file && (o->auth_user || o->auth_password_file || old_tok >= 0)) {
+		r = authorize(cd, o, secret, &auth);
+		if (r)
+			return r;
+		sep_hex_encode(secret, SEP_FDE_SECRET_BYTES, have, sizeof(have));
+		sep_wipe(secret, sizeof(secret));
+		use_auth = 1;
+	}
+	r = cmd_enroll(cd, o, 1, use_auth ? have : NULL, use_auth ? SEP_FDE_PASS_LEN : 0);
+	sep_wipe(have, sizeof(have));
+	if (r || old_tok < 0)
+		return r;
+	r = crypt_token_json_set(cd, old_tok, NULL);
+	if (r >= 0 && old_off >= 0 && old_off != old_ks)
+		r = crypt_keyslot_destroy(cd, old_off);
+	if (r >= 0 && old_ks >= 0)
+		r = crypt_keyslot_destroy(cd, old_ks);
+	if (r < 0) {
+		fprintf(stderr, "aurora-sep-fde: the new recovery key works, but removing the old one failed (%s)\n",
+			strerror(-r));
+		return r;
+	}
+	if (!o->quiet)
+		printf("old recovery key removed (token %d, keyslot %d%s)\n", old_tok, old_ks,
+		       old_off >= 0 ? " and its offline keyslot" : "");
+	return 0;
 }
 
 int main(int argc, char **argv)
@@ -961,6 +1099,7 @@ int main(int argc, char **argv)
 		{ "quiet", no_argument, NULL, 'q' },
 		{ "sep-only", no_argument, NULL, 'S' },
 		{ "offline", no_argument, NULL, 'F' },
+		{ "replace", no_argument, NULL, 'R' },
 		{ NULL, 0, NULL, 0 },
 	};
 	struct opts o = { .uid = -1, .owner = -1 };
@@ -989,17 +1128,22 @@ int main(int argc, char **argv)
 		case 'q': o.quiet = 1; break;
 		case 'S': o.sep_only = 1; break;
 		case 'F': o.offline = 1; break;
+		case 'R': o.replace = 1; break;
 		default: die_usage();
 		}
 	}
 	r = fde_conf_load(&o.conf);
 	if (r)
 		fprintf(stderr, "aurora-sep-fde: cannot read the configuration (%s)\n", strerror(-r));
+	if (o.sep_only && o.offline) {
+		fprintf(stderr, "aurora-sep-fde: --sep-only and --offline exclude each other\n");
+		return 2;
+	}
 	/* recovery = sep-only in fde.conf, unless --offline asks otherwise */
 	if (o.conf.recovery_sep_only && !o.offline)
 		o.sep_only = 1;
 	need_dev = strcmp(o.cmd, "change-password") && strcmp(o.cmd, "passwd-hook") &&
-		   strcmp(o.cmd, "sync") && strcmp(o.cmd, "status");
+		   strcmp(o.cmd, "sync") && strcmp(o.cmd, "status") && strcmp(o.cmd, "boot-chain");
 	if (optind == argc - 1)
 		o.device = argv[optind];
 	else if (optind != argc || need_dev)
@@ -1026,9 +1170,7 @@ int main(int argc, char **argv)
 	if (!strcmp(o.cmd, "enroll"))
 		r = cmd_enroll_user(cd, &o);
 	else if (!strcmp(o.cmd, "recovery")) {
-		if (o.uid < 0)
-			o.uid = recovery_bag_uid(cd, &o.conf);
-		r = cmd_enroll(cd, &o, 1);
+		r = cmd_recovery(cd, &o);
 		if (!r)
 			fde_volumes_add(&o.conf, o.device);
 	} else if (!strcmp(o.cmd, "add-user"))
@@ -1053,6 +1195,8 @@ int main(int argc, char **argv)
 		r = cmd_gate_check(cd, &o);
 	else if (!strcmp(o.cmd, "status"))
 		r = cmd_status(cd, &o);
+	else if (!strcmp(o.cmd, "boot-chain"))
+		r = cmd_boot_chain();
 	else
 		die_usage();
 	if (cd)

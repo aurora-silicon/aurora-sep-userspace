@@ -31,8 +31,9 @@ PAMMOD := pam_aurora_sep_fde.so
 TOOL := aurora-sep-cryptenroll
 FDE := aurora-sep-fde
 
-FDE_SRC := aurora-sep-fde.c fde-owner.c sep-fde.c sep-seal.c
-FDE_HDR := fde-owner.h sep-fde.h sep-seal.h
+FDE_SRC := aurora-sep-fde.c fde-owner.c sep-fde.c sep-seal.c sep-boot.c
+FDE_HDR := fde-owner.h sep-fde.h sep-seal.h sep-boot.h
+PLUGIN_SRC := luks2-token-aurora-sep.c sep-seal.c sep-fde.c sep-boot.c
 
 # The PAM module needs the PAM headers (pam-devel / pam); initrd-only builds can go without.
 HAVE_PAM := $(shell $(PKG_CONFIG) --exists pam && echo yes)
@@ -43,9 +44,9 @@ all: $(PLUGIN) $(TOOL) $(FDE) $(ALL_PAM)
 $(PAMMOD): pam_aurora_sep_fde.c
 	$(CC) $(CFLAGS) -shared -Wl,-z,relro,-z,now -o $@ pam_aurora_sep_fde.c $(LDFLAGS) -lpam
 
-$(PLUGIN): luks2-token-aurora-sep.c sep-seal.c sep-seal.h sep-fde.c sep-fde.h token.sym
+$(PLUGIN): $(PLUGIN_SRC) sep-seal.h sep-fde.h sep-boot.h token.sym
 	$(CC) $(CFLAGS) $(DEPS_CFLAGS) -shared -Wl,--version-script=token.sym \
-		-Wl,-z,relro,-z,now -o $@ luks2-token-aurora-sep.c sep-seal.c sep-fde.c $(LDFLAGS) $(DEPS_LIBS)
+		-Wl,-z,relro,-z,now -o $@ $(PLUGIN_SRC) $(LDFLAGS) $(DEPS_LIBS)
 
 $(FDE): $(FDE_SRC) $(FDE_HDR)
 	$(CC) $(CFLAGS) $(DEPS_CFLAGS) -fPIE -pie -Wl,-z,relro,-z,now -o $@ \
@@ -58,10 +59,10 @@ $(TOOL): aurora-sep-cryptenroll.c sep-seal.c sep-seal.h
 # Test builds swap the SEP trusted key for a kernel "user" key, so the AF_ALG,
 # token and LUKS2 paths run on any Linux >= 6.2. Kernels with af_alg_restrict
 # need root (CAP_SYS_ADMIN or CAP_NET_ADMIN) to bind ccm(aes).
-test/$(PLUGIN): luks2-token-aurora-sep.c sep-seal.c sep-seal.h sep-fde.c sep-fde.h token.sym
+test/$(PLUGIN): $(PLUGIN_SRC) sep-seal.h sep-fde.h sep-boot.h token.sym
 	mkdir -p test
 	$(CC) $(CFLAGS) -DSEP_SEAL_TEST_USER_KEYS -DSEP_FDE_MOCK $(DEPS_CFLAGS) -shared \
-		-Wl,--version-script=token.sym -o $@ luks2-token-aurora-sep.c sep-seal.c sep-fde.c $(DEPS_LIBS)
+		-Wl,--version-script=token.sym -o $@ $(PLUGIN_SRC) $(DEPS_LIBS)
 
 # Password mode against the file-backed enclave double (sep-fde.c, SEP_FDE_MOCK).
 test/$(FDE): $(FDE_SRC) $(FDE_HDR)
@@ -88,6 +89,7 @@ check: test/test-seal test/$(PLUGIN) test/$(TOOL) test/$(FDE) test/pam-drive $(P
 	sh tests/test-luks.sh test
 	sh tests/test-fde.sh test
 	sh tests/test-owners.sh test
+	sh tests/test-policy.sh test
 	bash tests/test-initrd.sh
 	@nm -D --defined-only $(PLUGIN) | grep -q 'cryptsetup_token_open@@CRYPTSETUP_TOKEN_1.0' \
 		&& echo "PASS plugin exports the CRYPTSETUP_TOKEN_1.0 ABI"

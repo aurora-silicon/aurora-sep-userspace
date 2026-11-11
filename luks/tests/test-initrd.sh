@@ -29,6 +29,8 @@ mkroot() {
 	: >"$r/usr/lib/cryptsetup/libcryptsetup-token-aurora-sep.so"
 	printf 'keybag' >"$r/var/lib/aurora-sep-keybag.bin"
 	printf 'refkey' >"$r/var/lib/aurora-sep-refkey.bin"
+	mkdir -p "$r/etc/aurora-sep"
+	printf 'boot-chain = warn\n' >"$r/etc/aurora-sep/fde.conf"
 }
 cat >"$T/bin/modinfo" <<'EOF'
 #!/bin/sh
@@ -94,6 +96,7 @@ rm -rf "$T/initdir"; : >"$T/d.log"
 FAKE_PARMS=$PARMS_NEW dracut_run "$T/d.log" install
 if has "$T/d.log" "lib /usr/lib64/cryptsetup/libcryptsetup-token-aurora-sep.so"; then pass "dracut: token plugin"; else fail "dracut: token plugin"; fi
 if has "$T/d.log" "file /usr/lib/systemd/system/systemd-cryptsetup@.service.d/aurora-sep.conf"; then pass "dracut: cryptsetup wait drop-in"; else fail "dracut: drop-in"; fi
+if has "$T/d.log" "file /etc/aurora-sep/fde.conf"; then pass "dracut: fde.conf (boot-chain policy)"; else fail "dracut: fde.conf"; fi
 if has "$T/d.log" "file /var/lib/aurora-sep-keybag.bin" && has "$T/d.log" "file /var/lib/aurora-sep-refkey.bin"; then pass "dracut: key store copies"; else fail "dracut: key store copies"; fi
 if grep -q "refkey-v2" "$T/d.log"; then fail "dracut: absent refkey-v2 must be skipped"; else pass "dracut: absent refkey-v2 skipped"; fi
 if [ "$(stat -c %a "$T/initdir/var/lib/aurora-sep-keybag.bin" 2>/dev/null || stat -f %Lp "$T/initdir/var/lib/aurora-sep-keybag.bin")" = 600 ]; then pass "dracut: key bag copy is 0600"; else fail "dracut: key bag mode"; fi
@@ -153,7 +156,9 @@ cpio_run() { # <log> ; env: FAKE_PARMS ; the fake root is the real / here, so us
 		. <(sed -e "s|/usr/lib/cryptsetup/|$T/root/usr/lib/cryptsetup/|" \
 			-e "s|\[\[ ! -s /var/lib|[[ ! -s $T/root/var/lib|" \
 			-e "s|\[\[ -s \$f \]\]|[[ -s $T/root\$f ]]|" \
-			-e "s|<\"\$f\"|<\"$T/root\$f\"|" "$here/initrd/mkinitcpio/aurora-sep")
+			-e "s|<\"\$f\"|<\"$T/root\$f\"|" \
+			-e "s|\[\[ -r /etc/aurora-sep/fde.conf \]\]|[[ -r $T/root/etc/aurora-sep/fde.conf ]]|" \
+			"$here/initrd/mkinitcpio/aurora-sep")
 		build
 	)
 }
@@ -166,6 +171,7 @@ if has "$T/m.log" "file /var/lib/aurora-sep-keybag.bin 0600" && has "$T/m.log" "
 if has "$T/m.log" "link /usr/lib/systemd/system/cryptsetup-pre.target.wants/aurora-sep-initrd.service -> ../aurora-sep-initrd.service"; then pass "mkinitcpio: unit wanted by cryptsetup-pre.target"; else fail "mkinitcpio: wants link"; fi
 if has "$T/m.log" "link /usr/lib/systemd/system/sysinit.target.wants/aurora-sep-initrd.service -> ../aurora-sep-initrd.service"; then pass "mkinitcpio: unit started from sysinit.target"; else fail "mkinitcpio: sysinit link"; fi
 if has "$T/m.log" "file /usr/lib/systemd/system/systemd-cryptsetup@.service.d/aurora-sep.conf "; then pass "mkinitcpio: cryptsetup wait drop-in"; else fail "mkinitcpio: drop-in"; fi
+if has "$T/m.log" "file /etc/aurora-sep/fde.conf "; then pass "mkinitcpio: fde.conf (boot-chain policy)"; else fail "mkinitcpio: fde.conf"; fi
 if [ "$(wc -l <"$T/build/usr/lib/aurora-sep/initrd-keystore.sha256")" = 2 ]; then pass "mkinitcpio: key store hashes recorded"; else fail "mkinitcpio: hashes"; fi
 
 rm -rf "$T/build"; : >"$T/m.log"

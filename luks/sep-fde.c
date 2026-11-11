@@ -25,6 +25,7 @@
 
 #include "sep-fde.h"
 #include "sep-seal.h"
+#include "sep-boot.h"
 
 #define BAG_MAX		4096	/* SEP_KEYBAG_BLOB_MAX: a fresh user bag wraps to 1504 bytes */
 #define RECORD_MAX	2048
@@ -190,6 +191,9 @@ int fde_token_parse(const char *json, struct fde_token *t)
 	}
 	s = jstr(o, "aurora_sep_user");
 	snprintf(t->user, sizeof(t->user), "%s", s ? s : "");
+	s = jstr(o, "aurora_sep_os_uuid");
+	if (s && strlen(s) == sizeof(t->os_uuid) - 1)
+		snprintf(t->os_uuid, sizeof(t->os_uuid), "%s", s);
 	if (json_object_object_get_ex(o, "aurora_sep_offline_keyslot", &v)) {
 		if (!json_object_is_type(v, json_type_int))
 			goto out;
@@ -256,6 +260,8 @@ char *fde_token_build(const struct fde_token *t)
 		json_object_object_add(o, "aurora_sep_linux_uid", json_object_new_int64(t->linux_uid));
 	if (t->user[0])
 		json_object_object_add(o, "aurora_sep_user", json_object_new_string(t->user));
+	if (t->os_uuid[0])
+		json_object_object_add(o, "aurora_sep_os_uuid", json_object_new_string(t->os_uuid));
 	if (t->offline_keyslot >= 0)
 		json_object_object_add(o, "aurora_sep_offline_keyslot",
 				       json_object_new_int(t->offline_keyslot));
@@ -1015,10 +1021,30 @@ static void xor_stream(const uint8_t ks[32], const uint8_t nonce[16], uint8_t *b
 	}
 }
 
+/*
+ * The OS install the double binds sealed secrets to, as the kernel does: the
+ * boot's OS identity (sep-boot.c), "mock-os" when the test root names none,
+ * -ENOKEY when $AURORA_SEP_FDE_MOCK_NO_OS says this kernel has none.
+ */
+#define MOCK_OS_LEN	16
+static int mock_os_id(uint8_t out[MOCK_OS_LEN])
+{
+	char u[SEP_BOOT_UUID_LEN + 1];
+	uint8_t h[32];
+
+	if (getenv("AURORA_SEP_FDE_MOCK_NO_OS"))
+		return -ENOKEY;
+	if (sep_boot_os_uuid(u))
+		snprintf(u, sizeof(u), "mock-os");
+	prf("os", u, strlen(u), "", 0, h);
+	memcpy(out, h, MOCK_OS_LEN);
+	return 0;
+}
+
 int fde_seal(uint32_t uid, const uint8_t *record, size_t record_len,
 	     const uint8_t *secret, size_t secret_len, uint8_t **sealed, size_t *len)
 {
-	uint8_t bag[MB_LEN], ks[32], *out;
+	uint8_t bag[MB_LEN], ks[32], os[MOCK_OS_LEN], *out;
 	int r = live_bag(uid, bag);
 
 	if (r)
@@ -1030,15 +1056,19 @@ int fde_seal(uint32_t uid, const uint8_t *record, size_t record_len,
 		return r;
 	if (!secret_len || secret_len > 64)
 		return -EINVAL;
-	out = malloc(16 + secret_len + 32);
+	r = mock_os_id(os);
+	if (r)
+		return r;
+	out = malloc(16 + secret_len + 32 + MOCK_OS_LEN);
 	if (!out)
 		return -ENOMEM;
 	rnd(out, 16);
 	memcpy(out + 16, secret, secret_len);
 	xor_stream(ks, out, out + 16, secret_len);
 	prf("tag", ks, 32, out, 16 + secret_len, out + 16 + secret_len);
+	memcpy(out + 16 + secret_len + 32, os, MOCK_OS_LEN);
 	*sealed = out;
-	*len = 16 + secret_len + 32;
+	*len = 16 + secret_len + 32 + MOCK_OS_LEN;
 	return 0;
 }
 
@@ -1046,7 +1076,7 @@ int fde_unseal(uint32_t uid, const uint8_t *record, size_t record_len,
 	       const uint8_t *sealed, size_t sealed_len, uint8_t *out, size_t out_size,
 	       size_t *out_len)
 {
-	uint8_t bag[MB_LEN], ks[32], tag[32];
+	uint8_t bag[MB_LEN], ks[32], tag[32], os[MOCK_OS_LEN];
 	size_t n;
 	int r = live_bag(uid, bag);
 
@@ -1057,8 +1087,15 @@ int fde_unseal(uint32_t uid, const uint8_t *record, size_t record_len,
 	r = record_ok(uid, record, record_len, bag);
 	if (r || (r = key_secret(record, ks, 0)))
 		return r;
-	if (sealed_len < 16 + 1 + 32)
+	if (sealed_len < 16 + 1 + 32 + MOCK_OS_LEN)
 		return -EINVAL;
+	/* The kernel's per-OS-install binding: checked before the enclave. */
+	r = mock_os_id(os);
+	if (r)
+		return r == -ENOKEY ? -EXDEV : r;
+	if (memcmp(os, sealed + sealed_len - MOCK_OS_LEN, MOCK_OS_LEN))
+		return -EXDEV;
+	sealed_len -= MOCK_OS_LEN;
 	n = sealed_len - 16 - 32;
 	prf("tag", ks, 32, sealed, 16 + n, tag);
 	if (memcmp(tag, sealed + 16 + n, 32) || n > out_size)
@@ -1100,7 +1137,7 @@ int fde_open_token(const struct fde_token *t, const char *pw, size_t pw_len,
 	fde_bag_lock(t->uid);
 	if (r < 0 || n != SEP_FDE_SECRET_BYTES) {
 		sep_wipe(secret, SEP_FDE_SECRET_BYTES);
-		return r == -ENODEV ? r : -EPERM;
+		return r == -ENODEV || r == -EXDEV ? r : -EPERM;
 	}
 	return 0;
 }
@@ -1128,6 +1165,8 @@ int fde_enroll_in_bag(uint32_t uid, const char *role, const char *pw, size_t pw_
 		     &t->sealed, &t->sealed_len);
 	if (r)
 		goto fail;
+	if (sep_boot_os_uuid(t->os_uuid))
+		t->os_uuid[0] = '\0';
 	r = fde_unseal(uid, t->record, t->record_len, t->sealed, t->sealed_len,
 		       check, sizeof(check), &n);
 	if (!r && (n != SEP_FDE_SECRET_BYTES || memcmp(check, secret, n)))

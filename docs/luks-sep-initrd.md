@@ -79,6 +79,10 @@ With the driver loaded from the initrd, volumes opened on the real root before `
 
 Always kept. `aurora-sep-cryptenroll` refuses to remove the last keyslot that is not bound to the SEP. systemd-cryptsetup tries tokens first and prompts for a passphrase when the plugin says no: `-EPERM` (the SEP refused the blob) or `-EAGAIN` (no SEP, or it did not come up in time). A recovery key from `systemd-cryptenroll --recovery-key` works the same way.
 
+### Boot chain check
+
+Before the plugin asks the SEP for a key in the initrd, it reads the boot record (`/sys/firmware/aurora/boot_security/state`). With `boot-chain = warn` (the default in `/etc/aurora-sep/fde.conf`, which the image carries) it logs one line per boot when the chain is not `verified` and goes on. With `boot-chain = require` it returns `-EPERM` instead, so the passphrase prompt appears unless the chain is verified. `aurora-sep-fde boot-chain` prints the decision for the running boot.
+
 ### When the SEP OS identity changes
 
 The sealed key is bound to this Mac's SEP and to the Linux OS identity (`apple_sep.os_uuid_hi`/`_lo`). In the initrd the identity comes from the same kernel command line, because `modprobe` applies `apple_sep.*` command line options. If the pin is dropped, or Linux is reinstalled with a new identity, the SEP refuses to recover the key bag, the unseal fails with `EBADMSG`, the plugin returns `-EPERM` and the passphrase prompt appears. In the key-store-only phase nothing is written to the SEP store and nothing is provisioned, so a wrong lane cannot damage anything. After booting with the passphrase, put the pin back or re-enroll with `aurora-sep-cryptenroll --wipe-slot=sep`.

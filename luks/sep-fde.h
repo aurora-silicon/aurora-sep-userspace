@@ -57,6 +57,10 @@ struct fde_token {
 	/* The Linux account the token belongs to (user tokens; -1 unknown). */
 	int64_t linux_uid;
 	char user[64];
+	/* The OS install (key store OS identity) the secret was sealed under,
+	 * as the tool saw it at enrolment; informational, "" unknown. The
+	 * kernel enforces the binding: another OS install gets -EXDEV. */
+	char os_uuid[37];
 };
 
 struct fde_state {
@@ -72,7 +76,10 @@ int fde_token_parse(const char *json, struct fde_token *t);
 char *fde_token_build(const struct fde_token *t);
 
 /* Enclave operations. Errors: -EACCES refused (wrong password, no bag),
- * -EKEYREJECTED the enclave refused a record/blob, -ENODEV no SEP. */
+ * -EKEYREJECTED the enclave refused a record/blob, -ENODEV no SEP.
+ * fde_seal: -ENOKEY when the kernel has no OS identity to bind the secret to.
+ * fde_unseal: -EXDEV when the secret was sealed under another OS install on
+ * this Mac (one disk key per OS install, as FileVault keeps one per volume). */
 int fde_bag_create(uint32_t uid, const char *pw, size_t pw_len);
 int fde_bag_unlock(uint32_t uid, const char *pw, size_t pw_len);
 int fde_bag_lock(uint32_t uid);
@@ -91,8 +98,9 @@ int fde_unseal(uint32_t uid, const uint8_t *record, size_t record_len,
 /*
  * Unlock: load the token's bag if the enclave does not hold it, unlock it with
  * the password, open the sealed secret, lock the bag again. -EACCES means the
- * password was wrong (the enclave counted it), -EPERM that the token cannot be
- * used on this Mac or OS (bag or record refused).
+ * password was wrong (the enclave counted it), -EXDEV that the secret belongs
+ * to another OS install on this Mac, -EPERM that the token cannot be used on
+ * this Mac or OS (bag or record refused).
  */
 int fde_open_token(const struct fde_token *t, const char *pw, size_t pw_len,
 		   uint8_t secret[SEP_FDE_SECRET_BYTES]);
