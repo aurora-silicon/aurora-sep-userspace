@@ -34,21 +34,21 @@ static int wait_seconds(void)
 }
 
 /*
- * In the initramfs (the root volume and anything else opened before the
- * switch to the real root), check the boot chain before the Secure Enclave
- * is asked for a key: fde.conf boot-chain = warn says once per boot that the
- * chain is not verified and goes on; boot-chain = require refuses, so the
- * volume asks for its passphrase or recovery key instead.
+ * Before the Secure Enclave is asked for a volume key, at every unlock (the
+ * root volume in the initramfs and any volume opened later): fde.conf
+ * boot-chain = audit logs, per unlock, what require would refuse when the
+ * boot chain is not verified and goes on; boot-chain = require refuses, so
+ * the volume asks for its passphrase or recovery key instead.
  */
 static int boot_chain_gate(struct crypt_device *cd)
 {
-	char msg[256];
-	int first, r;
+	const char *dev = crypt_get_device_name(cd), *uuid = crypt_get_uuid(cd);
+	char vol[384], msg[768];
+	int r;
 
-	if (!sep_boot_in_initrd())
-		return 0;
-	r = sep_boot_chain_gate(msg, sizeof(msg), &first);
-	if (msg[0] && (first || r))
+	snprintf(vol, sizeof(vol), "%s (LUKS UUID %s)", dev ? dev : "?", uuid ? uuid : "?");
+	r = sep_boot_chain_gate(vol, msg, sizeof(msg));
+	if (msg[0])
 		crypt_logf(cd, CRYPT_LOG_ERROR, "%s\n", msg);
 	return r;
 }

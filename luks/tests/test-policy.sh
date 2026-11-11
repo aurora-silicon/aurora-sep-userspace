@@ -6,7 +6,8 @@
 # - every sealed secret is bound to the OS install it was made under
 #   ($AURORA_SEP_FDE_ROOT/proc/device-tree/chosen/apfs-preboot-uuid, or the
 #   apple_sep os_uuid pin);
-# - boot-chain = warn | require before the initramfs asks the enclave.
+# - boot-chain = audit | require before every enclave volume unlock, and the
+#   boot-chain command that flips it per Mac (guarded on a verified boot).
 # Usage: tests/test-policy.sh <test build dir>
 set -eu
 B=$(cd "$1" && pwd)
@@ -141,41 +142,89 @@ img=$T/h.img; newvol "$img"
 if AURORA_SEP_FDE_MOCK_NO_OS=1 no "$F" enroll --uid 60308 --unlock-key-file "$T/pass" --password-file "$T/alice" "$img" && said 'no OS identity'; then
 	pass "no OS identity: enrolment refused, says why"; else fail "no OS identity"; fi
 
-# ---- boot-chain = warn | require, in the initramfs ----
+# ---- boot-chain = audit | require, at every unlock ----
 new_mac
 printf 'recovery = offline\n' >"$T/fde.conf"
 img=$T/i.img; newvol "$img"
 try "$F" enroll --user alice --unlock-key-file "$T/pass" --password-file "$T/alice" "$img" || fail "enroll i"
-I=$T/initrd; mkdir -p "$I/etc" "$I/sys/firmware/aurora/boot_security"; : >"$I/etc/initrd-release"
-st() {
-	if [ "$1" = absent ]; then rm -f "$T/initrd/sys/firmware/aurora/boot_security/state"
-	else printf '%s\n' "$1" >"$T/initrd/sys/firmware/aurora/boot_security/state"; fi
-	rm -rf "${T:?}/initrd/run"
+I=$T/initrd; BS=$I/sys/firmware/aurora/boot_security
+mkdir -p "$I/etc" "$BS"; : >"$I/etc/initrd-release"
+st() { # <state|absent> [advisory] [measurements...]
+	rm -f "$BS/state" "$BS/advisory" "$BS/measurements"
+	[ "$1" = absent ] && return 0
+	printf '%s\n' "$1" >"$BS/state"; shift
+	[ $# -gt 0 ] && { printf '%s\n' "$1" >"$BS/advisory"; shift; }
+	for m in "$@"; do printf '%s\n' "$m" >>"$BS/measurements"; done
+	return 0
 }
+H=0000000000000000000000000000000000000000000000000000000000000000
 export AURORA_SEP_FDE_ROOT="$I"
-st partial
-if try "$F" test --password-file "$T/alice" "$img" && said 'warning: boot chain partial' && said 'boot-chain = warn'; then
-	pass "warn (default): unverified chain logged, SEP unlock goes on"; else fail "warn partial"; fi
-"$F" test --password-file "$T/alice" "$img" >"$T/out" 2>&1 || fail "warn second open"
-if said 'warning: boot chain'; then fail "warn line repeated in the same boot"; else pass "warn logged once per boot"; fi
+st partial 1 "stage1 audit stage2 verified $H" "stage2 enforce u-boot verified $H"
+if try "$F" test --password-file "$T/alice" "$img" && said 'boot-chain = audit: require would refuse the Secure Enclave unlock of' &&
+   said 'boot chain partial, advisory, first unverified link: stage1 stage2 (audit, verified)' && said "LUKS UUID $(cryptsetup luksUUID "$img")"; then
+	pass "audit (default): one line with chain state, first unverified link and the volume; SEP unlock goes on"; else fail "audit partial"; fi
+"$F" test --password-file "$T/alice" "$img" >"$T/out" 2>&1 || fail "audit second open"
+if said 'require would refuse'; then pass "audit: a line for every unlock"; else fail "audit line only once"; fi
+st partial 0 "stage1 enforce stage2 verified $H" "stage2 enforce u-boot verified $H" "u-boot off kernel unverified $H"
+if try "$F" test --password-file "$T/alice" "$img" && said 'first unverified link: u-boot kernel (off, unverified)'; then
+	pass "audit: the first link that is not enforced+verified is named"; else fail "first gap later stage"; fi
 st absent
-if try "$F" test --password-file "$T/alice" "$img" && said 'boot chain unknown'; then pass "warn: no boot record = unknown, unlock goes on"; else fail "warn absent"; fi
-st verified
-if try "$F" test --password-file "$T/alice" "$img" && ! said 'boot chain'; then pass "verified chain: no warning"; else fail "verified"; fi
+if try "$F" test --password-file "$T/alice" "$img" && said 'boot chain none' && said 'no boot record'; then pass "audit: no boot record, unlock goes on"; else fail "audit absent"; fi
+st verified 0 "stage1 enforce stage2 verified $H"
+if try "$F" test --password-file "$T/alice" "$img" && ! said 'boot-chain ='; then pass "verified chain: no line"; else fail "verified"; fi
+st verified 1
+if try "$F" test --password-file "$T/alice" "$img" && said 'boot chain verified, advisory'; then pass "verified but advisory counts as not verified"; else fail "advisory verified"; fi
+printf 'recovery = offline\nboot-chain = warn\n' >"$T/fde.conf"
+st unverified 1
+if try "$F" test --password-file "$T/alice" "$img" && said 'boot-chain = audit'; then pass "warn (old name) is audit"; else fail "warn alias"; fi
 printf 'recovery = offline\nboot-chain = require\n' >"$T/fde.conf"
-st unverified
-if no "$F" test --password-file "$T/alice" "$img" && said 'boot-chain = require'; then pass "require: unverified chain, no SEP unlock"; else fail "require unverified"; fi
+st unverified 1 "stage1 off stage2 unverified $H"
+if no "$F" test --password-file "$T/alice" "$img" && said 'boot-chain = require: refused the Secure Enclave unlock of' && said 'stage1 stage2 (off, unverified)'; then
+	pass "require: unverified chain, no SEP unlock, says why"; else fail "require unverified"; fi
 if $CS0 --disable-external-tokens open --test-passphrase --key-file "$T/pass" "$img" >/dev/null 2>&1; then pass "require: the passphrase prompt still opens the volume"; else fail "require passphrase"; fi
 st absent
 if no "$F" test --password-file "$T/alice" "$img"; then pass "require: no boot record, no SEP unlock"; else fail "require absent"; fi
-st verified
+st verified 0 "stage1 enforce stage2 verified $H"
 if try "$F" test --password-file "$T/alice" "$img"; then pass "require: verified chain unlocks"; else fail "require verified"; fi
-st unverified
-"$F" boot-chain >"$T/out"
-if said 'boot chain unverified, boot-chain = require: the initramfs does not ask the Secure Enclave'; then pass "boot-chain command reports the decision"; else fail "boot-chain command"; fi
-rm -f "$T/initrd/etc/initrd-release"
-if try "$F" test --password-file "$T/alice" "$img"; then pass "require applies only in the initramfs"; else fail "require on the real root"; fi
-unset AURORA_SEP_FDE_ROOT
+rm -f "$I/etc/initrd-release"
+st unverified 1
+if no "$F" test --password-file "$T/alice" "$img"; then pass "require applies on the real root too (non-root volumes)"; else fail "require on the real root"; fi
+"$F" status "$img" >"$T/out" 2>&1
+if said 'boot chain: unverified, advisory, first unverified link:' && said 'boot-chain = require: the Secure Enclave unlocks nothing'; then pass "status shows the chain, first gap and decision"; else fail "status chain"; fi
+
+# ---- boot-chain audit | require: the per-Mac flip and its guard ----
+: >"$T/fde-volumes"
+printf '# kept comment\nrecovery = offline\nboot-chain = audit\nadmin-groups = wheel\n' >"$T/fde.conf"
+export AURORA_SEP_FDE_INITRAMFS_CMD="$T/regen"
+printf '#!/bin/sh\necho regen >>"%s/regen.log"\n' "$T" >"$T/regen"; chmod +x "$T/regen"
+"$F" boot-chain >"$T/out" 2>&1
+if said 'require can be switched on here: no'; then pass "boot-chain: says require cannot be switched on here"; else fail "boot-chain show"; fi
+if no "$F" boot-chain require && said 'refusing boot-chain = require' && grep -q '^boot-chain = audit$' "$T/fde.conf" && [ ! -e "$T/regen.log" ]; then
+	pass "require refused on an unverified boot; fde.conf and initramfs untouched"; else fail "require guard"; fi
+if try "$F" boot-chain require --force && grep -q '^boot-chain = require$' "$T/fde.conf" && grep -q '^# kept comment$' "$T/fde.conf" &&
+   grep -q '^admin-groups = wheel$' "$T/fde.conf" && [ "$(grep -c boot-chain "$T/fde.conf")" = 1 ] && [ "$(wc -l <"$T/regen.log")" = 1 ]; then
+	pass "--force switches require, keeps the other lines, rebuilds the initramfs"; else fail "require --force"; fi
+if try "$F" boot-chain audit --no-initramfs && grep -q '^boot-chain = audit$' "$T/fde.conf" && [ "$(wc -l <"$T/regen.log")" = 1 ] && said 'not rebuilt'; then
+	pass "audit: always allowed; --no-initramfs skips the rebuild"; else fail "audit flip"; fi
+printf '#!/bin/sh\nexit 1\n' >"$T/regen"
+if no "$F" boot-chain require --force && grep -q '^boot-chain = audit$' "$T/fde.conf" && said 'back to audit'; then
+	pass "a failed initramfs rebuild puts the old policy back"; else fail "regen failure rollback"; fi
+st verified 0 "stage1 enforce stage2 verified $H"
+printf '#!/bin/sh\nexit 0\n' >"$T/regen"
+if try "$F" boot-chain require && grep -q '^boot-chain = require$' "$T/fde.conf"; then pass "require on a verified boot needs no --force"; else fail "require verified flip"; fi
+"$F" boot-chain audit --no-initramfs >/dev/null 2>&1
+st unverified 1
+# a registered volume that only the enclave opens: --force must not strand it
+j=$T/j.img; newvol "$j"
+try "$F" enroll --user alice --unlock-key-file "$T/pass" --password-file "$T/alice" "$j" || fail "enroll j"
+printf '%s\n' "$j" >"$T/fde-volumes"
+$CS0 luksRemoveKey "$j" "$T/pass" </dev/null >/dev/null 2>&1 || fail "remove j passphrase"
+if no "$F" boot-chain require --force && said 'has no passphrase or offline recovery keyslot' && grep -q '^boot-chain = audit$' "$T/fde.conf"; then
+	pass "--force refused while a registered volume opens only through the enclave"; else fail "force strand guard"; fi
+rm -f "$T/fde-volumes"
+ln -sf "$T/fde.conf" "$T/fde-link.conf"
+if AURORA_SEP_FDE_CONF="$T/fde-link.conf" no "$F" boot-chain audit && said 'is a link'; then pass "a linked (system-managed) fde.conf is left alone"; else fail "symlink conf"; fi
+unset AURORA_SEP_FDE_ROOT AURORA_SEP_FDE_INITRAMFS_CMD
 
 echo "test-policy: $fails failure(s)"
 [ "$fails" = 0 ]

@@ -30,10 +30,11 @@
  *                                   Recovery keys made from then on; the
  *                                   recovery command's --offline/--sep-only
  *                                   picks per key.
- *   boot-chain = warn | require     before the initramfs asks the SEP for a
- *                                   volume key: warn (default) logs once when
- *                                   the boot chain is not verified and goes
- *                                   on; require refuses the SEP unlock then
+ *   boot-chain = audit | require    before a volume key is asked of the SEP:
+ *                                   audit (default; "warn" is the old name)
+ *                                   logs one line per unlock when the boot
+ *                                   chain is not verified and goes on;
+ *                                   require refuses the SEP unlock then
  *                                   (passphrase or recovery key instead).
  *   admin-groups = wheel sudo admin groups whose members become owners
  *   bag-uid-base = 60000            enclave bag uid = base + Linux uid

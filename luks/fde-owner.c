@@ -72,10 +72,10 @@ int fde_conf_load(struct fde_conf *c)
 		} else if (!strcmp(k, "boot-chain")) {
 			if (!strcmp(v, "require"))
 				c->boot_chain_require = 1;
-			else if (!strcmp(v, "warn"))
+			else if (!strcmp(v, "audit") || !strcmp(v, "warn"))
 				c->boot_chain_require = 0;
 			else
-				fprintf(stderr, "aurora-sep-fde: fde.conf: unknown boot-chain policy '%s' (warn)\n", v);
+				fprintf(stderr, "aurora-sep-fde: fde.conf: unknown boot-chain policy '%s' (audit)\n", v);
 		} else if (!strcmp(k, "admin-groups")) {
 			snprintf(c->admin_groups, sizeof(c->admin_groups), "%s", v);
 		} else if (!strcmp(k, "bag-uid-base")) {

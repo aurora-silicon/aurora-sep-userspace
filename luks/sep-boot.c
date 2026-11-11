@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <syslog.h>
 #include <sys/stat.h>
 
 #include "sep-boot.h"
@@ -17,9 +18,11 @@
 #define PARAM_HI	"/sys/module/apple_sep/parameters/os_uuid_hi"
 #define PARAM_LO	"/sys/module/apple_sep/parameters/os_uuid_lo"
 #define CHOSEN_UUID	"/proc/device-tree/chosen/apfs-preboot-uuid"
-#define CHAIN_STATE	"/sys/firmware/aurora/boot_security/state"
+#define CHAIN_DIR	"/sys/firmware/aurora/boot_security"
+#define CHAIN_STATE	CHAIN_DIR "/state"
+#define CHAIN_ADVISORY	CHAIN_DIR "/advisory"
+#define CHAIN_MEAS	CHAIN_DIR "/measurements"
 #define INITRD_RELEASE	"/etc/initrd-release"
-#define WARNED		"/run/aurora-sep/boot-chain-warned"
 
 static void path(char *buf, size_t n, const char *p)
 {
@@ -105,39 +108,105 @@ int sep_boot_chain_state(char *out, size_t size)
 	return read_small(CHAIN_STATE, out, size);
 }
 
-enum sep_boot_chain_policy sep_boot_chain_policy(void)
+/* The first measurement line ("stage policy component verdict sha256") that
+ * is not an enforced, verified link, as "stage component (policy, verdict)". */
+static void first_gap(char *out, size_t size)
 {
-	const char *conf = secure_getenv("AURORA_SEP_FDE_CONF");
-	enum sep_boot_chain_policy p = SEP_BOOT_CHAIN_WARN;
 	char full[4096], line[512];
 	FILE *f;
 
+	out[0] = '\0';
+	path(full, sizeof(full), CHAIN_MEAS);
+	f = fopen(full, "re");
+	if (!f)
+		return;
+	while (fgets(line, sizeof(line), f)) {
+		char stage[32], policy[16], comp[64], verdict[16];
+
+		if (sscanf(line, "%31s %15s %63s %15s", stage, policy, comp, verdict) != 4)
+			continue;
+		if (!strcmp(policy, "enforce") && !strcmp(verdict, "verified"))
+			continue;
+		snprintf(out, size, "%s %s (%s, %s)", stage, comp, policy, verdict);
+		break;
+	}
+	fclose(f);
+}
+
+void sep_boot_chain_read(struct sep_boot_chain *c)
+{
+	char buf[16];
+
+	memset(c, 0, sizeof(*c));
+	c->advisory = -1;
+	if (sep_boot_chain_state(c->state, sizeof(c->state))) {
+		snprintf(c->state, sizeof(c->state), "none");
+		snprintf(c->first_gap, sizeof(c->first_gap),
+			 "no boot record (the boot chain reports nothing from Stage 1 on)");
+		return;
+	}
+	c->present = 1;
+	if (read_small(CHAIN_ADVISORY, buf, sizeof(buf)) == 0 && (!strcmp(buf, "0") || !strcmp(buf, "1")))
+		c->advisory = buf[0] == '1';
+	c->verified = !strcmp(c->state, "verified") && c->advisory == 0;
+	if (c->verified)
+		return;
+	first_gap(c->first_gap, sizeof(c->first_gap));
+	if (!c->first_gap[0])
+		snprintf(c->first_gap, sizeof(c->first_gap), "%s",
+			 c->advisory ? "stage1 (not an enforcing Stage 1: the record is advisory)" :
+				       "unknown (the record lists no unverified link)");
+}
+
+void sep_boot_conf_path(char *buf, size_t size)
+{
+	const char *conf = secure_getenv("AURORA_SEP_FDE_CONF");
+
 	if (conf && *conf)
-		snprintf(full, sizeof(full), "%s", conf);
+		snprintf(buf, size, "%s", conf);
 	else
-		path(full, sizeof(full), CONF_PATH);
+		path(buf, size, CONF_PATH);
+}
+
+/* The key of an fde.conf line ("key = value"), or NULL for comments. */
+static const char *conf_key(const char *line, size_t *len)
+{
+	const char *k = line, *e;
+
+	while (isspace((unsigned char)*k))
+		k++;
+	if (*k == '#' || !(e = strchr(k, '=')))
+		return NULL;
+	while (e > k && isspace((unsigned char)e[-1]))
+		e--;
+	*len = (size_t)(e - k);
+	return k;
+}
+
+enum sep_boot_chain_policy sep_boot_chain_policy(void)
+{
+	enum sep_boot_chain_policy p = SEP_BOOT_CHAIN_AUDIT;
+	char full[4096], line[512];
+	FILE *f;
+
+	sep_boot_conf_path(full, sizeof(full));
 	f = fopen(full, "re");
 	if (!f)
 		return p;
 	while (fgets(line, sizeof(line), f)) {
-		char *k = line, *v, *e;
+		size_t klen;
+		const char *k = conf_key(line, &klen);
+		char *v, *e;
 
-		while (isspace((unsigned char)*k))
-			k++;
-		if (*k == '#' || !(v = strchr(k, '=')))
+		if (!k || klen != strlen("boot-chain") || strncmp(k, "boot-chain", klen))
 			continue;
-		for (e = v; e > k && isspace((unsigned char)e[-1]); e--)
-			;
-		*e = '\0';
-		v++;
+		v = strchr(line, '=') + 1;
 		while (isspace((unsigned char)*v))
 			v++;
 		for (e = v + strlen(v); e > v && isspace((unsigned char)e[-1]); e--)
 			;
 		*e = '\0';
-		if (strcmp(k, "boot-chain"))
-			continue;
-		p = !strcmp(v, "require") ? SEP_BOOT_CHAIN_REQUIRE : SEP_BOOT_CHAIN_WARN;
+		p = !strcmp(v, "require") ? SEP_BOOT_CHAIN_REQUIRE : SEP_BOOT_CHAIN_AUDIT;
 	}
 	fclose(f);
 	return p;
@@ -145,7 +214,53 @@ enum sep_boot_chain_policy sep_boot_chain_policy(void)
 
 const char *sep_boot_chain_policy_name(enum sep_boot_chain_policy p)
 {
-	return p == SEP_BOOT_CHAIN_REQUIRE ? "require" : "warn";
+	return p == SEP_BOOT_CHAIN_REQUIRE ? "require" : "audit";
+}
+
+int sep_boot_chain_policy_write(enum sep_boot_chain_policy p)
+{
+	char full[4096], tmp[4200], line[512];
+	FILE *in, *out;
+	int fd, done = 0, r = 0;
+
+	sep_boot_conf_path(full, sizeof(full));
+	snprintf(tmp, sizeof(tmp), "%s.XXXXXX", full);
+	fd = mkostemp(tmp, O_CLOEXEC);
+	if (fd < 0)
+		return -errno;
+	out = fdopen(fd, "w");
+	if (!out) {
+		r = -errno;
+		close(fd);
+		unlink(tmp);
+		return r;
+	}
+	in = fopen(full, "re");
+	while (in && fgets(line, sizeof(line), in)) {
+		size_t klen;
+		const char *k = conf_key(line, &klen);
+
+		if (k && klen == strlen("boot-chain") && !strncmp(k, "boot-chain", klen)) {
+			if (!done)
+				fprintf(out, "boot-chain = %s\n", sep_boot_chain_policy_name(p));
+			done = 1;
+			continue;
+		}
+		fputs(line, out);
+	}
+	if (in)
+		fclose(in);
+	if (!done)
+		fprintf(out, "boot-chain = %s\n", sep_boot_chain_policy_name(p));
+	if (fflush(out) || fchmod(fd, 0644) || fsync(fd))
+		r = -errno;
+	if (fclose(out) && !r)
+		r = -errno;
+	if (!r && rename(tmp, full))
+		r = -errno;
+	if (r)
+		unlink(tmp);
+	return r;
 }
 
 int sep_boot_in_initrd(void)
@@ -156,46 +271,29 @@ int sep_boot_in_initrd(void)
 	return access(full, F_OK) == 0;
 }
 
-/* 1 the first time this boot; the marker lives in /run (a tmpfs per boot). */
-static int first_time(void)
-{
-	char dir[4096], full[4096];
-	int fd;
-
-	path(dir, sizeof(dir), "/run");
-	mkdir(dir, 0755);	/* there on a real system; a test root may lack it */
-	path(dir, sizeof(dir), "/run/aurora-sep");
-	path(full, sizeof(full), WARNED);
-	mkdir(dir, 0755);
-	fd = open(full, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
-	if (fd < 0)
-		return errno != EEXIST;	/* no /run at all: log every time */
-	close(fd);
-	return 1;
-}
-
-int sep_boot_chain_gate(char *msg, size_t size, int *first)
+int sep_boot_chain_gate(const char *volume, char *msg, size_t size)
 {
 	enum sep_boot_chain_policy p = sep_boot_chain_policy();
-	char state[64];
+	struct sep_boot_chain c;
 
 	msg[0] = '\0';
-	*first = 0;
-	if (sep_boot_chain_state(state, sizeof(state)))
-		snprintf(state, sizeof(state), "unknown");
-	if (!strcmp(state, "verified"))
+	sep_boot_chain_read(&c);
+	if (c.verified)
 		return 0;
-	*first = first_time();
-	if (p == SEP_BOOT_CHAIN_REQUIRE) {
+	if (!volume || !*volume)
+		volume = "this volume";
+	if (p == SEP_BOOT_CHAIN_REQUIRE)
 		snprintf(msg, size,
-			 "aurora-sep: boot chain %s, and boot-chain = require: the Secure Enclave "
-			 "will not unlock this volume; enter its passphrase or recovery key",
-			 state);
-		return -EPERM;
-	}
-	snprintf(msg, size,
-		 "aurora-sep: warning: boot chain %s (not verified from Stage 1 on); unlocking "
-		 "with the Secure Enclave anyway (boot-chain = warn)",
-		 state);
-	return 0;
+			 "aurora-sep: boot-chain = require: refused the Secure Enclave unlock of %s "
+			 "(boot chain %s%s, first unverified link: %s); enter its passphrase or recovery key",
+			 volume, c.state, c.advisory == 1 ? ", advisory" : "", c.first_gap);
+	else
+		snprintf(msg, size,
+			 "aurora-sep: boot-chain = audit: require would refuse the Secure Enclave unlock of %s "
+			 "(boot chain %s%s, first unverified link: %s); unlocking anyway",
+			 volume, c.state, c.advisory == 1 ? ", advisory" : "", c.first_gap);
+	openlog(SEP_BOOT_LOG_IDENT, LOG_PID, LOG_AUTH);
+	syslog(LOG_WARNING, "%s", msg);
+	closelog();
+	return p == SEP_BOOT_CHAIN_REQUIRE ? -EPERM : 0;
 }
