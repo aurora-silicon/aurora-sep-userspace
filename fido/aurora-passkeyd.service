@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: MIT
+# User unit. Used when aurora-fido.conf has [authenticator] vault = user:
+# aurora-fidod (system) forwards each request to this agent of the active user.
+[Unit]
+Description=Aurora passkeys (this user's Secure Enclave credentials)
+Documentation=file:///usr/share/doc/aurora-fido/fido.md
+
+[Service]
+Type=simple
+ExecStart=@LIBEXECDIR@/aurora-passkeyd
+Restart=on-failure
+RestartSec=5
+UMask=0077
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+LockPersonality=yes
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

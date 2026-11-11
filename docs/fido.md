@@ -153,6 +153,30 @@ available when per-user, password-keyed key bags land (below).
   token with the credential-management permission takes a touch when it is
   issued.
 
+### Per-user credentials (preview, `vault = user`)
+
+With `[authenticator] vault = user`, aurora-fidod keeps only the uhid device
+and the CTAPHID framing. It forwards each CTAP2 request to `aurora-passkeyd`
+(a user unit) of the user who owns the active local session on seat0, the
+same user the hidraw `uaccess` ACL follows. That agent keeps the user's
+credential records in `$XDG_DATA_HOME/aurora-passkeys` and makes the
+`/dev/sep-key` calls as the user.
+
+- The two talk over `$XDG_RUNTIME_DIR/aurora-passkeys/ctap.sock`
+  (SOCK_SEQPACKET): one request per connection, with "user present"
+  keepalives and cancel passed both ways.
+- aurora-fidod checks that the socket's peer is that user. The agent accepts
+  only root (aurora-fidod) and its own user.
+- With no active local user, or no agent running, nothing is signed:
+  getInfo still answers, and every other command gets
+  `CTAP2_ERR_OPERATION_DENIED`.
+- U2F is not forwarded in this mode.
+
+The agent's vault key is sealed to a key under the user's own key bag
+(`/dev/sep-key` interface 4). So the records cannot be read while the user
+is logged out, and the credential keys sign for nobody else, root included.
+On a kernel without interface 4 the agent refuses to start.
+
 ### Existing credentials (migration from 0.1)
 
 aurora-fido 0.1 checked the touch in the daemon (fprintd, or a polkit
@@ -326,7 +350,7 @@ security key.
 
 ## Tests
 
-    make -C fido check                 # unit tests, no root, no hardware
+    make -C fido check                 # unit tests, no root, no hardware (agent tests: Linux)
     sudo make -C fido check-uhid       # real uhid device: libfido2, OpenSSH, pam_u2f, cryptenroll
     make -C fido test/aurora-fido-seal && sudo make -C fido check-seal
 

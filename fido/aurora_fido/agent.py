@@ -1,0 +1,234 @@
+# SPDX-License-Identifier: MIT
+"""aurora-passkeyd: one user's passkeys and security-key credentials.
+
+Runs as the user (systemd --user). aurora-fidod keeps the uhid device and
+the CTAPHID framing and forwards each CTAP2 request here (remote.py,
+agentproto.py). This process owns:
+- the user's credential records (in $XDG_DATA_HOME/aurora-passkeys);
+- the CTAP2 logic (ctap2.Authenticator, unchanged);
+- the calls to /dev/sep-key, which it makes as the user.
+
+On the target kernel (sep-key interface 4) the credential keys are created
+under the user's own key bag, and the enclave refuses them to every other
+uid, root included (docs/passkeys/DESIGN.md 4.1, 4.2).
+
+The vault key that wraps credential IDs and records is sealed to a key in
+the user's bag. That key needs the bag unlocked, but no touch, so records
+are unreadable while the user is logged out. This needs interface 4. On an
+older kernel the agent refuses to start: it never falls back to a key the
+host holds.
+"""
+
+import argparse
+import logging
+import os
+import pwd
+import signal
+import socket
+import sys
+import threading
+
+from . import __version__, agentproto, cbor, ctap2, daemon
+from .errors import ERR_CHANNEL_BUSY
+from .backend import BackendError, open_backend
+
+log = logging.getLogger("aurora-passkeys")
+
+SEP_KEY_IFACE_USER_BAG = 4
+
+
+def data_dir():
+    base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    return os.path.join(base, "aurora-passkeys")
+
+
+def runtime_socket():
+    rd = os.environ.get("XDG_RUNTIME_DIR") or "/run/user/%d" % os.getuid()
+    return os.path.join(rd, "aurora-passkeys", "ctap.sock")
+
+
+class UserBagSecret:
+    """The vault key, sealed to a no-touch key under the user's key bag.
+
+    Placeholder until sep-key interface 4 (SEP_KEY_CREATE_USER_BAG_ONLY:
+    a key under the caller's bag whose list needs the bag unlocked, no
+    credential). Until then it refuses; it never keeps a host-readable key.
+    """
+
+    def __init__(self, backend, state_dir):
+        self.backend = backend
+        self.state_dir = state_dir
+
+    def _need_iface(self):
+        if getattr(self.backend, "version", 0) < SEP_KEY_IFACE_USER_BAG:
+            raise BackendError(
+                "per-user passkeys need /dev/sep-key interface 4 (keys under your own key "
+                "bag); this kernel has interface %s" % getattr(self.backend, "version", "?"))
+        raise BackendError("interface 4 vault key: not implemented yet")
+
+    def load(self):
+        self._need_iface()
+
+    def new(self):
+        self._need_iface()
+
+
+def per_user_info(resp):
+    """getInfo from the agent: no U2F_V2 (U2F is not forwarded to agents)."""
+    if resp[:1] != b"\x00":
+        return resp
+    info = cbor.decode(resp[1:])
+    info[1] = [v for v in info.get(1, []) if v != "U2F_V2"]
+    return b"\x00" + cbor.encode(info)
+
+
+class AgentServer:
+    """Serves CTAP2 requests from aurora-fidod on a Unix SEQPACKET socket.
+
+    allowed_uids: peers that may send requests, normally root (aurora-fidod)
+    and the user (`aurora-passkeys` tools). Same-user processes can already
+    open the hidraw node, so allowing them here grants nothing new.
+    """
+
+    def __init__(self, auth, path, allowed_uids):
+        self.auth = auth
+        self.path = path
+        self.allowed = set(allowed_uids)
+        self.sock = None
+        self.stop = threading.Event()
+        self.lock = threading.Lock()           # one CTAP request at a time, as a key does
+
+    def bind(self):
+        d = os.path.dirname(self.path)
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        os.chmod(d, 0o700)
+        try:
+            os.unlink(self.path)
+        except FileNotFoundError:
+            pass
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        s.bind(self.path)
+        os.chmod(self.path, 0o600)
+        s.listen(4)
+        s.settimeout(0.2)
+        self.sock = s
+        return self
+
+    def serve_forever(self):
+        while not self.stop.is_set():
+            try:
+                conn, _ = self.sock.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                if self.stop.is_set():
+                    break
+                raise
+            threading.Thread(target=self._conn, args=(conn,), name="agent-conn",
+                             daemon=True).start()
+
+    def close(self):
+        self.stop.set()
+        if self.sock:
+            self.sock.close()
+        try:
+            os.unlink(self.path)
+        except OSError:
+            pass
+
+    def _conn(self, conn):
+        with conn:
+            try:
+                uid = agentproto.peer_uid(conn)
+                if uid not in self.allowed:
+                    log.warning("refused a request from uid %d", uid)
+                    return
+                msg = agentproto.recv(conn)
+                if msg is None or msg["t"] != "req":
+                    return
+                self._request(conn, msg["d"])
+            except (OSError, agentproto.ProtocolError) as e:
+                log.info("request ended: %s", e)
+
+    def _request(self, conn, data):
+        cancel = threading.Event()
+        send_lock = threading.Lock()
+
+        def up_needed():
+            with send_lock:
+                try:
+                    agentproto.send(conn, {"t": "up"})
+                except OSError:
+                    cancel.set()
+
+        def reader():
+            # A cancel message, or fidod going away, cancels the request.
+            try:
+                while not cancel.is_set():
+                    m = agentproto.recv(conn)
+                    if m is None or m["t"] == "cancel":
+                        cancel.set()
+            except (OSError, agentproto.ProtocolError):
+                cancel.set()
+
+        threading.Thread(target=reader, name="agent-read", daemon=True).start()
+        if not self.lock.acquire(timeout=1.0):
+            resp = bytes([ERR_CHANNEL_BUSY])
+        else:
+            try:
+                resp = self.auth.handle(data, ctap2.Ctx(cancel, up_needed))
+            finally:
+                self.lock.release()
+        if data[:1] == bytes([ctap2.CMD_GET_INFO]):
+            resp = per_user_info(resp)
+        with send_lock:
+            agentproto.send(conn, {"t": "resp", "d": resp})
+
+
+def build_agent(cfg, state_dir, backend, secret, user_name):
+    """The authenticator for one user (no U2F: not forwarded to agents yet)."""
+    cfg.set("touchid", "user", user_name)
+    policy, note = daemon.resolve_policy(cfg, backend.flags_supported)
+    user = daemon.enclave_user(cfg, backend, state_dir, policy)
+    auth, _u2f = daemon.build(cfg, state_dir, backend, user, secret, policy)
+    return auth, note
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="aurora-passkeyd")
+    ap.add_argument("--config", default=daemon.CONFIG)
+    ap.add_argument("--state-dir", default=None)
+    ap.add_argument("--socket", default=None)
+    ap.add_argument("-v", "--verbose", action="store_true")
+    a = ap.parse_args(argv)
+    logging.basicConfig(level=logging.DEBUG if a.verbose else logging.INFO,
+                        format="%(message)s")
+    if os.geteuid() == 0:
+        log.error("aurora-passkeyd runs as the user whose passkeys it keeps, not as root")
+        return 1
+    name = pwd.getpwuid(os.getuid()).pw_name
+    state_dir = a.state_dir or data_dir()
+    os.umask(0o077)
+    os.makedirs(state_dir, mode=0o700, exist_ok=True)
+    cfg = daemon.load_config(a.config)
+    try:
+        backend = open_backend(cfg.get("keys", "store"))
+        auth, note = build_agent(cfg, state_dir, backend, UserBagSecret(backend, state_dir), name)
+    except (BackendError, ValueError, OSError) as e:
+        log.error("%s", e)
+        return 1
+    if note:
+        log.info("%s", note)
+    srv = AgentServer(auth, a.socket or runtime_socket(), {0, os.getuid()}).bind()
+    for s in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(s, lambda *_: srv.stop.set())
+    log.info("aurora-passkeyd %s ready for %s", __version__, name)
+    try:
+        srv.serve_forever()
+    finally:
+        srv.close()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

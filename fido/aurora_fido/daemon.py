@@ -33,7 +33,10 @@ CONFIG = paths.CONFIG
 DEFAULTS = {
     "touchid": {"user": "auto", "timeout": "30", "max_tries": "3", "notify": "yes",
                 "policy": "auto"},
-    "authenticator": {"attestation": "self", "max_resident": "256", "u2f": "yes"},
+    "authenticator": {"attestation": "self", "max_resident": "256", "u2f": "yes",
+                      # system: credentials in STATE_DIR (0.2). user: each request goes to
+                      # the passkey agent (aurora-passkeyd) of seat0's active user.
+                      "vault": "system"},
     "keys": {"store": "auto"},
 }
 # Settings of aurora-fido 0.1 that no longer mean anything: the enclave
@@ -208,7 +211,7 @@ def serve(auth, u, device_factory, run_dir=None, info=None):
     for s in (signal.SIGTERM, signal.SIGINT):
         signal.signal(s, lambda *_: stop.set())
     log.info("security key ready (keys: %s, Touch ID checked by the Secure Enclave)",
-             auth.backend.name)
+             getattr(getattr(auth, "backend", None), "name", "per-user agents"))
     write_status(run_dir, dict(info or {}, pid=os.getpid(), ready=True))
     try:
         hid.run(stop)
@@ -222,6 +225,18 @@ def serve(auth, u, device_factory, run_dir=None, info=None):
             except OSError:
                 pass
         log.info("security key removed")
+
+
+def serve_per_user(run_dir):
+    """The uhid device only; each user's aurora-passkeyd keeps and uses their credentials."""
+    from .remote import RemoteAuthenticator
+    from .uhid import UhidDevice
+    status = {"version": __version__, "vault": "user", "keys": "sep-key",
+              "enforcement": "enclave", "u2f": False,
+              "keys_detail": "each user's passkey agent (aurora-passkeyd) keeps that user's "
+                             "credentials; requests go to seat0's active user"}
+    serve(RemoteAuthenticator(), None, lambda: UhidDevice(name=DEVICE_NAME), run_dir, status)
+    return 0
 
 
 POLICY_TEXT = {
@@ -251,6 +266,8 @@ def main(argv=None):
         if cfg.has_option(sec, key) and key not in DEFAULTS.get(sec, {}):
             log.warning("[%s] %s in %s has no effect any more: the Secure Enclave always "
                         "checks the touch", sec, key, a.config)
+    if cfg.get("authenticator", "vault") == "user":
+        return serve_per_user(a.run_dir)
     try:
         backend = open_backend(cfg.get("keys", "store"))
         policy, note = resolve_policy(cfg, backend.flags_supported)
