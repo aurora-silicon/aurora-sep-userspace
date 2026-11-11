@@ -81,7 +81,7 @@ Always kept. `aurora-sep-cryptenroll` refuses to remove the last keyslot that is
 
 ### Boot chain check
 
-Before the plugin asks the SEP for a key in the initrd, it reads the boot record (`/sys/firmware/aurora/boot_security/state`). With `boot-chain = warn` (the default in `/etc/aurora-sep/fde.conf`, which the image carries) it logs one line per boot when the chain is not `verified` and goes on. With `boot-chain = require` it returns `-EPERM` instead, so the passphrase prompt appears unless the chain is verified. `aurora-sep-fde boot-chain` prints the decision for the running boot.
+Before the plugin asks the SEP for a key (in the initrd, and for volumes opened after boot), it reads the boot record (`/sys/firmware/aurora/boot_security/`). With `boot-chain = audit` (the default in `/etc/aurora-sep/fde.conf`, which the image carries) it logs one line per unlock when the chain is not verified from an enforcing Stage 1 on (chain state, first unverified link, volume) and goes on. With `boot-chain = require` it returns `-EPERM` instead, so the passphrase prompt appears unless the chain is verified. `aurora-sep-fde boot-chain` prints the decision for the running boot; `aurora-sep-fde boot-chain require` switches a Mac once it boots verified and rebuilds the initramfs (see [luks-sep-owners.md](luks-sep-owners.md)).
 
 ### When the SEP OS identity changes
 
