@@ -89,6 +89,21 @@ The sealed key is bound to this Mac's SEP and to the Linux OS identity (`apple_s
 
 A boot policy change (a new Stage 1 or boot object) is similar: the first unlock under the new policy needs one xART record rewrite, which the key-store-only phase refuses. That boot asks for the passphrase, `complete_attach` on the real root lets the rewrite through as today, and the next boot unlocks by itself.
 
+### Password unlock under the xART guard
+
+With `keystore_only=2` the initrd also loads a user's saved key bag from the volume's token and unlocks it with the typed password. The enclave writes xART records while it does that. On the Macs whose enclave Linux shares with macOS (M2, M3, M4 Pro) the driver runs its xART guard, which only lets the enclave rewrite records Linux created. It keeps that list in `/var/lib/aurora-sep-xart-owned.bin` on the real root, which the initrd does not have yet (and which may sit inside the volume being opened).
+
+So the initrd runs the guard with an empty list kept in memory:
+
+- every session record that existed when the initrd opened the gigalocker is refused, Linux's own included;
+- the shared root records follow the guard level, as on the real root;
+- records the enclave creates during the unlock are adopted, in memory only;
+- no host file is read or written, the one-time policy-change allowance is left for the real root, and the boot-policy window never opens in the initrd.
+
+`complete_attach` on the real root adds the records the initrd adopted, if they still exist, to the real list before anything else can write them. If the Mac crashes before that, those records stay off the list and later boots protect them like another OS's records. If an unlock needs to rewrite a record from an earlier boot, the guard refuses it, the unlock fails closed, and the prompt falls back to the passphrase or recovery key.
+
+Kernels with this say so in the parameter description (`modinfo -F parm apple_sep`: `keystore_only: ... (under the xART guard too)`). When the running driver applies the guard (`diag/policy` shows `xart_guard=1` or `2`) and the target kernel lacks it, dracut and mkinitcpio warn that password volumes will ask for their passphrase or recovery key in the initrd. They still build the image in password mode, so the next kernel update fixes it without a rebuild by hand.
+
 ### When the key store changes
 
 If the driver rewrites the key bag or reference key (a new identity, a repaired bag), the copies in the initramfs are stale until it is rebuilt, and the root falls back to the passphrase. Kernel updates rebuild it anyway. The initrd records a SHA-256 of the copies it carries in `/run/aurora-sep/initrd-keystore.sha256`, and `aurora-sep-initrd-check.service` on the real root compares it with `/var/lib` and logs a warning when the initramfs needs rebuilding.

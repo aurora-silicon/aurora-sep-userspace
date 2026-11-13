@@ -31,6 +31,23 @@ _aurora_sep_kernel_user_bags() {
     modinfo -k "$kernel" -F parm apple_sep 2>/dev/null | grep -q '^keystore_only:.*per-user key bags'
 }
 
+# The Macs whose enclave Linux shares with macOS (M2, M3, M4 Pro) run the
+# driver's xART guard. Older drivers keep xART read-only in the initrd there,
+# so a user's bag cannot be loaded before the real root; newer ones say in
+# keystore_only's description that the initrd unlock works under the guard.
+_aurora_sep_kernel_guarded_bags() {
+    modinfo -k "$kernel" -F parm apple_sep 2>/dev/null | grep -q '^keystore_only:.*per-user key bags.*xART guard'
+}
+
+# Whether the running driver applies the guard (diag/policy: xart_guard=N).
+_aurora_sep_guard_on() {
+    local f
+    for f in "${AURORA_SEP_SYSFS:-/sys}"/bus/platform/drivers/apple_sep/*/diag/policy; do
+        [[ -r $f ]] && grep -Eq '(^|[[:space:]])xart_guard=[1-9]' "$f" && return 0
+    done
+    return 1
+}
+
 _aurora_sep_has_token() {
     [[ $2 == crypto_LUKS ]] || return 1
     cryptsetup luksDump "$1" 2>/dev/null | grep -Eq '^[[:space:]]+[0-9]+: aurora-sep$'
@@ -98,6 +115,9 @@ install() {
     if _aurora_sep_wants_user_bags; then
         if _aurora_sep_kernel_user_bags; then
             mode=2
+            if _aurora_sep_guard_on && ! _aurora_sep_kernel_guarded_bags; then
+                dwarning "aurora-sep: this Mac runs the xART guard, and apple_sep in $kernel keeps xART read-only in the initrd under it; volumes sealed to a password will ask for their passphrase or recovery key there"
+            fi
         else
             dwarning "aurora-sep: apple_sep in $kernel cannot unlock a user's key bag in the initrd; volumes sealed to a password will ask for their passphrase or recovery key there"
         fi
