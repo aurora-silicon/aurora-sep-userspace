@@ -369,6 +369,9 @@ static const char *errname(int r)
 	case -EEXIST: return "already enrolled";
 	case -EBUSY: return "that is the last owner of this volume";
 	case -ENODEV: return "no Secure Enclave key store";
+	case -EOPNOTSUPP: return "per-user key bags are not supported on this Mac's Secure Enclave key store "
+				 "(the warm, macOS-shared enclave on M1/M2/M3); use the volume's passphrase or "
+				 "recovery key, or enrol on a Mac whose enclave supports them (the Neo / M4 Pro)";
 	case -EXDEV: return "this disk key belongs to another OS install on this Mac; use the recovery key "
 			    "or the volume's passphrase";
 	case -ENOKEY: return "this kernel names no OS identity for this install, so the disk key cannot be "
