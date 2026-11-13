@@ -34,6 +34,7 @@ import struct
 
 # Linux value; also defined here so the module imports on other systems.
 EKEYREJECTED = getattr(errno, "EKEYREJECTED", 129)
+ENOKEY = getattr(errno, "ENOKEY", 126)       # AND keys: the enclave refused the password
 PUB_LEN = 65
 DIGEST_LEN = 32
 
@@ -162,11 +163,17 @@ IFACE_VERSIONS = (2, 3, 4)
 CREATE_BIOMETRY_CURRENT_SET = 0x1     # .biometryCurrentSet
 CREATE_BIOMETRY_ANY = 0x2             # .biometryAny
 CREATE_USER_PRESENCE = 0x4            # .userPresence (Touch ID or the user's password)
+CREATE_DEVICE_PASSCODE = 0x8          # CREATE_USER: only with CREATE_AND (.devicePasscode)
+CREATE_AND = 0x10                     # CREATE_USER: BIOMETRY_* | DEVICE_PASSCODE | AND (.and)
+# CREATE_USER flag sets for Touch ID AND the bag's password (feature USER_POLICIES).
+CREATE_AND_ANY = CREATE_BIOMETRY_ANY | CREATE_DEVICE_PASSCODE | CREATE_AND
+CREATE_AND_CURRENT = CREATE_BIOMETRY_CURRENT_SET | CREATE_DEVICE_PASSCODE | CREATE_AND
 # INFO features (version 3; the 'reserved' word of version 2).
 FEATURE_CANCEL = 0x1
 FEATURE_SEAL = 0x2
 FEATURE_PASSWORD = 0x4                # version 4: keys under the user's bag, password checked by the enclave
 FEATURE_PERSISTENT_ATTEMPTS = 0x8     # the enclave's wrong-password count survives a restart
+FEATURE_USER_POLICIES = 0x10          # CREATE_USER also makes Touch ID only and Touch ID AND password keys
 HANDLE_FLAG_BIOMETRY = 0x01           # handle byte 5: the record carries a biometric ACL
 SEP_MAGIC = b"SEPK"
 LEGACY_SEALED_MAGIC = b"AFSK"         # software keys of aurora-fido 0.1 (removed)
@@ -178,6 +185,18 @@ assert (_CREATE_USER.size, _SIGN_PASSWORD.size, _SEAL_PASSWORD.size) == (2128, 2
 HANDLE_VERSION_USER = 2
 HANDLE_FLAG_USER_BAG = 0x04           # under a user's bag, macOS .userPresence list
 HANDLE_FLAG_USER_PLAIN = 0x08         # with USER_BAG: no list, usable while the bag is unlocked
+HANDLE_FLAG_BIOMETRY_ANY = 0x02       # with BIOMETRY: any enrolled finger
+HANDLE_FLAG_AND_PASSCODE = 0x10       # with USER_BAG | BIOMETRY: Touch ID and the password
+# Version-2 flag byte for each CREATE_USER flag set the kernel takes.
+USER_HANDLE_FLAGS = {
+    0: HANDLE_FLAG_USER_BAG | HANDLE_FLAG_USER_PLAIN,
+    CREATE_USER_PRESENCE: HANDLE_FLAG_USER_BAG,
+    CREATE_BIOMETRY_CURRENT_SET: HANDLE_FLAG_USER_BAG | HANDLE_FLAG_BIOMETRY,
+    CREATE_BIOMETRY_ANY: HANDLE_FLAG_USER_BAG | HANDLE_FLAG_BIOMETRY | HANDLE_FLAG_BIOMETRY_ANY,
+    CREATE_AND_CURRENT: HANDLE_FLAG_USER_BAG | HANDLE_FLAG_BIOMETRY | HANDLE_FLAG_AND_PASSCODE,
+    CREATE_AND_ANY: (HANDLE_FLAG_USER_BAG | HANDLE_FLAG_BIOMETRY | HANDLE_FLAG_BIOMETRY_ANY
+                     | HANDLE_FLAG_AND_PASSCODE),
+}
 HANDLE_HEADER_USER = 16
 
 
@@ -195,12 +214,17 @@ def is_user_plain_handle(handle):
         handle[5] == HANDLE_FLAG_USER_BAG | HANDLE_FLAG_USER_PLAIN
 
 
+def is_and_handle(handle):
+    """A key under a user's bag that needs Touch ID and the bag's password together."""
+    return user_handle_uid(handle) is not None and bool(handle[5] & HANDLE_FLAG_AND_PASSCODE)
+
+
 def is_gated_handle(handle):
     """A /dev/sep-key handle whose record carries an access-control list the
     enclave enforces: biometric (version 1), or .userPresence under a user's
     bag (version 2). A plain user-bag key (no list) is not a credential key."""
     if user_handle_uid(handle) is not None:
-        return handle[5] == HANDLE_FLAG_USER_BAG
+        return handle[5] in USER_HANDLE_FLAGS.values() and not handle[5] & HANDLE_FLAG_USER_PLAIN
     return (isinstance(handle, bytes) and handle[:4] == SEP_MAGIC and len(handle) > 5
             and bool(handle[5] & HANDLE_FLAG_BIOMETRY))
 
@@ -247,6 +271,7 @@ class SepKeyBackend(KeyBackend):
         self.can_cancel = bool(self.features & FEATURE_CANCEL)
         self.can_unseal = bool(self.features & FEATURE_SEAL)
         self.can_password = bool(self.features & FEATURE_PASSWORD)
+        self.user_policies = self.can_password and bool(self.features & FEATURE_USER_POLICIES)
         # A CTAP2 PIN (with pinRetries) is offered only when the enclave's own
         # count of wrong passwords survives a restart; otherwise root could
         # reboot between guesses. No kernel sets this yet.
@@ -258,6 +283,11 @@ class SepKeyBackend(KeyBackend):
         if user and e.errno == EKEYREJECTED:
             return BagLocked("the enclave refused the key: your key bag is locked "
                              "(log in again) or belongs to another install")
+        if password and e.errno == ENOKEY:
+            # AND keys: the match happened, the enclave refused the password.
+            return PasswordRefused("the enclave refused the password")
+        if password == "and" and e.errno == errno.EACCES:
+            return EnclaveRefused("no Touch ID match")
         if password and e.errno == errno.EACCES:
             return PasswordRefused("the enclave refused the password")
         if e.errno in (errno.EINVAL, EKEYREJECTED):
@@ -355,15 +385,24 @@ class SepKeyBackend(KeyBackend):
                                "bag (interface 4, variant-5 key store)")
 
     def create_user(self, uid, presence):
+        """presence: True (.userPresence), False (no list) or a CREATE_USER flag set."""
         self._need_password_iface()
-        flags = CREATE_USER_PRESENCE if presence else 0
+        if presence is True or presence is False:
+            flags = CREATE_USER_PRESENCE if presence else 0
+        else:
+            flags = presence
+        if flags not in USER_HANDLE_FLAGS:
+            raise BackendError(f"no CREATE_USER policy with flags 0x{flags:x}")
+        if flags not in (0, CREATE_USER_PRESENCE) and not self.user_policies:
+            raise BackendError("this kernel makes only Touch ID or password keys under your "
+                               "key bag (no SEP_KEY_FEATURE_USER_POLICIES)")
         buf = bytearray(_CREATE_USER.pack(flags, uid, 0, b"", b"", b""))
         self._call(IOC_CREATE_USER, buf, user=True)
         _f, _u, n, point, _r, handle = _CREATE_USER.unpack(buf)
         if not 0 < n <= self.handle_max or point[0] != 4:
             raise BackendError("malformed create reply")
         handle = handle[:n]
-        if user_handle_uid(handle) != uid or is_gated_handle(handle) != presence:
+        if user_handle_uid(handle) != uid or handle[5] != USER_HANDLE_FLAGS[flags]:
             raise BackendError("the kernel made a key other than the one asked for")
         return handle, point
 
@@ -382,7 +421,8 @@ class SepKeyBackend(KeyBackend):
         buf = bytearray(_SIGN_PASSWORD.pack(0, len(handle), digest, 0, b"", handle,
                                             len(pw), 0, pw))
         try:
-            self._call(IOC_SIGN_PASSWORD, buf, user=True, password=True)
+            self._call(IOC_SIGN_PASSWORD, buf, user=True,
+                       password="and" if is_and_handle(handle) else True)
             f = _SIGN_PASSWORD.unpack(buf)
         finally:
             buf[_SIGN.size:] = bytes(len(buf) - _SIGN.size)      # our copy of the password
@@ -400,7 +440,8 @@ class SepKeyBackend(KeyBackend):
         buf = bytearray(_SEAL_PASSWORD.pack(0, len(handle), 0, len(sealed), b"", sealed,
                                             handle, len(pw), 0, pw))
         try:
-            self._call(IOC_UNSEAL_PASSWORD, buf, user=True, password=True)
+            self._call(IOC_UNSEAL_PASSWORD, buf, user=True,
+                       password="and" if is_and_handle(handle) else True)
             f = _SEAL_PASSWORD.unpack(buf)
         finally:
             buf[_SEAL.size:] = bytes(len(buf) - _SEAL.size)
@@ -413,19 +454,22 @@ class SepKeyBackend(KeyBackend):
 class UserBagBackend(KeyBackend):
     """Credential keys under one user's key bag (interface 4), for that user's agent.
 
-    Every credential key is a .userPresence key (Touch ID, or the bag's
-    password checked by the enclave): that is the only kind a user's own
-    process may make. Policies that need a biometric-only list are not
-    offered here (flags_supported), so a site rule asking for one is refused,
-    never weakened.
+    The default credential key is a .userPresence key (Touch ID, or the bag's
+    password checked by the enclave). With SEP_KEY_FEATURE_USER_POLICIES the
+    kernel also makes Touch ID only keys and Touch ID AND password keys under
+    the bag (per-site rules). A kernel without it offers only .userPresence
+    here (flags_supported), so a site rule asking for more is refused, never
+    weakened.
     """
 
     name = "sep-key (your key bag)"
-    flags_supported = CREATE_USER_PRESENCE
 
     def __init__(self, sep, uid):
         self.sep = sep
         self.uid = uid
+        self.flags_supported = CREATE_USER_PRESENCE
+        if getattr(sep, "user_policies", False):
+            self.flags_supported |= CREATE_AND_ANY | CREATE_AND_CURRENT
         self.can_unseal = sep.can_unseal
         self.can_cancel = sep.can_cancel
         self.can_password = True
@@ -433,10 +477,10 @@ class UserBagBackend(KeyBackend):
         self.version = sep.version
 
     def create(self, flags):
-        if flags != CREATE_USER_PRESENCE:
-            raise BackendError("keys under your key bag are Touch ID or password keys "
-                               "(.userPresence) only")
-        return self.sep.create_user(self.uid, True)
+        if flags == 0 or flags not in USER_HANDLE_FLAGS or flags & ~self.flags_supported:
+            raise BackendError("this kernel cannot make that kind of key under your key bag "
+                               f"(flags 0x{flags:x})")
+        return self.sep.create_user(self.uid, flags)
 
     def gated(self, handle):
         return is_gated_handle(handle) and user_handle_uid(handle) == self.uid
