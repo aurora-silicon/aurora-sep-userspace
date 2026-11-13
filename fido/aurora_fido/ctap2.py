@@ -30,7 +30,8 @@ from cryptography.hazmat.primitives.asymmetric import ec
 
 from . import cbor, keys, pinuv, touchid
 from .backend import BackendError, InvalidHandle
-from .creds import ID_MAX_CTAP2, POLICY_FLAGS, POLICY_TOUCHID_ANY, Credential
+from .creds import (ID_MAX_CTAP2, POLICIES_NEED_PASSWORD, POLICY_FLAGS, POLICY_TOUCHID_ANY,
+                    Credential)
 from .errors import *  # noqa: F401,F403
 from .errors import CtapError
 
@@ -240,6 +241,10 @@ class Authenticator:
             raise CtapError(ERR_USER_ACTION_TIMEOUT, "no touch")
         if result == "wrong-password":                   # enclave.WRONG_PASSWORD
             raise CtapError(ERR_PIN_INVALID, "the enclave refused the password")
+        if result == "password-needed":                  # enclave.PASSWORD_NEEDED
+            # A Touch ID AND password credential: only a front-end that
+            # collects the password (the native provider) can use it.
+            raise CtapError(ERR_PUAT_REQUIRED, "this credential needs your password too")
         raise CtapError(ERR_OPERATION_DENIED, f"Touch ID: {result}")
 
     def ask(self, ctx, prompt, request=None):
@@ -405,6 +410,9 @@ class Authenticator:
                 # Never a weaker key than the site's rule asks for.
                 log.warning("site rule for %s asks for a policy this kernel cannot make", rp_id)
                 raise CtapError(ERR_UNSUPPORTED_OPTION, "site policy")
+        if policy in POLICIES_NEED_PASSWORD and getattr(ctx, "password", None) is None:
+            # Asked before the key exists: its first signature needs the password.
+            raise CtapError(ERR_PUAT_REQUIRED, "this site's rule needs your password too")
         handle, point = self.backend.create(flags)
         sealed = None
         if hmac_secret:

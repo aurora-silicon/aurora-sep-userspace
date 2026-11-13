@@ -361,6 +361,92 @@ class UserBagTest(unittest.TestCase):
         self.assertEqual(st, E.ERR_UNSUPPORTED_OPTION)
         self.assertEqual(f.make(rp="other.example")[0], 0)
 
+    def test_biometric_only_site_rule_under_the_bag_with_user_policies(self):
+        conf = os.path.join(self.tmp.name, "sites.conf")
+        with open(conf, "w") as fh:
+            fh.write("bank.example = touchid-current\n")
+        a, f = self.agent(sites=agent.SitePolicy(conf),
+                          backend=StubKeyBackend(user_policies=True))
+        st, mc = f.make(rp="bank.example")
+        self.assertEqual(st, 0)
+        with a.gate.open():
+            cred = a.auth.vault.unwrap(hashlib.sha256(b"bank.example").digest(),
+                                       parse_auth_data(mc[2])["cred_id"])
+        self.assertEqual(cred.policy, creds.POLICY_TOUCHID_CURRENT)
+        self.assertEqual(cred.handle[5], 0x05)                # USER_BAG | BIOMETRY
+        self.assertTrue(backend.is_gated_handle(cred.handle))
+        self.assertEqual(f.ga(rp="bank.example")[0], 0)
+        # No password route on a Touch ID only key.
+        with self.assertRaises(backend.InvalidHandle):
+            a.backend.sign_password(cred.handle, b"\0" * 32, b"pw")
+
+    def test_touch_and_password_site_rule(self):
+        conf = os.path.join(self.tmp.name, "sites.conf")
+        with open(conf, "w") as fh:
+            fh.write("bank.example = touchid-and-password\n")
+        modes = [stub.MATCH]
+        st = StubKeyBackend(user_policies=True, mode=lambda h: modes[0])
+        a, f = self.agent(sites=agent.SitePolicy(conf), backend=st)
+        # CTAP over hidraw carries no password: refused before any key is made.
+        creates = st.creates
+        self.assertEqual(f.make(rp="bank.example")[0], E.ERR_PUAT_REQUIRED)
+        self.assertEqual(st.creates, creates)
+        p = Provider(a.auth, a.gate)
+        o = {"origin": "https://bank.example"}
+        rp, user = {"id": "bank.example"}, {"id": b"u1", "name": "r"}
+        with self.assertRaises(ProviderError) as c:
+            p.make_credential(CDH, rp, user, [-7], options=o)
+        self.assertEqual(c.exception.reason, "password-needed")
+        self.assertEqual(st.creates, creates)
+        r = p.make_credential(CDH, rp, user, [-7], options=o, password=bytearray(b"pw"))
+        cid = parse_auth_data(cbor.decode(r["attestation_object"])["authData"])["cred_id"]
+        with a.gate.open():
+            cred = a.auth.vault.unwrap(hashlib.sha256(b"bank.example").digest(), cid)
+        self.assertEqual(cred.policy, creds.POLICY_TOUCHID_AND_PASSWORD)
+        self.assertTrue(backend.is_and_handle(cred.handle))
+        self.assertEqual(cred.handle[5], 0x17)                # USER_BAG | BIOMETRY | ANY | AND
+        touches = st.touches
+        # Without the password: asked for it, no touch.
+        with self.assertRaises(ProviderError) as c:
+            p.get_assertion(CDH, "bank.example", cid, o)
+        self.assertEqual(c.exception.reason, "password-needed")
+        self.assertEqual(st.touches, touches)
+        # Password but no matching finger: refused, the password is not counted.
+        modes[0] = stub.NO_MATCH
+        with self.assertRaises(ProviderError) as c:
+            p.get_assertion(CDH, "bank.example", cid, o, password=bytearray(b"pw"))
+        self.assertNotEqual(c.exception.reason, "wrong-password")
+        self.assertEqual(st.password_failures, 0)
+        # A match and a wrong password: wrong-password, counted once. (A new
+        # request: a repeat of the refused one is refused without a prompt.)
+        modes[0] = stub.MATCH
+        cdh2 = hashlib.sha256(b"second request").digest()
+        with self.assertRaises(ProviderError) as c:
+            p.get_assertion(cdh2, "bank.example", cid, o, password=bytearray(b"nope"))
+        self.assertEqual(c.exception.reason, "wrong-password")
+        self.assertEqual(st.password_failures, 1)
+        # Both: signed, after a touch.
+        touches = st.touches
+        cdh3 = hashlib.sha256(b"third request").digest()
+        r = p.get_assertion(cdh3, "bank.example", cid, o, password=bytearray(b"pw"))
+        self.assertTrue(r["signature"])
+        self.assertEqual(st.touches, touches + 1)
+        # SIGN alone never reaches the touch for an AND key.
+        with self.assertRaises(backend.InvalidHandle):
+            st.sign(cred.handle, b"\0" * 32)
+
+    def test_touch_and_password_rule_needs_user_policies(self):
+        conf = os.path.join(self.tmp.name, "sites.conf")
+        with open(conf, "w") as fh:
+            fh.write("bank.example = touchid-and-password\n")
+        a, f = self.agent(sites=agent.SitePolicy(conf))       # kernel without the feature
+        p = Provider(a.auth, a.gate)
+        with self.assertRaises(ProviderError) as c:
+            p.make_credential(CDH, {"id": "bank.example"}, {"id": b"u1", "name": "r"}, [-7],
+                              options={"origin": "https://bank.example"},
+                              password=bytearray(b"pw"))
+        self.assertEqual(c.exception.name, "NotSupportedError")
+
     def test_another_users_handle_is_refused(self):
         a, _ = self.agent()
         mine = UserBagBackend(a.backend, UID)

@@ -204,9 +204,27 @@ rule covers the site and every name under it, and the longest match wins.
 The rule is written into the new credential's access-control list, so the
 enclave enforces it. Changing a rule affects new credentials only. If the
 kernel cannot make the key a rule asks for, the registration is refused
-(`CTAP2_ERR_UNSUPPORTED_OPTION`); a weaker key is never made instead. Under a
-user's bag the kernel makes `.userPresence` keys only, so biometric-only
-rules (`touchid-any`, `touchid-current`) are refused there.
+(`CTAP2_ERR_UNSUPPORTED_OPTION`); a weaker key is never made instead.
+
+Under a user's bag, a kernel whose `INFO` lists
+`SEP_KEY_FEATURE_USER_POLICIES` also makes the biometric-only keys
+(`touchid-any`, `touchid-current`) and two rules that need both factors:
+
+| rule | approves a request | macOS | `SEP_KEY_CREATE_USER` flags |
+| --- | --- | --- | --- |
+| `touchid-and-password` | Touch ID and your password, together | `.biometryAny \| .and \| .devicePasscode` | `BIOMETRY_ANY \| DEVICE_PASSCODE \| AND` |
+| `touchid-current-and-password` | the same, with the fingers enrolled when the credential was made | `.biometryCurrentSet \| .and \| .devicePasscode` | `BIOMETRY_CURRENT_SET \| DEVICE_PASSCODE \| AND` |
+
+For these the enclave needs a match it saw and your password, checked by the
+enclave into the same credential context, before it signs: the key's list
+asks for both (`pkofn` 2 over `cbio` and `cup`). Only the native front-end
+(the credentials portal) can collect the password, so they work there and
+not over CTAP/hidraw: a CTAP request gets `CTAP2_ERR_PUAT_REQUIRED`. The
+provider answers a call without the password with reason `password-needed`
+before any touch or key is made; the portal asks for the password and calls
+again. A wrong password is `wrong-password` (the enclave counted it); a
+finger that did not match is refused without counting the password. On a
+kernel without the feature these rules are refused, as above.
 
 ### Existing credentials (migration from 0.1)
 

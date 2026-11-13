@@ -27,7 +27,9 @@ class ProviderError(Exception):
         super().__init__(message or name)
         self.name = name
         # Finer cause for the portal UI: "wrong-password" (ask again; the enclave
-        # counted the try), else None.
+        # counted the try), "password-needed" (the credential or the site's rule
+        # needs Touch ID and the password: ask for it and call again), "locked",
+        # else None.
         self.reason = reason
 
 
@@ -78,6 +80,10 @@ class Provider:
         r = self.auth.handle(bytes([cmd]) + cbor.encode(params), ctx)
         if r[0] == E.ERR_PIN_INVALID:
             raise ProviderError("NotAllowedError", "wrong password", "wrong-password")
+        if r[0] == E.ERR_PUAT_REQUIRED:
+            # Touch ID AND password (a site rule): ask for the password, then
+            # call again with it. Nothing touched the enclave key yet.
+            raise ProviderError("NotAllowedError", "your password is needed too", "password-needed")
         if r[0] != 0:
             raise ProviderError(_DOM.get(r[0], "NotAllowedError"), "CTAP status 0x%02x" % r[0])
         return cbor.decode(r[1:]) if len(r) > 1 else {}
