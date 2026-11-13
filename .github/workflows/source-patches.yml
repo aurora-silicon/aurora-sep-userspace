@@ -26,8 +26,10 @@ jobs:
           git apply ../libfprint/0008-aurora-report-the-touch-id-lockout-as-locked-out.patch
           git apply ../libfprint/0009-aurora-say-why-touch-id-needs-the-password.patch
           git apply ../libfprint/0010-let-a-front-end-ask-whether-the-reader-needs-the-password.patch
+          git apply ../libfprint/0011-aurora-name-a-touch-of-another-enrolled-finger.patch
           python3 ../libfprint/test_interface.py libfprint/drivers/aurora/aurora.c ../libfprint/apple-sep.h
           python3 ../libfprint/test_lockout_reason.py libfprint/drivers/aurora/aurora.c
+          python3 ../libfprint/test_identity_mapping.py libfprint/drivers/aurora/aurora.c
           grep -q '^#define SEP_BIO_IFACE_VERSION  5' ../libfprint/apple-sep.h
       - name: Check biometric ioctl ABI sizes
         run: |

@@ -15,7 +15,7 @@ Version:        1.94.100
 # replaces (1.fc45 < 1.fc45.aurora5) and below the next Fedora release.
 # aurora10: the Touch ID lockout reaches fprintd as FP_DEVICE_ERROR_LOCKED_OUT.
 # aurora11: and why Touch ID needs the password (after boot, other reasons).
-Release:        1%{?dist}.aurora12
+Release:        1%{?dist}.aurora13
 Summary:        Toolkit for fingerprint scanner
 
 # Automatically converted from old format: LGPLv2+ - review is highly recommended.
@@ -70,6 +70,9 @@ Patch1008:      0009-aurora-say-why-touch-id-needs-the-password.patch
 # fp_device_get_password_required(): say before a prompt that Touch ID needs
 # the password, so front-ends don't ask for a finger first.
 Patch1009:      0010-let-a-front-end-ask-whether-the-reader-needs-the-password.patch
+# Log a single-finger verify that matched another enrolled finger as a plain
+# no match, not as a print filed under the wrong identity.
+Patch1010:      0011-aurora-name-a-touch-of-another-enrolled-finger.patch
 
 BuildRequires:  meson
 BuildRequires:  gcc
@@ -205,6 +208,10 @@ python3 %{SOURCE1004} libfprint/drivers/aurora/aurora.c
 %{_datadir}/installed-tests/libfprint-2/
 
 %changelog
+* Fri Nov 13 2026 Ryan Murray <ryan@aurorasilicon.org> - 1.94.100-1.aurora13
+- Log a single-finger verify whose touch matched another enrolled finger as
+  a plain no match instead of a warning about the requested print's identity
+
 * Tue Nov 10 2026 Ryan Murray <ryan@aurorasilicon.org> - 1.94.100-1.aurora12
 - Add fp_device_get_password_required(), answered by the aurora driver from
   the kernel's lockout state, so front-ends can skip the finger prompt while
