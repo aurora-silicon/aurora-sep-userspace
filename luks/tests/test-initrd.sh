@@ -54,6 +54,14 @@ chmod +x "$T/bin/modinfo" "$T/bin/cryptsetup"
 PARMS_NEW=$(printf 'os_uuid_hi:OS identity\nkeystore_only:Attach for the key store only\n')
 PARMS_OLD=$(printf 'os_uuid_hi:OS identity\nxart_writes:writes\n')
 PARMS_BAGS=$(printf 'os_uuid_hi:OS identity\nkeystore_only:Initrd attach: 1 = trusted keys only, 2 = also per-user key bags for a password unlock\n')
+PARMS_GUARDED=$(printf 'os_uuid_hi:OS identity\nkeystore_only:Initrd attach: 1 = trusted keys only, 2 = also per-user key bags for a password unlock (under the xART guard too); defer persistent host state\n')
+# A fake sysfs with the driver's diag/policy line.
+fake_policy() { # <guard level>
+	local d=$T/sys/bus/platform/drivers/apple_sep/24e400000.sep/diag
+	mkdir -p "$d"
+	printf 'xart_writes=1 provision_keybag=1 xart_guard=%s\n' "$1" >"$d/policy"
+}
+export AURORA_SEP_SYSFS=$T/sys
 
 # ---- dracut ----
 dracut_run() { # <log> <check|install|installkernel> ; env: FAKE_PARMS, hostonly, FAKE_TOKEN_DEV
@@ -205,6 +213,36 @@ fi
 rm -rf "$T/build"; : >"$T/m.log"
 AURORA_SEP_PASSWORD_UNLOCK=yes FAKE_PARMS=$PARMS_BAGS cpio_run "$T/m.log"
 if [ "$(cat "$T/build/usr/lib/aurora-sep/initrd.conf")" = AURORA_SEP_KEYSTORE_ONLY=2 ]; then pass "mkinitcpio: password unlock -> keystore_only=2"; else fail "mkinitcpio: mode 2"; fi
+
+# ---- the xART guard (M2, M3, M4 Pro) ----
+guard_warn="this Mac runs the xART guard, and apple_sep in 7.3.0-test keeps xART read-only in the initrd"
+for level in 0 1 2; do
+	fake_policy $level
+	for parms in BAGS GUARDED; do
+		rm -rf "$T/initdir"; : >"$T/d.log"
+		eval "p=\$PARMS_$parms"
+		aurora_sep_password_unlock=yes FAKE_PARMS=$p dracut_run "$T/d.log" install
+		want=no; [ $level != 0 ] && [ $parms = BAGS ] && want=yes
+		got=no; grep -q "^warn aurora-sep: $guard_warn" "$T/d.log" && got=yes
+		if [ "$(cat "$conf")" = AURORA_SEP_KEYSTORE_ONLY=2 ] && [ $got = $want ]; then
+			pass "dracut: guard $level, $parms kernel -> keystore_only=2, guard warning $want"
+		else
+			fail "dracut: guard $level, $parms kernel (warning $got, want $want)"
+		fi
+		rm -rf "$T/build"; : >"$T/m.log"
+		AURORA_SEP_PASSWORD_UNLOCK=yes FAKE_PARMS=$p cpio_run "$T/m.log"
+		got=no; grep -q "^warn aurora-sep: $guard_warn" "$T/m.log" && got=yes
+		if [ "$(cat "$T/build/usr/lib/aurora-sep/initrd.conf")" = AURORA_SEP_KEYSTORE_ONLY=2 ] && [ $got = $want ]; then
+			pass "mkinitcpio: guard $level, $parms kernel -> keystore_only=2, guard warning $want"
+		else
+			fail "mkinitcpio: guard $level, $parms kernel (warning $got, want $want)"
+		fi
+	done
+done
+rm -rf "$T/sys"
+rm -rf "$T/initdir"; : >"$T/d.log"
+aurora_sep_password_unlock=yes FAKE_PARMS=$PARMS_BAGS dracut_run "$T/d.log" install
+if grep -q "xART guard" "$T/d.log"; then fail "dracut: no driver loaded, no guard warning"; else pass "dracut: no driver loaded, no guard warning"; fi
 
 # ---- units and loader ----
 u=$here/initrd/aurora-sep-initrd.service
