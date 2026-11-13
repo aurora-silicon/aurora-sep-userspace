@@ -17,8 +17,10 @@ options: "origin" s (required), "top_origin" s, "rk" b, "extensions" a{sv},
 "password_fd" h: a memfd (or pipe) holding the user's login password, which
 the enclave checks in place of a touch. It is read once, then the buffer is wiped.
 Errors are org.aurora.Passkeys.Error.<DOMException name>, for example
-org.aurora.Passkeys.Error.NotAllowedError; a wrong password is
-org.aurora.Passkeys.Error.WrongPassword.
+org.aurora.Passkeys.Error.NotAllowedError. A wrong password is
+org.aurora.Passkeys.Error.WrongPassword, a call that needs the password too
+(a Touch ID AND password credential or site rule) is ...Error.PasswordNeeded,
+and a locked key bag is ...Error.Locked.
 
 Callers: only the session's own uid, and, when allow_names is set, only the
 current owner of one of those bus names (the portal). Every signature is
@@ -43,6 +45,11 @@ BUS_NAME = "org.aurora.Passkeys1"
 PATH = "/org/aurora/Passkeys1"
 IFACE = "org.aurora.Passkeys.Provider1"
 ERR = "org.aurora.Passkeys.Error."
+# Provider reasons the portal acts on get their own error names: it asks for
+# the password (and calls again) or shows the locked state. Other refusals
+# carry their DOMException name.
+_REASON_ERRORS = {"wrong-password": "WrongPassword", "password-needed": "PasswordNeeded",
+                  "locked": "Locked"}
 MAX_PASSWORD = 256
 
 INTROSPECT = f"""<!DOCTYPE node PUBLIC "-//freedesktop//DTD D-BUS Object Introspection 1.0//EN"
@@ -214,7 +221,7 @@ class ProviderService:
             sig, body = fn(sender, *msg.body)
             self._send(new_method_return(msg, sig, body))
         except ProviderError as e:
-            name = "WrongPassword" if e.reason == "wrong-password" else e.name
+            name = _REASON_ERRORS.get(e.reason, e.name)
             self._send(new_error(msg, ERR + name, "s", (str(e),)))
         except Exception as e:                          # never kill the bus loop
             log.exception("%s failed", member)
