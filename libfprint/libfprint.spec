@@ -15,7 +15,7 @@ Version:        1.94.100
 # replaces (1.fc45 < 1.fc45.aurora5) and below the next Fedora release.
 # aurora10: the Touch ID lockout reaches fprintd as FP_DEVICE_ERROR_LOCKED_OUT.
 # aurora11: and why Touch ID needs the password (after boot, other reasons).
-Release:        1%{?dist}.aurora13
+Release:        1%{?dist}.aurora14
 Summary:        Toolkit for fingerprint scanner
 
 # Automatically converted from old format: LGPLv2+ - review is highly recommended.
@@ -73,6 +73,9 @@ Patch1009:      0010-let-a-front-end-ask-whether-the-reader-needs-the-password.p
 # Log a single-finger verify that matched another enrolled finger as a plain
 # no match, not as a print filed under the wrong identity.
 Patch1010:      0011-aurora-name-a-touch-of-another-enrolled-finger.patch
+# Name the print's Unix account in a match, so a kernel that keeps each
+# account's prints in its own key bag matches there.
+Patch1011:      0012-aurora-match-in-the-account-s-own-key-bag-domain.patch
 
 BuildRequires:  meson
 BuildRequires:  gcc
@@ -208,6 +211,11 @@ python3 %{SOURCE1004} libfprint/drivers/aurora/aurora.c
 %{_datadir}/installed-tests/libfprint-2/
 
 %changelog
+* Tue Nov 17 2026 Cameron Cooper <c@meron.cc> - 1.94.100-1.aurora14
+- Name the print's Unix account in a verify or identify
+  (SEP_BIO_VERIFY_ACCOUNT) when the kernel offers it, so fingers enrolled
+  into the account's own key bag match at the lock screen too
+
 * Fri Nov 13 2026 Ryan Murray <ryan@aurorasilicon.org> - 1.94.100-1.aurora13
 - Log a single-finger verify whose touch matched another enrolled finger as
   a plain no match instead of a warning about the requested print's identity
