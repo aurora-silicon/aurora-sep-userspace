@@ -249,3 +249,13 @@ jobs:
         run: dnf -y install make gcc pam-devel python3
       - name: Build and test the PAM re-arm module and service
         run: make -C touchid-rearm check
+
+  host-state:
+    runs-on: ubuntu-latest
+    container: fedora:45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: dnf -y install make python3
+      - name: Test the truncated host-state store repair
+        run: make -C host-state check

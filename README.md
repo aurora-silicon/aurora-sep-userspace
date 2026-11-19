@@ -71,6 +71,19 @@ It also applies the "Touch ID after a restart" setting (`/etc/aurora/touchid.con
 `require_password_after_boot`): by default, as on macOS, the first login or unlock
 after boot needs the password; `no` gives Touch ID from the first login.
 
+## Truncated host-state store
+
+`host-state/` recovers `/var/lib/aurora-sep-host-state.bin` after a power cut
+shortened it. The driver refuses any size but the full 72-block store and does
+not reinitialise the file, so Touch ID stays dead across reboots. A prefix whose
+superblock validates and whose used slots all end inside the file is backed up
+and zero-extended back to the full size; anything else is moved to
+`/var/lib/aurora-sep-quarantine` so the driver starts with a fresh store.
+`aurora-sep-host-state-repair.service` orders itself before `aurora-sep.service`
+and is enabled by its preset. See [host-state/README.md](host-state/README.md).
+
+    make -C host-state check         # synthetic stores, no root, no hardware
+
 ## SEP-sealed LUKS2 unlock
 
 `luks/` holds `aurora-sep-cryptenroll` and the libcryptsetup token plugin
@@ -185,6 +198,7 @@ top of it, or keep the version lock.
   `LICENSES/Linux-syscall-note.txt`, `LICENSES/MIT.txt`).
 - `luks/` is MIT.
 - `fido/` is MIT.
+- `host-state/` is MIT.
 - Everything else here is MIT.
 
 ## Qualification
