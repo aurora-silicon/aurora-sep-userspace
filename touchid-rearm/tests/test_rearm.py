@@ -47,6 +47,7 @@ class Rig:
             f'auth required {FAKE} password\naccount required {FAKE}\n')
         self.connections = 0
         self.replies = []
+        self.stopping = False
         self.server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.server.bind(self.sock)
         self.server.listen(4)
@@ -54,7 +55,8 @@ class Rig:
                         AURORA_REARM_TEST_DEVICE=str(self.device),
                         AURORA_REARM_TEST_FPRINT_DIR=str(self.fprint),
                         AURORA_REARM_TEST_CONFDIR=str(self.conf))
-        threading.Thread(target=self.serve, daemon=True).start()
+        self.thread = threading.Thread(target=self.serve, daemon=True)
+        self.thread.start()
 
     def serve(self):
         while True:
@@ -62,10 +64,26 @@ class Rig:
                 conn, _ = self.server.accept()
             except OSError:
                 return
+            if self.stopping:
+                conn.close()
+                return
             self.connections += 1
             subprocess.run([HELPER], stdin=conn.fileno(), stdout=conn.fileno(),
                            env=self.env, check=False, timeout=20)
             conn.close()
+
+    def stop(self):
+        # Close the listening socket only once serve() has returned. Closed
+        # under a thread about to enter accept(), its descriptor number goes
+        # to the next test's socket, and this rig's thread then answers that
+        # test with this rig's (deleted) device: "ok not-locked".
+        self.stopping = True
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as wake:
+            wake.connect(self.sock)
+        self.thread.join(timeout=30)
+        if self.thread.is_alive():
+            raise RuntimeError('the rig\'s server thread did not stop')
+        self.server.close()
 
     def lock(self, state):
         self.device.write_text(state + '\n')
@@ -108,7 +126,7 @@ class RearmTest(unittest.TestCase):
         self.rig.stack('client', f'-auth optional {MODULE} socket={self.rig.sock}')
 
     def tearDown(self):
-        self.rig.server.close()
+        self.rig.stop()
         self.tmpdir.cleanup()
 
     def test_password_rearms_a_lockout(self):
@@ -213,6 +231,19 @@ class RearmTest(unittest.TestCase):
         self.rig.stack('nomodule', '-auth optional /nonexistent/pam_aurora_touchid.so')
         self.assertEqual(self.rig.authenticate('nomodule', 'right'), PAM_SUCCESS)
         self.assertEqual(self.rig.authenticate('nomodule', 'wrong'), PAM_AUTH_ERR)
+
+    def test_a_stopped_rig_answers_no_later_connection(self):
+        # The next test's socket may reuse this one's descriptor number, so
+        # this rig's thread must be gone before its socket closes.
+        self.rig.lock('required')
+        self.assertEqual(self.rig.direct(USER, 'right'), 'ok armed')
+        thread = self.rig.thread
+        self.rig.stop()
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(self.rig.server.fileno(), -1)
+        # The wake-up connection is not served.
+        self.assertEqual(self.rig.connections, 1)
+        self.rig = Rig(tempfile.mkdtemp(dir=self.tmpdir.name))
 
     def test_service_down_keeps_the_stack(self):
         self.rig.stack('down', f'-auth optional {MODULE} socket={self.rig.tmp}/absent.sock')
