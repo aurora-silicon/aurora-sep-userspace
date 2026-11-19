@@ -45,6 +45,15 @@ OBSOLETE = {("keys", "enclave_policy"), ("touchid", "password_timeout")}
 
 DEVICE_NAME = "Aurora Touch ID Security Key"
 
+# Exit status of a start that cannot succeed until the configuration or the
+# machine changes: not root, no usable /dev/sep-key, an invalid policy, or a
+# master secret the enclave does not unseal (its answer is final for the boot
+# once aurora-sep.service, which this unit starts after, has finished). It is
+# EX_CONFIG from sysexits.h; aurora-fido.service names it in
+# RestartPreventExitStatus=, so systemd does not restart into the same failure
+# every RestartSec while a crash of the running daemon is still restarted.
+EXIT_CONFIG = 78
+
 
 class SealedSecret:
     """The 64-byte master secret, sealed by this Mac's Secure Enclave."""
@@ -263,7 +272,7 @@ def main(argv=None):
                         format="%(message)s")
     if os.geteuid() != 0:
         log.error("aurora-fidod runs as root (uhid, sep-key, the sealed secret)")
-        return 1
+        return EXIT_CONFIG
     cfg = load_config(a.config)
     for sec, key in sorted(OBSOLETE):
         if cfg.has_option(sec, key) and key not in DEFAULTS.get(sec, {}):
@@ -276,7 +285,7 @@ def main(argv=None):
         policy, note = resolve_policy(cfg, backend.flags_supported)
     except (BackendError, ValueError) as e:
         log.error("%s", e)
-        return 1
+        return EXIT_CONFIG
     if note:
         log.info("%s", note)
     os.umask(0o077)
@@ -290,7 +299,7 @@ def main(argv=None):
                         SealedSecret(a.state_dir, a.seal_helper), policy, legacy)
     except (RuntimeError, OSError, subprocess.SubprocessError) as e:
         log.error("cannot open the sealed master secret: %s", e)
-        return 1
+        return EXIT_CONFIG
     from .uhid import UhidDevice
     pol = creds.POLICY_NAMES[policy]
     status.update(key_store_info(backend), version=__version__,

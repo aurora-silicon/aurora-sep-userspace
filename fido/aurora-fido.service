@@ -13,6 +13,10 @@ Type=simple
 ExecStart=@LIBEXECDIR@/aurora-fidod
 Restart=on-failure
 RestartSec=5
+# aurora-fidod exits 78 (EX_CONFIG) when it cannot start until the
+# configuration or the machine changes (see EXIT_CONFIG in daemon.py); a
+# restart would fail the same way.
+RestartPreventExitStatus=78
 StateDirectory=aurora-fido
 StateDirectoryMode=0700
 RuntimeDirectory=aurora-fido
