@@ -52,6 +52,8 @@ if [ "$2" = "${FAKE_TOKEN_DEV:-}" ]; then echo "  0: aurora-sep"; else echo "  0
 EOF
 chmod +x "$T/bin/modinfo" "$T/bin/cryptsetup"
 PARMS_NEW=$(printf 'os_uuid_hi:OS identity\nkeystore_only:Attach for the key store only\n')
+# A kernel without keystore_only. It still listed xart_writes, which
+# aurora-silicon/linux#2591 later removed.
 PARMS_OLD=$(printf 'os_uuid_hi:OS identity\nxart_writes:writes\n')
 PARMS_BAGS=$(printf 'os_uuid_hi:OS identity\nkeystore_only:Initrd attach: 1 = trusted keys only, 2 = also per-user key bags for a password unlock\n')
 
