@@ -55,6 +55,7 @@ check:
 	$(PYTHON) tests/test_ctap.py
 	$(PYTHON) tests/test_agent.py
 	$(PYTHON) tests/test_provider.py
+	$(PYTHON) tests/test_daemon_exit.py
 	if command -v dbus-run-session >/dev/null 2>&1; then \
 		dbus-run-session -- $(PYTHON) tests/test_dbus_provider.py; \
 	else $(PYTHON) tests/test_dbus_provider.py; fi
