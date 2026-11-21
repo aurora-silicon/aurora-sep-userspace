@@ -1,0 +1,36 @@
+# SPDX-License-Identifier: MIT
+[Unit]
+Description=Recover a truncated SEP host-state store
+Documentation=file:///usr/share/doc/aurora-sep-host-state/README.md
+# A power cut can leave a prefix of /var/lib/aurora-sep-host-state.bin. The
+# driver refuses any size but the full one and does not reinitialise the
+# file, so Touch ID stays dead until someone recovers the file by hand. Run
+# before the loader starts apple_sep, and only when there is a store at
+# all; a whole store is left untouched and costs one stat.
+ConditionPathExists=/var/lib/aurora-sep-host-state.bin
+RequiresMountsFor=/var/lib
+Before=aurora-sep.service
+CollectMode=inactive-or-failed
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=@LIBEXECDIR@/aurora-sep-host-state-repair
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=aurora-sep.service

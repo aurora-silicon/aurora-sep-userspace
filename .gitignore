@@ -15,3 +15,4 @@ __pycache__/
 /luks/pam_aurora_sep_fde.so
 /fido/aurora-passkeyd
 /fido/aurora-passkeyd.service.out
+/host-state/aurora-sep-host-state-repair.service.out
