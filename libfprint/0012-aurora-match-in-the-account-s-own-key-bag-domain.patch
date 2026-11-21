@@ -1,0 +1,138 @@
+Subject: [PATCH] aurora: match in the account's own key bag domain
+
+A kernel that keeps each Unix account's prints in its own key bag
+(SEP_BIO_INFO_VERIFY_ACCOUNT) matches a verify there only when told the
+account. Without it every match ran against the built-in Linux user, so
+a finger enrolled into the account's bag (enrolment always names the
+account) never matched at the lock screen, and the bag's own Touch ID
+and the lock screen's disagreed about which fingers count.
+
+Name the print's account with SEP_BIO_VERIFY_ACCOUNT, resolved as an
+enrolment resolves it, when the open device offered the flag. The open
+reads it once; a match does not ask again, since the kernel can refuse a
+query while the last touch's bookkeeping runs, and a retry must not move
+to another domain. fprintd's gallery is one user's; an identify names
+the gallery's account only when every print belongs to it, and then does
+not take the built-in user's zero live count as a no match: an account's
+prints are not counted there. A kernel
+without the flag, a print without an account or one without a passwd
+entry keeps the built-in Linux user, as before.
+
+Assisted-by: LLM
+---
+diff --git a/libfprint/drivers/aurora/aurora.c b/libfprint/drivers/aurora/aurora.c
+index 9d1cc33..fba732d 100644
+--- a/libfprint/drivers/aurora/aurora.c
++++ b/libfprint/drivers/aurora/aurora.c
+@@ -78,6 +78,8 @@ struct _FpiDeviceAurora
+ 
+   gint      fd;
+   guint32   iface_version;
++  /* SEP_BIO_INFO_VERIFY_ACCOUNT on the open fd: a match names its account. */
++  gboolean  verify_account;
+   guint     watch_id;
+   guint32   enroll_last_reported_stage;
+ 
+@@ -583,6 +585,7 @@ aurora_open (FpDevice *device)
+ 
+   /* Recheck on the fd used for operations, rather than relying on probe. */
+   self->iface_version = 0;
++  self->verify_account = FALSE;
+   if (!aurora_ioctl (self, SEP_BIO_GET_INFO, &info, &error) ||
+       !aurora_iface_supported (info.version))
+     {
+@@ -596,6 +599,7 @@ aurora_open (FpDevice *device)
+       return;
+     }
+   self->iface_version = info.version;
++  self->verify_account = (info.reserved[0] & SEP_BIO_INFO_VERIFY_ACCOUNT) != 0;
+   fpi_device_open_complete (device, NULL);
+ }
+ 
+@@ -1110,12 +1114,48 @@ aurora_verify_ready (gint fd, GIOCondition condition, gpointer user_data)
+   return G_SOURCE_REMOVE;
+ }
+ 
++/* The Unix account a match is for, so a kernel that keeps each account's
++ * prints in its own key bag (SEP_BIO_INFO_VERIFY_ACCOUNT, read once at open)
++ * matches there. Not asked again per match: the kernel can refuse a query
++ * while the last touch's bookkeeping runs, and that must not move a retry to
++ * another domain. fprintd's gallery is one user's; a gallery naming several
++ * accounts, a print with no account or one without a passwd entry keeps the
++ * built-in Linux user, as before. */
++static gboolean
++aurora_match_account (FpiDeviceAurora *self,
++                      FpPrint        **prints,
++                      guint            n_prints,
++                      guint32         *uid_out)
++{
++  struct passwd account;
++  struct passwd *found = NULL;
++  gchar account_buf[16384];
++  const gchar *username;
++  guint i;
++
++  if (!self->verify_account || n_prints == 0 || prints[0] == NULL)
++    return FALSE;
++  username = fp_print_get_username (prints[0]);
++  if (username == NULL || username[0] == '\0')
++    return FALSE;
++  for (i = 1; i < n_prints; i++)
++    if (prints[i] == NULL || g_strcmp0 (fp_print_get_username (prints[i]), username) != 0)
++      return FALSE;
++  if (getpwnam_r (username, &account, account_buf, sizeof (account_buf), &found) != 0 ||
++      found == NULL || g_strcmp0 (found->pw_name, username) != 0 ||
++      (guint64) found->pw_uid >= G_MAXUINT32)
++    return FALSE;
++  *uid_out = (guint32) found->pw_uid;
++  return TRUE;
++}
++
+ static void
+ aurora_match_start (FpDevice *device)
+ {
+   FpiDeviceAurora *self = FPI_DEVICE_AURORA (device);
+   struct sep_bio_verify_start start = { 0 };
+   struct sep_bio_info info = { 0 };
++  guint32 account_uid = 0;
+   FpiDeviceAction action = fpi_device_get_current_action (device);
+   g_autoptr(GError) error = NULL;
+   FpPrint *print = NULL;
+@@ -1158,7 +1198,11 @@ aurora_match_start (FpDevice *device)
+           return;
+         }
+ 
+-      if (ioctl (self->fd, SEP_BIO_GET_INFO, &info) == 0 &&
++      /* The live count is the built-in Linux user's. A gallery matched in an
++       * account's own key bag is not counted there, so the count proves
++       * nothing about it. */
++      if (!aurora_match_account (self, (FpPrint **) gallery->pdata, gallery->len, &account_uid) &&
++          ioctl (self->fd, SEP_BIO_GET_INFO, &info) == 0 &&
+           aurora_iface_supported (info.version) &&
+           (info.reserved[0] & SEP_BIO_INFO_LIVE_COUNT_VALID) != 0 &&
+           info.reserved[1] == 0)
+@@ -1196,6 +1240,24 @@ aurora_match_start (FpDevice *device)
+   self->nonce_valid = TRUE;
+ 
+   memcpy (start.nonce, self->nonce, sizeof (start.nonce));
++  {
++    GPtrArray *gallery = NULL;
++    FpPrint **prints = &print;
++    guint n_prints = print != NULL;
++    guint32 uid = 0;
++
++    if (action == FPI_DEVICE_ACTION_IDENTIFY)
++      {
++        fpi_device_get_identify_data (device, &gallery);
++        prints = (FpPrint **) gallery->pdata;
++        n_prints = gallery->len;
++      }
++    if (aurora_match_account (self, prints, n_prints, &uid))
++      {
++        start.flags = SEP_BIO_VERIFY_ACCOUNT;
++        start.account_uid = uid;
++      }
++  }
+   self->match_started_us = g_get_monotonic_time ();
+ 
+   if (!aurora_ioctl (self, SEP_BIO_VERIFY_START, &start, &error))
