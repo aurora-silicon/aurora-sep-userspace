@@ -108,7 +108,7 @@ def resolve_policy(cfg, flags_supported):
     if name not in creds.POLICIES:
         raise PolicyError(f"[touchid] policy = {name!r}; use auto, " + ", ".join(creds.POLICIES))
     pol = creds.POLICIES[name]
-    if not flags_supported & creds.POLICY_FLAGS[pol]:
+    if creds.POLICY_FLAGS[pol] & ~flags_supported:
         if pol == creds.POLICY_TOUCHID_OR_PASSWORD:
             raise PolicyError(
                 "[touchid] policy = touchid-or-password needs the Secure Enclave to check "

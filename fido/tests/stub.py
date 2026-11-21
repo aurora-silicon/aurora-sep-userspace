@@ -24,8 +24,10 @@ from cryptography.exceptions import InvalidTag
 
 import struct
 
-from aurora_fido.backend import (BagLocked, EnclaveCancelled, EnclaveRefused, EnclaveTimeout,
-                                 InvalidHandle, KeyBackend, PasswordRefused)
+from aurora_fido.backend import (USER_HANDLE_FLAGS, BagLocked, EnclaveCancelled, EnclaveRefused,
+                                 EnclaveTimeout, InvalidHandle, KeyBackend, PasswordRefused)
+
+_AND = 0x10      # HANDLE_FLAG_AND_PASSCODE
 
 MATCH, NO_MATCH, TIMEOUT, WAIT = "match", "no-match", "timeout", "wait"
 # Handle layout: "STUB" | gated flag | nonce[12] | AES-GCM(scalar) (48) | pad
@@ -39,7 +41,8 @@ class StubKeyBackend(KeyBackend):
     name = "software-stub (TEST ONLY)"
 
     def __init__(self, key=None, handle_pad=0, mode=MATCH, flags_supported=0x3,
-                 can_unseal=True, can_cancel=True, can_password=True, bag_password=b"pw"):
+                 can_unseal=True, can_cancel=True, can_password=True, bag_password=b"pw",
+                 user_policies=False):
         self._aead = AESGCM(key or secrets.token_bytes(32))
         self.handle_pad = handle_pad      # make handles longer, like a big SEP record
         self.mode = mode
@@ -51,6 +54,8 @@ class StubKeyBackend(KeyBackend):
         self.creates = 0
         # Interface 4 stand-in: one user key bag (any uid), its password and lock.
         self.can_password = can_password
+        # SEP_KEY_FEATURE_USER_POLICIES: Touch ID only and Touch ID AND password keys.
+        self.user_policies = can_password and user_policies
         self.version = 4 if can_password else 3
         self.pin_reboot_proof = False
         self.bag_password = bag_password
@@ -76,8 +81,11 @@ class StubKeyBackend(KeyBackend):
             raise AssertionError("create_user on a stub without interface 4")
         if self.bag_locked:
             raise BagLocked("bag locked")
-        inner, point = self.create(0x4 if presence else 0, gated=presence)
-        flags = 0x04 if presence else 0x0C
+        cflags = (0x4 if presence else 0) if isinstance(presence, bool) else presence
+        if cflags not in (0, 0x4) and not self.user_policies:
+            raise AssertionError("create_user policy 0x%x without USER_POLICIES" % cflags)
+        inner, point = self.create(cflags, gated=cflags != 0)
+        flags = USER_HANDLE_FLAGS[cflags]
         return (b"SEPK" + bytes([2, flags, 0, 0]) + struct.pack("<II", len(inner), uid)
                 + inner, point)
 
@@ -91,7 +99,7 @@ class StubKeyBackend(KeyBackend):
     def gated(self, handle):
         inner, uflags = self._user(handle)
         if uflags is not None:
-            return uflags == 0x04
+            return uflags in USER_HANDLE_FLAGS.values() and not uflags & 0x08
         return isinstance(handle, bytes) and handle[:4] == b"STUB" and len(handle) > 4 \
             and bool(handle[4] & _GATED)
 
@@ -140,8 +148,14 @@ class StubKeyBackend(KeyBackend):
         if m != MATCH:
             raise AssertionError(f"stub mode {m!r}")
 
+    def _no_and(self, handle):
+        uflags = self._user(handle)[1]
+        if uflags is not None and uflags & _AND:
+            raise InvalidHandle("SIGN/UNSEAL refuse a Touch ID AND password key (EINVAL)")
+
     def sign(self, handle, digest):
         priv = self._priv(handle)
+        self._no_and(handle)
         self._touch(handle)
         self.signs += 1
         return priv.sign(digest, ec.ECDSA(Prehashed(hashes.SHA256())))
@@ -156,6 +170,7 @@ class StubKeyBackend(KeyBackend):
 
     def unseal(self, handle, sealed):
         self._priv(handle)
+        self._no_and(handle)
         self._touch(handle)
         try:
             return AESGCM(self._seal_key(handle)).decrypt(sealed[:12], sealed[12:], b"seal")
@@ -163,8 +178,13 @@ class StubKeyBackend(KeyBackend):
             raise InvalidHandle("sealed for another key") from e
 
     def _password(self, handle, password):
-        if self._user(handle)[1] != 0x04:
-            raise InvalidHandle("password calls take .userPresence keys under a user bag")
+        uflags = self._user(handle)[1]
+        if uflags != 0x04 and not (uflags is not None and uflags & _AND):
+            raise InvalidHandle("password calls take .userPresence or AND keys under a user bag")
+        if uflags & _AND:
+            # As the kernel: the match first, then the enclave checks the password.
+            self._touch(handle)
+            self.and_touches = getattr(self, "and_touches", 0) + 1
         if self.bag_locked:
             raise BagLocked("bag locked")
         if bytes(password) != self.bag_password:

@@ -27,7 +27,7 @@ except ImportError:
 
 from aurora_fido import agent, cbor, ctap2, daemon  # noqa: E402
 from aurora_fido.backend import UserBagBackend  # noqa: E402
-from aurora_fido.provider import Provider  # noqa: E402
+from aurora_fido.provider import Provider, ProviderError  # noqa: E402
 import stub  # noqa: E402
 from test_ctap import CDH, parse_auth_data  # noqa: E402
 
@@ -114,6 +114,17 @@ class DbusProviderTest(unittest.TestCase):
         err, (r,) = self.make(dict(ORIGIN, password_fd=("h", self.memfd(b"pw"))), req=3)
         self.assertIsNone(err, r)
         self.assertEqual(self.backend.password_signs, 1)
+
+    def test_reasons_the_portal_acts_on_have_their_own_errors(self):
+        if self.svc.allow_names:
+            self.skipTest("this caller is refused before the provider runs")
+        for reason, name in (("locked", "Locked"), ("password-needed", "PasswordNeeded"),
+                             ("wrong-password", "WrongPassword"), (None, "NotAllowedError")):
+            def refuse(*_a, reason=reason):
+                raise ProviderError("NotAllowedError", "refused", reason)
+            self.svc.provider.list_credentials = refuse
+            err, _ = self.call("ListCredentials", "saay", ("example.com", []))
+            self.assertEqual(err, dp.ERR + name)
 
     def test_cancel(self):
         self.backend.mode = stub.WAIT
