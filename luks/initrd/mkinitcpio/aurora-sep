@@ -14,6 +14,20 @@ _aurora_sep_kernel_user_bags() {
     modinfo -k "$KERNELVERSION" -F parm apple_sep 2>/dev/null | grep -q '^keystore_only:.*per-user key bags'
 }
 
+# Macs whose enclave Linux shares with macOS run the driver's xART guard;
+# older drivers keep xART read-only in the initrd there (see the dracut module).
+_aurora_sep_kernel_guarded_bags() {
+    modinfo -k "$KERNELVERSION" -F parm apple_sep 2>/dev/null | grep -q '^keystore_only:.*per-user key bags.*xART guard'
+}
+
+_aurora_sep_guard_on() {
+    local f
+    for f in "${AURORA_SEP_SYSFS:-/sys}"/bus/platform/drivers/apple_sep/*/diag/policy; do
+        [[ -r $f ]] && grep -Eq '(^|[[:space:]])xart_guard=[1-9]' "$f" && return 0
+    done
+    return 1
+}
+
 # Password-mode volumes (aurora-sep-fde) named in /etc/crypttab.initramfs, or
 # AURORA_SEP_PASSWORD_UNLOCK=yes in mkinitcpio.conf for volumes this host
 # cannot see (an installer target, an image file).
@@ -61,6 +75,9 @@ build() {
     if _aurora_sep_wants_user_bags; then
         if _aurora_sep_kernel_user_bags; then
             mode=2
+            if _aurora_sep_guard_on && ! _aurora_sep_kernel_guarded_bags; then
+                warning "aurora-sep: this Mac runs the xART guard, and apple_sep in $KERNELVERSION keeps xART read-only in the initrd under it; volumes sealed to a password will ask for their passphrase or recovery key there"
+            fi
         else
             warning "aurora-sep: apple_sep in $KERNELVERSION cannot unlock a user's key bag in the initrd; volumes sealed to a password will ask for their passphrase or recovery key there"
         fi
