@@ -195,7 +195,110 @@ class PerAccountTest(unittest.TestCase):
         self.rig.seat.uid = BOB
         self.assertEqual(self.rig.u2f.handle(check), b"\x6a\x80")     # unknown to Bob
         self.rig.seat.uid = None
-        self.assertEqual(self.rig.u2f.handle(check), b"\x69\x85")        # nothing done
+        self.assertEqual(self.rig.u2f.handle(check), b"\x6a\x80")        # not usable by anyone now
+
+
+class SessionBindingTest(unittest.TestCase):
+    """Tokens and continuations belong to the account that made them: a change of
+    the seat user drops them, and another account's request cannot use them."""
+
+    def setUp(self):
+        self.rig = OwnedRig()
+        self.addCleanup(self.rig.close)
+
+    def two_accounts(self):
+        self.rig.seat.uid = ALICE
+        self.rig.make(rp="a1.example", uid=b"alice1", rk=True)
+        self.rig.make(rp="a2.example", uid=b"alice2", rk=True)
+        self.rig.seat.uid = BOB
+        self.rig.make(rp="b.example", uid=b"bob", rk=True)
+
+    def test_a_cm_token_does_not_cross_to_another_account(self):
+        self.two_accounts()
+        plat = Platform(self.rig)                       # Bob, active on seat0
+        _, tok = plat.token(pinuv.PERM_CM)
+        self.assertEqual(cm_call(self.rig, plat, tok, 0x01)[0], 0)
+        self.rig.seat.uid = ALICE                       # user switch; Bob's process keeps its fd
+        touches = self.rig.backend.touches
+        for sub, params in ((0x01, None), (0x02, None),
+                            (0x04, {1: hashlib.sha256(b"a1.example").digest()})):
+            self.assertEqual(cm_call(self.rig, plat, tok, sub, params)[0], E.ERR_PIN_AUTH_INVALID)
+        alice_id = self.rig.auth.store.for_rp(hashlib.sha256(b"a1.example").digest())[0]["credId"]
+        self.assertEqual(cm_call(self.rig, plat, tok, 0x06,
+                                 {2: {"type": "public-key", "id": alice_id}})[0],
+                         E.ERR_PIN_AUTH_INVALID)
+        self.assertEqual(self.rig.auth.store.count(), 3)
+        self.assertEqual(self.rig.backend.touches, touches)
+        # Back to Bob: the token was dropped at the switch, not just hidden.
+        self.rig.seat.uid = BOB
+        self.assertEqual(cm_call(self.rig, plat, tok, 0x01)[0], E.ERR_PIN_AUTH_INVALID)
+
+    def test_a_ga_token_does_not_cross_to_another_account(self):
+        self.rig.seat.uid = ALICE
+        _, r = self.rig.make()
+        cid = self.rig.cid(r)
+        self.rig.seat.uid = BOB
+        plat = Platform(self.rig)
+        _, tok = plat.token(pinuv.PERM_GA, RP)
+        self.rig.seat.uid = ALICE
+        st, _ = self.rig.ga(cid, extra={6: plat.auth(tok, CDH), 7: plat.version})
+        self.assertEqual(st, E.ERR_PIN_AUTH_INVALID)
+
+    def test_an_enumeration_does_not_continue_for_another_account(self):
+        self.two_accounts()
+        self.rig.seat.uid = ALICE
+        plat = Platform(self.rig)
+        _, tok = plat.token(pinuv.PERM_CM)
+        st, rp1 = cm_call(self.rig, plat, tok, 0x02)
+        self.assertEqual((st, rp1[5]), (0, 2))
+        self.rig.seat.uid = BOB
+        self.assertEqual(cm_call(self.rig, plat, tok, 0x03, auth=False)[0], E.ERR_NOT_ALLOWED)
+        # Nor for Alice again: it was dropped at the switch.
+        self.rig.seat.uid = ALICE
+        self.assertEqual(cm_call(self.rig, plat, tok, 0x03, auth=False)[0], E.ERR_NOT_ALLOWED)
+
+    def test_a_credential_enumeration_needs_a_session_to_continue(self):
+        self.rig.seat.uid = ALICE
+        self.rig.make(uid=b"alice1", rk=True)
+        self.rig.make(uid=b"alice2", rk=True)
+        plat = Platform(self.rig)
+        _, tok = plat.token(pinuv.PERM_CM)
+        st, c1 = cm_call(self.rig, plat, tok, 0x04, {1: RP_HASH})
+        self.assertEqual((st, c1[9]), (0, 2))
+        self.rig.seat.uid = None
+        self.assertEqual(cm_call(self.rig, plat, tok, 0x05, auth=False)[0], E.ERR_OPERATION_DENIED)
+        self.rig.seat.uid = BOB
+        self.assertEqual(cm_call(self.rig, plat, tok, 0x05, auth=False)[0], E.ERR_NOT_ALLOWED)
+
+    def test_get_next_assertion_does_not_continue_for_another_account(self):
+        self.rig.seat.uid = ALICE
+        self.rig.make(uid=b"alice1", rk=True)
+        self.rig.make(uid=b"alice2", rk=True)
+        st, a = self.rig.call(ctap2.CMD_GET_ASSERTION, {1: RP, 2: CDH})
+        self.assertEqual((st, a[5]), (0, 2))
+        self.rig.seat.uid = BOB
+        signs = self.rig.backend.signs
+        self.assertEqual(self.rig.call(ctap2.CMD_GET_NEXT_ASSERTION)[0], E.ERR_NOT_ALLOWED)
+        self.assertEqual(self.rig.backend.signs, signs)
+        self.rig.seat.uid = ALICE
+        self.assertEqual(self.rig.call(ctap2.CMD_GET_NEXT_ASSERTION)[0], E.ERR_NOT_ALLOWED)
+
+    def test_the_same_account_keeps_its_session(self):
+        self.rig.seat.uid = ALICE
+        self.rig.make(uid=b"alice1", rk=True)
+        self.rig.make(uid=b"alice2", rk=True)
+        st, _ = self.rig.call(ctap2.CMD_GET_ASSERTION, {1: RP, 2: CDH})
+        self.assertEqual(self.rig.call(ctap2.CMD_GET_NEXT_ASSERTION)[0], 0)
+
+    def test_no_session_no_touch_prompt(self):
+        self.rig.seat.uid = ALICE
+        plat = Platform(self.rig)
+        self.rig.seat.uid = None
+        touches = self.rig.backend.touches
+        self.assertEqual(self.rig.call(ctap2.CMD_SELECTION)[0], E.ERR_OPERATION_DENIED)
+        self.assertEqual(plat.token(pinuv.PERM_CM)[0], E.ERR_OPERATION_DENIED)
+        self.assertEqual(self.rig.backend.touches, touches)
+        self.assertEqual(self.rig.call(ctap2.CMD_GET_INFO)[0], 0)
 
 
 class LegacyOwnerTest(unittest.TestCase):
@@ -292,6 +395,13 @@ class LegacyOwnerTest(unittest.TestCase):
             rig.rebuild()
             self.assertFalse(rig.owners.owns(ALICE, None))
             self.assertTrue(rig.owners.others(ALICE))
+            # Repairing the legacy owner does not open reset: who made the other
+            # credentials is still not known.
+            owners.Owners(rig.state, lambda: None, rig.fprint).adopt(ALICE)
+            rig.rebuild()
+            self.assertTrue(rig.owners.owns(ALICE, None))
+            self.assertTrue(rig.owners.others(ALICE))
+            self.assertEqual(rig.call(ctap2.CMD_RESET)[0], E.ERR_NOT_ALLOWED)
         finally:
             rig.close()
 

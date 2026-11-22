@@ -108,11 +108,28 @@ access-control list. The daemon keeps the accounts apart itself:
   version first opens such a store it gives them to the only account with
   prints in `/var/lib/fprint`. With no such account or several, they are
   refused to everyone and `aurora-fido status` says so, until root names
-  their account: `sudo aurora-fido adopt-legacy USER`.
+  their account: `sudo aurora-fido adopt-legacy USER`. A damaged
+  `owners.json` is treated the same way, and reset then stays refused even
+  after `adopt-legacy` (who made the other credentials is no longer known)
+  until `sudo aurora-fido disable --forget`.
+- Session state belongs to the account it was made for: the
+  pinUvAuthToken (and the credential-management permission behind it), the
+  key agreement key, and the getNextAssertion and credential-management
+  "next" lists. When a request comes for another account, or with no active
+  session, all of it is dropped before the request runs, so a token or a
+  list made for one account never serves another.
 - A process that opened the hidraw node while its user was active keeps it
   open after a user switch; its requests are then for the new active user,
   whose finger the enclave waits for and whose session gets the
-  notification.
+  notification. A request made inside the active user's session on behalf
+  of another account (`su - other` with `pam_u2f`) is also for the active
+  user, so it does not find the other account's registration.
+- The `max_resident` passkey slots are one budget for all accounts: the
+  remaining count reported to each account is the store's.
+- With `touchid-current` (what `auto` makes without the enclave password
+  check), adding or removing a finger by any account on this Mac retires
+  every account's credentials made with it, `pam_u2f` registrations and
+  `hmac-secret` enrolments included. `aurora-fido status` says so.
 
 **Master secret:** 64 random bytes, sealed by this Mac's Secure Enclave with
 the kernel's `trusted` key type (`aurora-fido-seal`, the same sealing as

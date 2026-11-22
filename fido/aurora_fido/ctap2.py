@@ -162,6 +162,11 @@ class Authenticator:
         self._next = None                 # getNextAssertion state
         self._cm = None                   # credential management enumeration state
         self._refused = None              # (request digest, when) of the last refusal
+        # System vault: the uid the session state above (token, key agreement,
+        # enumerations, refusal) was made for, and the uid of the request being
+        # handled. A request for another uid drops all of that state first.
+        self._session_uid = None
+        self._request_uid = None
         # Signs the answers to silent (up=false) probes; never a credential key.
         self._probe_key = ec.generate_private_key(ec.SECP256R1())
 
@@ -187,10 +192,6 @@ class Authenticator:
         h = handlers.get(cmd)
         if h is None:
             return bytes([ERR_INVALID_COMMAND])
-        if cmd != CMD_GET_NEXT_ASSERTION:
-            self._next = None
-        if cmd not in (CMD_CRED_MGMT, CMD_CRED_MGMT_PRE):
-            self._cm = None
         params = {}
         if len(data) > 1:
             try:
@@ -203,7 +204,16 @@ class Authenticator:
                 return bytes([ERR_CBOR_UNEXPECTED_TYPE])
         try:
             with self.lock:
-                resp = h(params, ctx)
+                try:
+                    if cmd != CMD_GET_INFO:
+                        self.begin_request()
+                    if cmd != CMD_GET_NEXT_ASSERTION:
+                        self._next = None
+                    if cmd not in (CMD_CRED_MGMT, CMD_CRED_MGMT_PRE):
+                        self._cm = None
+                    resp = h(params, ctx)
+                finally:
+                    self._request_uid = None
         except CtapError as e:
             log.info("command 0x%02x: %s", cmd, e)
             return bytes([e.code])
@@ -296,15 +306,40 @@ class Authenticator:
 
     # -- whose credentials ------------------------------------------------------------
 
-    def client_uid(self):
-        """The uid this request is for (system vault), or None when the store has
-        one user. Refused when no local user is active on seat0."""
+    def begin_request(self):
+        """Resolve, once per request, the uid it is for (system vault).
+
+        Session state made for another uid (the pinUvAuthToken, the key
+        agreement key, the credential-management and getNextAssertion
+        continuations, the last refusal) is dropped before the request runs.
+        With no active local session nothing but getInfo is answered."""
         if self.owners is None:
+            self._request_uid = None
             return None
         uid = self.owners.current()
+        if uid != self._session_uid:
+            self._drop_session()
+            self._session_uid = uid
         if uid is None:
             raise CtapError(ERR_OPERATION_DENIED, "no active local session on seat0")
+        self._request_uid = uid
         return uid
+
+    def _drop_session(self):
+        self.token.reset()
+        self.key_agreement.regenerate()
+        self._cm = None
+        self._next = None
+        self._refused = None
+
+    def client_uid(self):
+        """The uid of the request being handled (begin_request), or None when the
+        store has one user."""
+        if self.owners is None:
+            return None
+        if self._request_uid is None:
+            raise CtapError(ERR_OPERATION_DENIED, "no active local session on seat0")
+        return self._request_uid
 
     def mine(self, cred, uid):
         """True when cred (a Credential, or None) belongs to the request's uid."""
@@ -405,7 +440,7 @@ class Authenticator:
                 self.ask(ctx, touchid.Prompt("select", rp_id))
                 raise CtapError(ERR_PIN_NOT_SET)
             proto = self._pin_protocol(p, 9)
-            ok = self.token.check(proto, cdh, auth_param, pinuv.PERM_MC, rp_id)
+            ok = self.token.check(proto, cdh, auth_param, pinuv.PERM_MC, rp_id, owner=owner)
             if ok is None:
                 raise CtapError(ERR_PIN_AUTH_INVALID, "token permission or RP")
             if not ok:
@@ -513,7 +548,7 @@ class Authenticator:
                 self.ask(ctx, touchid.Prompt("select", rp_id))
                 raise CtapError(ERR_PIN_NOT_SET)
             proto = self._pin_protocol(p, 7)
-            ok = self.token.check(proto, cdh, auth_param, pinuv.PERM_GA, rp_id)
+            ok = self.token.check(proto, cdh, auth_param, pinuv.PERM_GA, rp_id, owner=owner)
             if not ok:
                 raise CtapError(ERR_PIN_AUTH_INVALID)
             # The token asks for UV. Its UV is the enclave's touch at the
@@ -556,7 +591,7 @@ class Authenticator:
                             if legacy else "")
 
         hs = ext.get("hmac-secret")
-        state = {"rp_id": rp_id, "rp_hash": rp_hash, "cdh": cdh, "touch": touch, "up": up,
+        state = {"uid": owner, "rp_id": rp_id, "rp_hash": rp_hash, "cdh": cdh, "touch": touch, "up": up,
                  "hs": hs, "rest": found[1:], "total": len(found), "t": self.clock(),
                  "request": self.request_digest("ga", rp_hash, cdh, sorted(opts.items()),
                                                 *(allow or ()))}
@@ -641,7 +676,8 @@ class Authenticator:
 
     def get_next_assertion(self, _p, ctx):
         st = self._next
-        if not st or not st["rest"] or self.clock() - st["t"] > NEXT_ASSERTION_WINDOW:
+        if (not st or not st["rest"] or self.clock() - st["t"] > NEXT_ASSERTION_WINDOW
+                or st["uid"] != self.client_uid()):
             self._next = None
             raise CtapError(ERR_NOT_ALLOWED)
         item = st["rest"].pop(0)
@@ -677,12 +713,12 @@ class Authenticator:
                 # Credential management signs nothing an RP could check, so
                 # its token takes an enclave-checked touch now (presence key).
                 self.ask(ctx, touchid.Prompt("manage", rp_id))
-                self.token.begin(perms, rp_id)
+                self.token.begin(perms, rp_id, owner=self.client_uid())
             else:
                 # makeCredential / getAssertion: each signature waits for its
                 # own enclave-checked touch, so the token carries no UV and
                 # the one touch happens at the signature, not twice.
-                self.token.begin(perms, rp_id, verified=False)
+                self.token.begin(perms, rp_id, verified=False, owner=self.client_uid())
             return {2: proto.encrypt(shared, self.token.value)}
         if sub in (0x01, 0x03, 0x04, 0x05, 0x09):
             # getPINRetries, setPIN, changePIN, getPinToken, ...UsingPin: no PIN.
@@ -723,21 +759,21 @@ class Authenticator:
     def cred_mgmt(self, p, ctx):
         sub = _need(p, 1, int)
         sub_params = p.get(2)
+        owner = self.client_uid()
         if sub in (0x03, 0x05):
-            return self._cm_next(sub)
+            return self._cm_next(sub, owner)
         if sub not in (0x01, 0x02, 0x04, 0x06, 0x07):
             raise CtapError(ERR_INVALID_SUBCOMMAND)
         proto = self._pin_protocol(p, 3)
         auth = _need(p, 4, bytes)
         msg = bytes([sub]) + (cbor.encode(sub_params) if sub_params is not None else b"")
-        ok = self.token.check(proto, msg, auth, pinuv.PERM_CM)
+        ok = self.token.check(proto, msg, auth, pinuv.PERM_CM, owner=owner)
         if ok is None:
             raise CtapError(ERR_PIN_AUTH_INVALID, "token lacks cm permission")
         if not ok:
             raise CtapError(ERR_PIN_AUTH_INVALID)
         if sub in (0x04, 0x06, 0x07) and not isinstance(sub_params, dict):
             raise CtapError(ERR_MISSING_PARAMETER, "subCommandParams")
-        owner = self.client_uid()
 
         if sub == 0x01:
             if self.token.rp_id is not None:
@@ -755,7 +791,7 @@ class Authenticator:
                 raise CtapError(ERR_NO_CREDENTIALS)
             items = [({"id": r["rpId"], **({"name": r["rpName"]} if r.get("rpName") else {})},
                       h) for h, r in rps.items()]
-            self._cm = ("rp", items[1:])
+            self._cm = ("rp", items[1:], owner)
             return {3: items[0][0], 4: items[0][1], 5: len(items)}
 
         if sub == 0x04:
@@ -766,7 +802,7 @@ class Authenticator:
             recs = self._resident(owner, rp_hash)
             if not recs:
                 raise CtapError(ERR_NO_CREDENTIALS)
-            self._cm = ("cred", recs[1:])
+            self._cm = ("cred", recs[1:], owner)
             out = self._cm_cred(recs[0])
             out[9] = len(recs)
             return out
@@ -804,9 +840,9 @@ class Authenticator:
         return {6: u, 7: {"type": "public-key", "id": rec["credId"]},
                 8: keys.cose_es256(rec["pub"]), 0x0A: rec.get("credProtect", 1)}
 
-    def _cm_next(self, sub):
+    def _cm_next(self, sub, owner):
         want = "rp" if sub == 0x03 else "cred"
-        if not self._cm or self._cm[0] != want or not self._cm[1]:
+        if not self._cm or self._cm[0] != want or not self._cm[1] or self._cm[2] != owner:
             self._cm = None
             raise CtapError(ERR_NOT_ALLOWED)
         item = self._cm[1].pop(0)

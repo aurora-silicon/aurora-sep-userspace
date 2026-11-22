@@ -159,18 +159,26 @@ class U2F:
             return _sw(SW_CLA_NOT_SUPPORTED)
         try:
             with self.auth.lock:
-                if ins == INS_VERSION:
-                    return _sw(SW_NO_ERROR, b"U2F_V2") if not data else _sw(SW_WRONG_LENGTH)
-                if ins == INS_REGISTER:
-                    return self.register(data)
-                if ins == INS_AUTHENTICATE:
-                    return self.authenticate(p1, data)
+                try:
+                    return self._dispatch(ins, p1, data)
+                finally:
+                    self.auth._request_uid = None
         except InvalidHandle:
             return _sw(SW_WRONG_DATA)
         except CtapError:
             # No active local user on seat0 (system vault): nobody to act for.
-            return _sw(SW_CONDITIONS_NOT_SATISFIED)
-        return _sw(SW_INS_NOT_SUPPORTED)
+            return _sw(SW_WRONG_DATA if ins == INS_AUTHENTICATE else SW_CONDITIONS_NOT_SATISFIED)
+
+    def _dispatch(self, ins, p1, data):
+        if ins == INS_VERSION:
+            return _sw(SW_NO_ERROR, b"U2F_V2") if not data else _sw(SW_WRONG_LENGTH)
+        if ins not in (INS_REGISTER, INS_AUTHENTICATE):
+            return _sw(SW_INS_NOT_SUPPORTED)
+        # Whose request (system vault), and session state of another account dropped.
+        self.auth.begin_request()
+        if ins == INS_REGISTER:
+            return self.register(data)
+        return self.authenticate(p1, data)
 
     def register(self, data):
         if len(data) != 64:

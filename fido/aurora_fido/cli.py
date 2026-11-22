@@ -156,6 +156,9 @@ def render(s):
     if s.get("policy_note"):
         lines.append(f"             {s['policy_note']}")
     lines.append("             (new credentials; set [touchid] policy in " + paths.CONFIG + ")")
+    if s.get("policy") == "touchid-current" or (pol == "auto" and not s.get("policy_detail")):
+        lines.append("             touchid-current: adding or removing a finger, by any account on "
+                     "this Mac, retires the credentials made with it")
     if s.get("vault", "system") == "system":
         lines.append("  accounts:  each account uses, lists and deletes only its own credentials; "
                      "requests are for the user active on seat0")

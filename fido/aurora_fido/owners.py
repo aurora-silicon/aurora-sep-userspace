@@ -26,8 +26,14 @@ or several such accounts it stays unassigned, those credentials are refused
 to everyone (status says so) until root names the owner with
 `aurora-fido adopt-legacy USER`.
 
+A damaged owners.json is never guessed at: nobody gets the ownerless
+credentials and reset stays refused. adopt-legacy repairs the first part
+only; "owners_unknown" stays set (the uids that made credentials are not
+known any more), so reset stays refused until `aurora-fido disable --forget`.
+
 File owners.json (root-only, in the state dir):
-  {"version": 1, "legacy_store": bool, "legacy": uid or null, "uids": [uid, ...]}
+  {"version": 1, "legacy_store": bool, "legacy": uid or null, "uids": [uid, ...],
+   "owners_unknown": bool}
 """
 
 import json
@@ -78,6 +84,7 @@ class Owners:
         self.legacy = None
         self.uids = set()
         self.damaged = False
+        self.owners_unknown = False
         if not self._load():
             self._first_open(state_dir, fprint_dir)
 
@@ -96,11 +103,13 @@ class Owners:
             log.error("%s is damaged: credentials made before owners were recorded are "
                       "refused, and reset is refused", self.path)
             self.legacy_store, self.legacy, self.damaged = True, None, True
+            self.owners_unknown = True
             return True
         self.legacy_store = bool(d.get("legacy_store"))
         legacy = d.get("legacy")
         self.legacy = legacy if isinstance(legacy, int) and legacy >= 0 else None
         self.uids = {u for u in d["uids"] if isinstance(u, int) and u >= 0}
+        self.owners_unknown = bool(d.get("owners_unknown"))
         return True
 
     def _first_open(self, state_dir, fprint_dir):
@@ -119,7 +128,7 @@ class Owners:
         if self.damaged:
             return                  # keep the damaged file for root to look at
         d = {"version": 1, "legacy_store": self.legacy_store, "legacy": self.legacy,
-             "uids": sorted(self.uids)}
+             "uids": sorted(self.uids), "owners_unknown": self.owners_unknown}
         creds.atomic_write(self.path, json.dumps(d, indent=1).encode() + b"\n")
 
     @property
@@ -141,13 +150,14 @@ class Owners:
 
     def others(self, uid):
         """True when an account other than uid owns (or may own) credentials here."""
-        if self.damaged or any(u != uid for u in self.uids):
+        if self.damaged or self.owners_unknown or any(u != uid for u in self.uids):
             return True
         return self.legacy_store and self.legacy != uid
 
     def cleared(self):
         """After a reset: nobody's credentials are left."""
         self.legacy_store, self.legacy, self.uids = False, None, set()
+        self.owners_unknown = False
         self.save()
 
     def adopt(self, uid):
