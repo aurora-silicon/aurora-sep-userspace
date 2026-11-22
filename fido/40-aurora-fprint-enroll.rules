@@ -1,0 +1,21 @@
+// SPDX-License-Identifier: MIT
+// Enrolling or deleting a fingerprint (fprintd's net.reactivated.fprint.device.enroll)
+// asks for the user's own password every time, not only once in a while.
+//
+// On these Macs every Linux enrolment lands in one Secure Enclave user, so a
+// new finger can approve whatever an existing finger approves (touchid-any
+// keys, the Touch ID security key's presence checks). fprintd's own default
+// for this action is auth_self_keep, which skips the password for a few
+// minutes after any earlier password prompt for it.
+//
+// fprintd passes no polkit details (no device or driver name), so the rule
+// cannot be limited to the apple-sep reader; it covers this action on this
+// machine. Sessions that are not local and active keep fprintd's "no". Root
+// (sudo fprintd-enroll) is left to the defaults.
+polkit.addRule(function(action, subject) {
+    if (action.id != "net.reactivated.fprint.device.enroll" || subject.user == "root")
+        return polkit.Result.NOT_HANDLED;
+    if (!subject.local || !subject.active)
+        return polkit.Result.NO;
+    return polkit.Result.AUTH_SELF;
+});

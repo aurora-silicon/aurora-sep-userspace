@@ -251,13 +251,14 @@ class Ctap2Test(unittest.TestCase):
         orig = self.rig.backend.create
         self.rig.backend.create = lambda flags, **k: made.append(flags) or orig(flags, **k)
         self.rig.make()
-        self.assertEqual(made, [creds.POLICY_FLAGS[creds.POLICY_TOUCHID_ANY]])
-        rig = Rig(policy="touchid-current")
+        # auto on a kernel without the enclave password check: touchid-current.
+        self.assertEqual(made, [creds.POLICY_FLAGS[creds.POLICY_TOUCHID_CURRENT]])
+        rig = Rig(policy="touchid-any")
         try:
             orig2 = rig.backend.create
             rig.backend.create = lambda flags, **k: made.append(flags) or orig2(flags, **k)
             self.assertEqual(rig.make()[0], 0)
-            self.assertEqual(made[-1], 0x1)
+            self.assertEqual(made[-1], 0x2)
         finally:
             rig.close()
 
@@ -668,8 +669,13 @@ class PolicyTest(unittest.TestCase):
         return c
 
     def test_auto_takes_the_best_the_enclave_enforces(self):
-        self.assertEqual(daemon.resolve_policy(self.cfg("auto"), 0x3)[0], creds.POLICY_TOUCHID_ANY)
+        # Without the password check: the fingers enrolled now, so that a finger
+        # enrolled later does not approve credentials made before it.
+        self.assertEqual(daemon.resolve_policy(self.cfg("auto"), 0x3)[0],
+                         creds.POLICY_TOUCHID_CURRENT)
         self.assertIn("no password fallback", daemon.resolve_policy(self.cfg("auto"), 0x3)[1])
+        self.assertIn("retires", daemon.resolve_policy(self.cfg("auto"), 0x3)[1])
+        self.assertEqual(daemon.resolve_policy(self.cfg("auto"), 0x2)[0], creds.POLICY_TOUCHID_ANY)
         self.assertEqual(daemon.resolve_policy(self.cfg("auto"), 0x7),
                          (creds.POLICY_TOUCHID_OR_PASSWORD, None))
 
@@ -953,7 +959,7 @@ class CliTest(unittest.TestCase):
         t = cli.render(off)
         self.assertIn("Touch ID security key: off", t)
         self.assertIn("sudo aurora-fido enable", t)
-        self.assertIn("root on this Mac cannot sign without your finger", t)
+        self.assertIn("root on this Mac cannot sign without a finger enrolled on this Mac", t)
         on = dict(off, enabled="enabled", active="active", device="/dev/hidraw5",
                   keys="sep-key", ready=True, policy="touchid-any", hmac_secret=False,
                   legacy_resident=1, legacy_refused_rps=1, legacy_rps=["github.com"])

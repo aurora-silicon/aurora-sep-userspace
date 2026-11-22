@@ -22,7 +22,8 @@ CTAPHID, so anything that talks to a USB security key works unchanged:
 - WebAuthn and passkeys in Firefox and Chromium,
 - SSH security keys from `ssh-keygen -t ecdsa-sk` (P-256; the enclave has no
   Ed25519, so `ed25519-sk` is not offered),
-- `pam_u2f` (sudo, login),
+- `pam_u2f` (sudo, and unlocking or logging in again while your session is
+  active on the seat; see "Accounts" below),
 - `systemd-cryptenroll --fido2-device` (hmac-secret, on kernels that can seal
   a secret to an enclave key),
 - `fido2-token`, `fido2-cred`, `fido2-assert` from libfido2.
@@ -86,6 +87,33 @@ CTAP2, 255 for U2F key handles), the handle is stored in
 the passkey managers in browser settings, list and delete them with a
 credential-management token, which takes an enclave-checked touch.
 
+**Accounts:** with `vault = system` (the default) one store in
+`/var/lib/aurora-fido` serves every account on the Mac, and the Secure
+Enclave cannot tell the accounts apart: every Linux enrolment is under one
+enclave user, so any enrolled finger satisfies any credential's
+access-control list. The daemon keeps the accounts apart itself:
+
+- Each request is for the user who owns the active local session on seat0,
+  the user the hidraw node's `uaccess` ACL follows. (uhid does not say which
+  process opened the hidraw node, so the seat is the identity the daemon
+  has.) With no active local user session (a login screen before anyone is
+  logged in) nothing but getInfo is answered, as with `vault = user`.
+- A new credential records that uid inside its credential ID, encrypted and
+  authenticated under the master secret. Another account's credential looks
+  unknown: it is not found, listed, used or deleted, and an exclude list
+  ignores it.
+- Reset (which deletes every credential) is refused while another account
+  has made credentials here (`owners.json` lists the uids).
+- Credentials made before owners were recorded carry no uid. When this
+  version first opens such a store it gives them to the only account with
+  prints in `/var/lib/fprint`. With no such account or several, they are
+  refused to everyone and `aurora-fido status` says so, until root names
+  their account: `sudo aurora-fido adopt-legacy USER`.
+- A process that opened the hidraw node while its user was active keeps it
+  open after a user switch; its requests are then for the new active user,
+  whose finger the enclave waits for and whose session gets the
+  notification.
+
 **Master secret:** 64 random bytes, sealed by this Mac's Secure Enclave with
 the kernel's `trusted` key type (`aurora-fido-seal`, the same sealing as
 `aurora-sep-cryptenroll`). It protects the privacy of credential IDs and
@@ -113,7 +141,7 @@ enclave enforces it. Changing the setting affects new credentials only.
 
 | policy | approves a request | macOS | `/dev/sep-key` CREATE flag |
 | --- | --- | --- | --- |
-| `auto` (default) | `touchid-or-password` when the kernel offers it, else `touchid-any` (status says which) | | |
+| `auto` (default) | `touchid-or-password` when the kernel offers it, else `touchid-current` (status says which) | | |
 | `touchid-or-password` | Touch ID, or your password checked by the Secure Enclave | `.userPresence` | `SEP_KEY_CREATE_USER_PRESENCE` (not offered yet: refused) |
 | `touchid-any` | Touch ID only, any finger enrolled on this install, now or later | `.biometryAny` | `SEP_KEY_CREATE_BIOMETRY_ANY` |
 | `touchid-current` | Touch ID only, the fingers enrolled when the credential was made; adding or removing a finger retires it for good | `.biometryCurrentSet` | `SEP_KEY_CREATE_BIOMETRY_CURRENT_SET` |
@@ -239,6 +267,7 @@ attacker.
 | thief with the disk or a backup | no | keys never leave the enclave; credential IDs and records are wrapped by an enclave-sealed secret |
 | another Mac, another Linux install on this Mac | no | handles are bound to this SEP and this install's identity key bag |
 | website, or another site's credential ID | no | IDs are bound to the RP hash |
+| another account on this Mac, no root | no | its requests see only its own credentials (Accounts) |
 | malware as the desktop user, no root | only with your touch | it can send requests, and time one to meet a touch you meant for something else; the notification names the site |
 | root, or the kernel | only with your touch | the enclave refuses without a match it saw; root can redirect the operation one touch approves (below) |
 | root after losing root | nothing | keys never left the enclave; nothing it copied signs |
@@ -288,9 +317,19 @@ The cases a strong attacker can still use, and what bounds them:
   (only its first signature does), so root can make keys. A key it makes
   still signs nothing without your finger.
 - **Choosing the finger.** `touchid-any` accepts any finger enrolled on this
-  install, including one enrolled later; enrolling needs your password at
-  the enclave's prompt (the Touch ID enrolment rules), but if that matters,
-  use `touchid-current`.
+  install, by any account, including one enrolled later. `touchid-current`
+  (what `auto` makes when the kernel cannot check your password) accepts the
+  fingers enrolled when the credential was made, so a finger enrolled later
+  does not approve it; the change retires the credential instead. Either list
+  names every account's fingers, which is why the daemon keeps accounts apart
+  itself (Accounts, above). The enclave does not ask for a password to
+  enrol: through fprintd, enrolling needs your login password every time
+  (`40-aurora-fprint-enroll.rules`, polkit `auth_self` for
+  `net.reactivated.fprint.device.enroll`; fprintd passes polkit no reader
+  name, so the rule covers every reader on the machine), but root, or
+  anything with `CAP_SYS_ADMIN` on `/dev/sep-bio`, can enrol a finger without
+  it. So against root, use `touchid-current`, and note that a finger root
+  enrols still satisfies `touchid-any` credentials.
 
 ### hmac-secret
 
@@ -350,6 +389,8 @@ passcode, which the enclave checks itself.
 ### Known limits
 
 - No PIN (above): no `ssh-keygen -K`, no `alwaysUv` with a PIN.
+- `pam_u2f` at a login screen before any user session is active is refused:
+  the daemon has no account to act for (Accounts).
 - `touchid-or-password` is refused until the enclave can check your password.
 - `pamu2fcfg` needs pam-u2f 1.1.1 or newer to accept self attestation.
 - "Installed off" relies on systemd presets (`90-aurora-fido.preset`). A

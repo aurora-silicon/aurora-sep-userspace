@@ -136,6 +136,7 @@ jobs:
           test -x dest/usr/libexec/aurora-fido/aurora-fido-seal
           test -f dest/usr/lib/aurora-fido/aurora_fido/ctap2.py
           test -f dest/usr/lib/systemd/system/aurora-fido.service
+          test -f dest/usr/share/polkit-1/rules.d/40-aurora-fprint-enroll.rules
 
   fido:
     # Not in a container: the uhid device and its hidraw node belong to the VM.

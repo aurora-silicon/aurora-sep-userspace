@@ -39,6 +39,7 @@ from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from . import keys, touchid
 from .backend import InvalidHandle
 from .creds import ID_MAX_U2F, Credential
+from .errors import CtapError
 
 log = logging.getLogger("aurora-fido")
 
@@ -166,6 +167,9 @@ class U2F:
                     return self.authenticate(p1, data)
         except InvalidHandle:
             return _sw(SW_WRONG_DATA)
+        except CtapError:
+            # No active local user on seat0 (system vault): nobody to act for.
+            return _sw(SW_CONDITIONS_NOT_SATISFIED)
         return _sw(SW_INS_NOT_SUPPORTED)
 
     def register(self, data):
@@ -173,13 +177,16 @@ class U2F:
             return _sw(SW_WRONG_LENGTH)
         chal, app = data[:32], data[32:]
         a = self.auth
+        owner = a.client_uid()
         prompt = touchid.Prompt("register", None, "U2F")
         ok = self.presence.poll(("reg", app, chal), lambda cancel: (
             a.user.verify(prompt, cancel), True))
         if ok is None:
             return _sw(SW_CONDITIONS_NOT_SATISFIED)
+        if a.owners is not None:
+            a.owners.add(owner)
         handle, point = a.backend.create(a.flags)
-        cred = Credential(handle, 1, a.policy)
+        cred = Credential(handle, 1, a.policy, owner=owner)
         kh = a.vault.wrap(app, cred, ID_MAX_U2F)
         sig = self._att_sign(hashlib.sha256(b"\x00" + app + chal + kh + point).digest())
         log.info("U2F registration")
@@ -190,7 +197,7 @@ class U2F:
             return _sw(SW_WRONG_LENGTH)
         chal, app, kh = data[:32], data[32:64], data[65:]
         cred = self.auth.vault.unwrap(app, kh)
-        if cred is None or not self.auth._usable(cred, "U2F"):
+        if not self.auth.mine(cred, self.auth.client_uid()) or not self.auth._usable(cred, "U2F"):
             return _sw(SW_WRONG_DATA)
         if p1 == 0x07:                                  # check-only
             return _sw(SW_CONDITIONS_NOT_SATISFIED)

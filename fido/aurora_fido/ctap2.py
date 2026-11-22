@@ -136,8 +136,12 @@ class Authenticator:
     def __init__(self, backend, user, vault, store, counter,
                  attestation="self", new_vault=None, clock=time.monotonic,
                  policy=POLICY_TOUCHID_ANY, on_legacy=lambda rp_id, why: None,
-                 policy_for=None):
+                 policy_for=None, owners=None):
         self.backend = backend
+        # owners.Owners for the system vault (one store, every account): each
+        # request is for one uid and sees only that uid's credentials. None:
+        # the store has a single user (aurora-passkeyd, tests).
+        self.owners = owners
         self.user = user                  # enclave.EnclaveUser: every approval
         self.policy = policy              # for new credentials (config [touchid] policy)
         self.flags = POLICY_FLAGS[policy]
@@ -290,6 +294,33 @@ class Authenticator:
             raise CtapError(ERR_INVALID_PARAMETER, "pinUvAuthProtocol")
         return p
 
+    # -- whose credentials ------------------------------------------------------------
+
+    def client_uid(self):
+        """The uid this request is for (system vault), or None when the store has
+        one user. Refused when no local user is active on seat0."""
+        if self.owners is None:
+            return None
+        uid = self.owners.current()
+        if uid is None:
+            raise CtapError(ERR_OPERATION_DENIED, "no active local session on seat0")
+        return uid
+
+    def mine(self, cred, uid):
+        """True when cred (a Credential, or None) belongs to the request's uid."""
+        if cred is None:
+            return False
+        return self.owners is None or self.owners.owns(uid, cred.owner)
+
+    def _rec_mine(self, rec, uid):
+        if self.owners is None:
+            return True
+        return self.mine(self.vault.unwrap(rec["rpIdHash"], rec["credId"]), uid)
+
+    def _resident(self, uid, rp_hash=None):
+        recs = self.store.all() if rp_hash is None else self.store.for_rp(rp_hash)
+        return [r for r in recs if self._rec_mine(r, uid)]
+
     def _usable(self, cred, rp_id):
         """False for a credential made before the enclave checked the touch."""
         if cred.legacy is None and self.backend.gated(cred.handle):
@@ -363,6 +394,7 @@ class Authenticator:
             raise CtapError(ERR_INVALID_OPTION, "up=false in makeCredential")
         rk = opts.get("rk", False)
         rp_hash = _rp_hash(rp_id)
+        owner = self.client_uid()
         prompt = touchid.Prompt("register", rp_id, user_line(user))
 
         # pinUvAuthParam: empty = "touch to select" probe from old platforms.
@@ -385,7 +417,7 @@ class Authenticator:
         hmac_secret = ext.get("hmac-secret") is True and self.backend.can_unseal
 
         for cid in exclude:
-            if self.vault.unwrap(rp_hash, cid) is not None:
+            if self.mine(self.vault.unwrap(rp_hash, cid), owner):
                 self.ask(ctx, touchid.Prompt("register", rp_id,
                                              "This key is already registered here"))
                 self.token.consumed_by_mc_ga()
@@ -405,13 +437,15 @@ class Authenticator:
                 # Never a weaker key than the site's rule asks for.
                 log.warning("site rule for %s asks for a policy this kernel cannot make", rp_id)
                 raise CtapError(ERR_UNSUPPORTED_OPTION, "site policy")
+        if self.owners is not None:
+            self.owners.add(owner)
         handle, point = self.backend.create(flags)
         sealed = None
         if hmac_secret:
             # CredRandomWithUV || CredRandomWithoutUV, released by the
             # enclave only together with a touch-approved signature.
             sealed = self.backend.seal(handle, os.urandom(64))
-        cred = Credential(handle, cred_protect or 1, policy, sealed)
+        cred = Credential(handle, cred_protect or 1, policy, sealed, owner=owner)
         cred_id = self.vault.wrap(rp_hash, cred, ID_MAX_CTAP2)
 
         ext_out = {}
@@ -441,7 +475,7 @@ class Authenticator:
                 "userId": uid, "userName": _trunc(user.get("name")),
                 "displayName": _trunc(user.get("displayName")),
                 "credId": cred_id, "pub": point, "credProtect": cred.cred_protect,
-            })
+            }, None if self.owners is None else lambda old: self._rec_mine(old, owner))
             if not ok:
                 raise CtapError(ERR_KEY_STORE_FULL)
 
@@ -470,6 +504,7 @@ class Authenticator:
         up = opts.get("up", True)
         uv = opts.get("uv", False)
         rp_hash = _rp_hash(rp_id)
+        owner = self.client_uid()
 
         if auth_param is not None:
             if not isinstance(auth_param, bytes):
@@ -495,7 +530,7 @@ class Authenticator:
         if allow:
             for cid in allow:
                 c = self.vault.unwrap(rp_hash, cid)
-                if c is None:
+                if not self.mine(c, owner):
                     continue
                 if not self._usable(c, rp_id):
                     legacy += 1
@@ -507,7 +542,7 @@ class Authenticator:
         else:
             for rec in self.store.for_rp(rp_hash):
                 c = self.vault.unwrap(rp_hash, rec["credId"])
-                if c is None:
+                if not self.mine(c, owner):
                     continue
                 if not self._usable(c, rp_id):
                     legacy += 1
@@ -662,12 +697,18 @@ class Authenticator:
             raise CtapError(ERR_NOT_ALLOWED, "reset only within 10 s of start")
         if self.new_vault is None:
             raise CtapError(ERR_NOT_ALLOWED, "reset not configured")
+        owner = self.client_uid()
+        if self.owners is not None and self.owners.others(owner):
+            # Reset deletes every credential here, other accounts' too.
+            raise CtapError(ERR_NOT_ALLOWED, "other accounts have credentials here")
         self.ask(ctx, touchid.Prompt("reset", None,
                                      "Every passkey and security-key credential "
                                      "made with this Mac stops working"))
         self.store.wipe()
         self._refused = None
         self.vault, self.store = self.new_vault()
+        if self.owners is not None:
+            self.owners.cleared()
         self.token.reset()
         self.key_agreement.regenerate()
         log.warning("authenticator reset: all credentials invalidated")
@@ -696,17 +737,19 @@ class Authenticator:
             raise CtapError(ERR_PIN_AUTH_INVALID)
         if sub in (0x04, 0x06, 0x07) and not isinstance(sub_params, dict):
             raise CtapError(ERR_MISSING_PARAMETER, "subCommandParams")
+        owner = self.client_uid()
 
         if sub == 0x01:
             if self.token.rp_id is not None:
                 raise CtapError(ERR_PIN_AUTH_INVALID, "token bound to an RP")
-            return {1: self.store.count(), 2: self.store.remaining()}
+            n = self.store.count() if self.owners is None else len(self._resident(owner))
+            return {1: n, 2: self.store.remaining()}
 
         if sub == 0x02:
             if self.token.rp_id is not None:
                 raise CtapError(ERR_PIN_AUTH_INVALID, "token bound to an RP")
             rps = {}
-            for r in self.store.all():
+            for r in self._resident(owner):
                 rps.setdefault(r["rpIdHash"], r)
             if not rps:
                 raise CtapError(ERR_NO_CREDENTIALS)
@@ -720,7 +763,7 @@ class Authenticator:
             if not isinstance(rp_hash, bytes):
                 raise CtapError(ERR_MISSING_PARAMETER, "rpIDHash")
             self._token_rp_matches(rp_hash)
-            recs = self.store.for_rp(rp_hash)
+            recs = self._resident(owner, rp_hash)
             if not recs:
                 raise CtapError(ERR_NO_CREDENTIALS)
             self._cm = ("cred", recs[1:])
@@ -732,7 +775,7 @@ class Authenticator:
         if not isinstance(desc, dict) or not isinstance(desc.get("id"), bytes):
             raise CtapError(ERR_MISSING_PARAMETER, "credentialId")
         rec = self.store.find(desc["id"])
-        if rec is None:
+        if rec is None or not self._rec_mine(rec, owner):
             raise CtapError(ERR_NO_CREDENTIALS)
         self._token_rp_matches(rec["rpIdHash"])
         if sub == 0x06:
@@ -744,7 +787,8 @@ class Authenticator:
             raise CtapError(ERR_INVALID_PARAMETER, "user.id must not change")
         rec["userName"] = _trunc(user.get("name"))
         rec["displayName"] = _trunc(user.get("displayName"))
-        self.store.put(rec)
+        self.store.put(rec, None if self.owners is None
+                       else lambda old: self._rec_mine(old, owner))
         return None
 
     def _token_rp_matches(self, rp_hash):

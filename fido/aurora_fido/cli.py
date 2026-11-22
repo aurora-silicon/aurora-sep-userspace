@@ -6,6 +6,8 @@
                                 then start it now and at boot (refused otherwise)
   aurora-fido disable           (root) stop it now and at boot; credentials are kept
   aurora-fido disable --forget  (root) also delete every credential it made
+  aurora-fido adopt-legacy USER (root) give the credentials made before their owner was
+                                recorded to USER
 
 The feature is installed off. Nothing else turns it on.
 """
@@ -26,6 +28,7 @@ UNIT = "aurora-fido.service"
 POLICY_TEXT = {
     "touchid-or-password": "Touch ID, or your password checked by the Secure Enclave "
                            "(the default, as on macOS, where the kernel offers it)",
+    "auto": "touchid-or-password where the kernel offers it, else touchid-current",
     "touchid-any": "Touch ID only, any enrolled finger",
     "touchid-current": "Touch ID only, and only the fingers enrolled when a credential "
                        "is made (adding or removing a finger retires it)",
@@ -33,8 +36,10 @@ POLICY_TEXT = {
 
 THREAT = ("Keys live in the Secure Enclave and cannot be copied off this Mac. The "
           "enclave itself checks the Touch ID match inside every signature, so root on "
-          "this Mac cannot sign without your finger; at most it can use one touch you "
-          "give for a different request. Details and limits: the threat model in the doc.")
+          "this Mac cannot sign without a finger enrolled on this Mac; at most it can use "
+          "one touch you give for a different request, or enrol a finger itself (which "
+          "retires touchid-current credentials). Details and limits: the threat model "
+          "in the doc.")
 
 LEGACY = ("{n} credential(s) made by aurora-fido 0.1 (touch checked outside the enclave) "
           "are refused now: register this key again with those sites and SSH servers{rps}.")
@@ -99,6 +104,16 @@ def configured_policy(path=None):
     return cp.get("touchid", "policy", fallback="auto")
 
 
+def configured_vault(path=None):
+    import configparser
+    cp = configparser.ConfigParser()
+    try:
+        cp.read(path or paths.CONFIG)
+    except configparser.Error:
+        pass
+    return cp.get("authenticator", "vault", fallback="system")
+
+
 def gather():
     _, enabled = _systemctl("is-enabled")
     _, active = _systemctl("is-active")
@@ -118,6 +133,8 @@ def gather():
         "legacy_resident": (st or {}).get("legacy_resident", 0),
         "legacy_refused_rps": (st or {}).get("legacy_refused_rps", 0),
         "legacy_rps": legacy_rps() if os.geteuid() == 0 else None,
+        "vault": (st or {}).get("vault") or configured_vault(),
+        "owners": (st or {}).get("owners"),
         "version": __version__,
     }
 
@@ -139,6 +156,17 @@ def render(s):
     if s.get("policy_note"):
         lines.append(f"             {s['policy_note']}")
     lines.append("             (new credentials; set [touchid] policy in " + paths.CONFIG + ")")
+    if s.get("vault", "system") == "system":
+        lines.append("  accounts:  each account uses, lists and deletes only its own credentials; "
+                     "requests are for the user active on seat0")
+        own = s.get("owners") or {}
+        if own.get("legacy_unassigned"):
+            lines.append("  WARNING:   credentials made before their owner was recorded are refused: "
+                         "not exactly one account has prints, so their owner is not known. "
+                         "Name it with: sudo aurora-fido adopt-legacy USER")
+        elif own.get("legacy_owner"):
+            lines.append(f"             credentials made before owners were recorded belong to "
+                         f"{own['legacy_owner']}")
     if on and s.get("hmac_secret") is False:
         lines.append("  hmac-secret (systemd-cryptenroll --fido2-device): not offered; this "
                      "kernel cannot seal secrets to enclave keys")
@@ -250,6 +278,28 @@ def cmd_disable(a):
     return 0
 
 
+def cmd_adopt_legacy(a):
+    import pwd
+    try:
+        uid = pwd.getpwnam(a.user).pw_uid
+    except KeyError:
+        print(f"aurora-fido: no such user: {a.user}", file=sys.stderr)
+        return 1
+    from . import owners
+    _, active = _systemctl("is-active")
+    if active == "active":
+        rc, out = _systemctl("stop")
+        if rc != 0:
+            print(f"aurora-fido: systemctl stop {UNIT}: {out}", file=sys.stderr)
+            return 1
+    os.makedirs(a.state_dir, mode=0o700, exist_ok=True)
+    owners.Owners(a.state_dir, current=lambda: None).adopt(uid)
+    if active == "active":
+        _systemctl("start")
+    print(f"Credentials made before their owner was recorded now belong to {a.user} only.")
+    return 0
+
+
 def cmd_status(a):
     s = gather()
     print(json.dumps(s, indent=1) if a.json else render(s))
@@ -268,6 +318,10 @@ def main(argv=None):
     p.add_argument("--forget", action="store_true",
                    help="also delete every credential it made")
     p.set_defaults(fn=cmd_disable, root=True)
+    p = sub.add_parser("adopt-legacy",
+                       help="give the credentials made before owners were recorded to USER")
+    p.add_argument("user")
+    p.set_defaults(fn=cmd_adopt_legacy, root=True)
     ap.add_argument("--state-dir", default=paths.STATE_DIR, help=argparse.SUPPRESS)
     ap.add_argument("--seal-helper", default=paths.SEAL_HELPER, help=argparse.SUPPRESS)
     a = ap.parse_args(argv)

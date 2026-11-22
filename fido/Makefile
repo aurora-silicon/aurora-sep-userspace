@@ -17,6 +17,7 @@ PYDIR ?= $(PREFIX)/lib/aurora-fido
 UNITDIR ?= $(PREFIX)/lib/systemd/system
 USERUNITDIR ?= $(PREFIX)/lib/systemd/user
 UDEVRULESDIR ?= $(PREFIX)/lib/udev/rules.d
+POLKITRULESDIR ?= $(PREFIX)/share/polkit-1/rules.d
 SYSCONFDIR ?= /etc
 DOCDIR ?= $(PREFIX)/share/doc/aurora-fido
 BINDIR ?= $(PREFIX)/bin
@@ -53,6 +54,7 @@ FORCE:
 # Unit tests: no root, no hardware (software keys with a scripted enclave touch).
 check:
 	$(PYTHON) tests/test_ctap.py
+	$(PYTHON) tests/test_owners.py
 	$(PYTHON) tests/test_agent.py
 	$(PYTHON) tests/test_provider.py
 	if command -v dbus-run-session >/dev/null 2>&1; then \
@@ -78,6 +80,7 @@ install: all
 	for f in $(PY); do install -Dm644 $$f $(DESTDIR)$(PYDIR)/$$f; done
 	install -Dm644 aurora-fido.service.out $(DESTDIR)$(UNITDIR)/aurora-fido.service
 	install -Dm644 60-aurora-fido.rules $(DESTDIR)$(UDEVRULESDIR)/60-aurora-fido.rules
+	install -Dm644 40-aurora-fprint-enroll.rules $(DESTDIR)$(POLKITRULESDIR)/40-aurora-fprint-enroll.rules
 	install -Dm644 aurora-fido.conf $(DESTDIR)$(SYSCONFDIR)/aurora-fido/aurora-fido.conf
 	install -Dm644 ../docs/fido.md $(DESTDIR)$(DOCDIR)/fido.md
 
