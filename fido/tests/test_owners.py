@@ -45,11 +45,13 @@ class Seat:
 class OwnedRig(Rig):
     """A Rig whose authenticator is the system vault with owners (as aurora-fidod builds it)."""
 
-    def __init__(self, seat=None, fprint=None, legacy_store=False, **kw):
+    def __init__(self, seat=None, fprint=None, legacy_store=False, names=None, **kw):
         super().__init__(**kw)
         self.seat = seat or Seat()
         # The account name of each uid now; other uids are looked up in passwd.
-        self.names = {ALICE: "alice", BOB: "bob"}
+        # (Tests with real accounts pass names={}: ALICE or BOB may be the uid
+        # the tests run as.)
+        self.names = {ALICE: "alice", BOB: "bob"} if names is None else names
         if legacy_store:
             with open(os.path.join(self.state, "master.sep"), "wb") as f:
                 f.write(b"old")
@@ -233,7 +235,7 @@ class PerAccountTest(unittest.TestCase):
         self.assertEqual(self.rig.make()[0], 0)
         self.rig.seat.uid = BOB
         self.assertEqual(self.rig.make()[0], 0)
-        self.assertEqual(owners_file(self.rig)["uids"], [ALICE, BOB])
+        self.assertEqual(owners_file(self.rig)["uids"], sorted((ALICE, BOB)))
         self.rig.seat.uid = ALICE
         self.assertEqual(self.rig.call(ctap2.CMD_RESET)[0], E.ERR_NOT_ALLOWED)
 
@@ -397,7 +399,7 @@ class LegacyOwnerTest(unittest.TestCase):
         try:
             fprint = os.path.join(tmp, "fprint")
             self.prints(fprint, me)
-            rig = OwnedRig(seat=Seat(my_uid), fprint=fprint, legacy_store=True)
+            rig = OwnedRig(seat=Seat(my_uid), fprint=fprint, legacy_store=True, names={})
             try:
                 cid = rig.unowned()
                 rk = rig.unowned(rk=True)
@@ -427,7 +429,7 @@ class LegacyOwnerTest(unittest.TestCase):
         try:
             fprint = os.path.join(tmp, "fprint")
             self.prints(fprint, me, other)
-            rig = OwnedRig(seat=Seat(my_uid), fprint=fprint, legacy_store=True)
+            rig = OwnedRig(seat=Seat(my_uid), fprint=fprint, legacy_store=True, names={})
             try:
                 cid = rig.unowned()
                 self.assertTrue(rig.owners.legacy_unassigned)
@@ -546,7 +548,7 @@ class AccountNameTest(unittest.TestCase):
         os.makedirs(d)
         with open(os.path.join(d, "7"), "wb") as f:
             f.write(b"print")
-        rig = OwnedRig(seat=Seat(os.getuid()), fprint=tmp, legacy_store=True)
+        rig = OwnedRig(seat=Seat(os.getuid()), fprint=tmp, legacy_store=True, names={})
         self.addCleanup(rig.close)
         cid = rig.unowned()
         self.assertEqual(owners_file(rig)["names"], {str(os.getuid()): me})
