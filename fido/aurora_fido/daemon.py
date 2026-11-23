@@ -231,18 +231,20 @@ def owners_info(own):
             "legacy_owner": name, "legacy_unassigned": own.legacy_unassigned}
 
 
-def watch_seat(monitor, seat, changed):
-    """Tell changed(uid) the seat's user after each change of logind's seat
-    state, also when the uid reads the same as before (the seat may have been
-    another user's in between)."""
+def watch_seat(monitor, seat, woke, user_is):
+    """After each change of logind's seat state call woke() at once, then
+    user_is(uid) with the seat's user as looked up after it (also when it
+    reads the same as before: the seat may have been another user's in
+    between). woke() comes first because the lookup takes a while."""
     while True:
         monitor.wait()
+        woke()
         try:
             uid = seat()
-        except Exception as e:      # the node must still be made again
+        except Exception as e:      # the node is made again all the same
             log.warning("cannot look up the seat's user: %s", e)
             uid = None
-        changed(uid)
+        user_is(uid)
 
 
 def serve(auth, u, device_factory, run_dir=None, info=None, seat=None,
@@ -272,7 +274,7 @@ def serve(auth, u, device_factory, run_dir=None, info=None, seat=None,
 
         def watch():
             try:
-                watch_seat(monitor, seat, hid.seat_event)
+                watch_seat(monitor, seat, hid.seat_woke, hid.seat_is)
             except Exception:
                 log.exception("the watch of the seat's user ended: stopping")
                 failed.append(True)

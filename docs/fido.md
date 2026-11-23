@@ -111,7 +111,9 @@ access-control list. The daemon keeps the accounts apart itself:
   for another user is not answered and replaces the node as well. A request
   that was waiting for a touch at that moment is cancelled. Browsers see the
   key unplugged and plugged in again. Without the logind watch the daemon
-  does not start (the journal says why; systemd tries again).
+  does not serve: it exits before it makes the device, the journal says
+  why, and systemd starts it again every 5 seconds for as long as the watch
+  cannot be made (no device appears in the meantime).
 - A new credential records that uid inside its credential ID, encrypted and
   authenticated under the master secret. Another account's credential looks
   unknown: it is not found, listed, used or deleted, and an exclude list

@@ -146,14 +146,26 @@ class CtapHid:
             self.txn.abandoned = True
             self.txn.cancel.set()
 
-    def seat_event(self, uid):
-        """logind reported a change of the seat's state; uid is its user now
-        (any thread). The node is replaced whatever uid is: the seat may have
-        been another user's in between, who could open this node then."""
+    def seat_woke(self):
+        """logind's seat state changed (any thread; the watch calls it at the
+        wake, before it looks the seat's user up, which takes a while): the
+        node is stale from now on, whatever the seat's user turns out to be,
+        as the seat may have been another user's in between, who could open
+        this node then. Nothing is read from it any more, and the request
+        running on it is cancelled and gets no answer."""
         if self.reopen is None:
             return
         with self.send_lock:
-            self._changed_locked(uid)
+            self._changed_locked(self.want_user)
+
+    def seat_is(self, uid):
+        """The watch's lookup after seat_woke(): uid is the seat's user now.
+        No new change (a later one wakes the watch again)."""
+        if self.reopen is None:
+            return
+        with self.send_lock:
+            self.want_user = uid
+
 
     def for_user(self, uid):
         """The request being handled is for seat user uid (any thread). A node

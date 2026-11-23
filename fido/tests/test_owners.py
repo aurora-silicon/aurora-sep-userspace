@@ -739,7 +739,8 @@ class SeatDeviceTest(unittest.TestCase):
             pass
         old = self.hid.dev
         self.rig.seat.uid = BOB
-        self.hid.seat_event(self.rig.seat())            # what watch_seat() calls
+        self.hid.seat_woke()                            # what watch_seat() calls
+        self.hid.seat_is(self.rig.seat())
         self.finish()
         old.out.clear()                                 # keepalives from before the change
         self.hid.step(None)
@@ -779,7 +780,8 @@ class SeatDeviceTest(unittest.TestCase):
     def test_a_device_not_tied_to_the_seat_is_never_replaced(self):
         hid = ctaphid.CtapHid(Node(), self.rig.auth, self.rig.u2f)
         self.assertTrue(hid.for_user(BOB))
-        hid.seat_event(BOB)
+        hid.seat_woke()
+        hid.seat_is(BOB)
         hid.step(None)
         self.assertFalse(hid.dev.closed)
 
@@ -828,7 +830,7 @@ class SeatDeviceTest(unittest.TestCase):
                 self.left -= 1
 
         with self.assertRaises(StopIteration):
-            daemon.watch_seat(Monitor(), lambda: ALICE, self.hid.seat_event)
+            daemon.watch_seat(Monitor(), lambda: ALICE, self.hid.seat_woke, self.hid.seat_is)
         self.hid.step(None)
         self.assertTrue(old.closed)
         cid = self.init()                               # Alice is served on the new node
@@ -843,7 +845,8 @@ class SeatDeviceTest(unittest.TestCase):
                 bytes([ctaphid.KEEPALIVE_UPNEEDED]):
             pass
         old = self.hid.dev
-        self.hid.seat_event(ALICE)
+        self.hid.seat_woke()
+        self.hid.seat_is(ALICE)
         self.finish()
         old.out.clear()
         self.hid.step(None)
@@ -865,9 +868,66 @@ class SeatDeviceTest(unittest.TestCase):
         def broken():
             raise OSError("loginctl")
         with self.assertRaises(StopIteration):
-            daemon.watch_seat(Monitor(), broken, self.hid.seat_event)
+            daemon.watch_seat(Monitor(), broken, self.hid.seat_woke, self.hid.seat_is)
         self.hid.step(None)
         self.assertTrue(old.closed)
+
+    class OneWake:
+        left = 1
+
+        def wait(self):
+            if not self.left:
+                raise StopIteration
+            self.left -= 1
+
+    def test_the_node_is_stale_from_the_wake_on(self):
+        """The watch looks the seat's user up after a wake (two loginctl runs):
+        the node is stale during that lookup already."""
+        self._alice_has_a_passkey()
+        seen = []
+
+        def seat():
+            seen.append(self.hid._stale())
+            return ALICE
+        with self.assertRaises(StopIteration):
+            daemon.watch_seat(self.OneWake(), seat, self.hid.seat_woke, self.hid.seat_is)
+        self.assertEqual(seen, [True])
+
+    def test_no_answer_on_a_kept_handle_during_the_watch_lookup(self):
+        """A touch-free getAssertion on the node of before the wake, sent while
+        the watch looks the seat up, gets no answer."""
+        cid = self._alice_has_a_passkey()
+        old = self.hid.dev
+        got = []
+
+        def seat():
+            old.out.clear()
+            self.cbor(cid, ctap2.CMD_GET_ASSERTION, {1: RP, 2: CDH, 5: {"up": False}})
+            if self.hid.txn is not None and self.hid.txn.cid == cid:
+                self.hid.txn.finished.wait(5)
+            got.append(list(old.out))
+            return ALICE
+        with self.assertRaises(StopIteration):
+            daemon.watch_seat(self.OneWake(), seat, self.hid.seat_woke, self.hid.seat_is)
+        self.assertEqual(got, [[]])
+        self.assertTrue(old.closed)
+
+    def test_one_wake_replaces_the_node_once(self):
+        """The reader may replace the node during the watch's lookup; the lookup's
+        result is no second change."""
+        self._alice_has_a_passkey()
+
+        def seat():
+            self.hid.step(None)                         # the reader's turn meanwhile
+            return ALICE
+        with self.assertRaises(StopIteration):
+            daemon.watch_seat(self.OneWake(), seat, self.hid.seat_woke, self.hid.seat_is)
+        self.hid.step(None)
+        self.assertEqual(len(self.nodes), 2)
+        cid = self.init()
+        self.cbor(cid, ctap2.CMD_GET_ASSERTION, {1: RP, 2: CDH})
+        self.assertEqual(self.answer()[0], 0)
+        self.assertEqual(len(self.nodes), 2)
 
     def test_watch_seat_reports_each_change(self):
         class Monitor:
@@ -882,8 +942,9 @@ class SeatDeviceTest(unittest.TestCase):
         seen = []
         seats = iter((BOB, None))
         with self.assertRaises(StopIteration):
-            daemon.watch_seat(Monitor(), lambda: next(seats), seen.append)
-        self.assertEqual(seen, [BOB, None])
+            daemon.watch_seat(Monitor(), lambda: next(seats), lambda: seen.append("woke"),
+                              seen.append)
+        self.assertEqual(seen, ["woke", BOB, "woke", None])
 
     def test_no_seat_watch_no_service(self):
         """Without logind's watch the daemon does not serve a seat-tied node."""
