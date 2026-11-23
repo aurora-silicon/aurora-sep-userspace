@@ -63,11 +63,16 @@ def seat_uid():
 def fprint_accounts(root=FPRINT_DIR):
     """uids of the accounts that have at least one stored print (fprintd keeps
     them in <root>/<user name>/...). Names with no passwd entry are skipped."""
-    out = set()
+    return sorted(fprint_names(root))
+
+
+def fprint_names(root=FPRINT_DIR):
+    """{uid: account name} of the accounts with at least one stored print."""
+    out = {}
     try:
         names = os.listdir(root)
     except OSError:
-        return []
+        return {}
     for name in names:
         top = os.path.join(root, name)
         if os.path.islink(top) or not os.path.isdir(top):
@@ -76,10 +81,11 @@ def fprint_accounts(root=FPRINT_DIR):
         if not has_print:
             continue
         try:
-            out.add(pwd.getpwnam(name).pw_uid)
+            pw = pwd.getpwnam(name)
         except KeyError:
             continue
-    return sorted(out)
+        out[pw.pw_uid] = pw.pw_name
+    return out
 
 
 def account_name(uid):
@@ -138,10 +144,12 @@ class Owners:
         # holds credentials without an owner.
         self.legacy_store = os.path.exists(os.path.join(state_dir, "master.sep"))
         if self.legacy_store:
-            accounts = fprint_accounts(fprint_dir)
+            accounts = fprint_names(fprint_dir)
             if len(accounts) == 1:
-                self.legacy = accounts[0]
-                self._name(self.legacy)
+                # Named from the passwd entry just found, not by another lookup
+                # that could fail and leave it without a name.
+                (self.legacy, name), = accounts.items()
+                self.names[self.legacy] = name
                 log.info("credentials made before owners were recorded belong to uid %d "
                          "(the only account with prints)", self.legacy)
         self.save()
@@ -174,20 +182,28 @@ class Owners:
         else:
             self.names[uid] = name
 
-    def add(self, uid):
-        """uid has made a credential here (call it when the credential is finished)."""
+    def add(self, uid, name=None):
+        """uid has made a credential here (call it when the credential is
+        finished). name: its account name as looked up for the request (else
+        it is looked up now)."""
         if uid not in self.uids:
             self.uids.add(uid)
             if uid != self.legacy:
-                self._name(uid)
+                if name is None:
+                    self._name(uid)
+                else:
+                    self.names[uid] = name
             self.save()
 
-    def gone(self, uid):
+    def gone(self, uid, now=None):
         """True when credentials here were made for uid by an account that had
-        another name than uid has now: the account they belong to is gone."""
+        another name than uid has now (now: that name, if looked up already):
+        the account they belong to is gone."""
         if uid not in self.uids and not (self.legacy_store and self.legacy == uid):
             return False
-        was, now = self.names.get(uid), self.name_of(uid)
+        was = self.names.get(uid)
+        if now is None:
+            now = self.name_of(uid)
         if was is not None and was == now:
             return False
         if uid not in self._gone_logged:
@@ -211,9 +227,13 @@ class Owners:
         self.owners_unknown = False
         self.save()
 
-    def adopt(self, uid):
-        """Give the credentials without a recorded owner to uid (root, by hand)."""
+    def adopt(self, uid, name=None):
+        """Give the credentials without a recorded owner to uid (root, by hand;
+        name: its account name, else looked up)."""
         self.legacy_store, self.legacy, self.damaged = True, uid, False
         if uid not in self.uids:
-            self._name(uid)
+            if name is None:
+                self._name(uid)
+            else:
+                self.names[uid] = name
         self.save()

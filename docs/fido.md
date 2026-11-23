@@ -124,7 +124,10 @@ access-control list. The daemon keeps the accounts apart itself:
   name now, or none, is not the account that made those credentials (the
   account was removed, renamed, or its uid given to a new account): every
   request for that uid is refused, the journal says so once, and the uid
-  still counts for the reset rule. Nothing is deleted or handed over.
+  still counts for the reset rule. Nothing is deleted or handed over. A
+  request whose uid has no name at that moment (the account lookup failed)
+  is refused before anything is made, so an account is never listed
+  without its name.
   Giving the account its name back restores it; otherwise the way out is
   `sudo aurora-fido disable --forget`, which deletes every account's
   credentials. Not covered: an account removed and created again with the

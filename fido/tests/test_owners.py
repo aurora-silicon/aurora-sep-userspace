@@ -556,6 +556,74 @@ class AccountNameTest(unittest.TestCase):
         rig.names[os.getuid()] = "someone-else"
         self.assertEqual(rig.ga(cid)[0], E.ERR_OPERATION_DENIED)
 
+    def test_the_legacy_owner_is_named_from_its_prints_without_another_lookup(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp)
+        me = pwd.getpwuid(os.getuid()).pw_name
+        d = os.path.join(tmp, me, "apple-sep", "0")
+        os.makedirs(d)
+        with open(os.path.join(d, "7"), "wb") as f:
+            f.write(b"print")
+        # The uid -> name lookup fails at the first open; the name the print
+        # directory was found under is the one recorded.
+        rig = OwnedRig(seat=Seat(os.getuid()), fprint=tmp, legacy_store=True,
+                       names={os.getuid(): None})
+        self.addCleanup(rig.close)
+        cid = rig.unowned()
+        self.assertEqual(owners_file(rig)["names"], {str(os.getuid()): me})
+        rig.names = {}
+        self.assertEqual(rig.ga(cid)[0], 0)
+
+
+class NameLookupTest(unittest.TestCase):
+    """The account name cannot be looked up when a uid makes its first credential."""
+
+    def setUp(self):
+        self.rig = OwnedRig(seat=Seat(BOB))
+        self.addCleanup(self.rig.close)
+        self.rig.names[BOB] = None                      # NSS fails at this moment
+
+    def test_a_failed_name_lookup_refuses_before_anything_is_made(self):
+        st, _ = self.rig.make(uid=b"bob", rk=True)
+        self.assertEqual(st, E.ERR_OPERATION_DENIED)
+        reg = apdu(u2f.INS_REGISTER, 0, os.urandom(32) + RP_HASH)
+        self.assertEqual(self.rig.u2f.handle(reg), b"\x69\x85")
+        self.assertEqual((self.rig.backend.signs, self.rig.backend.touches), (0, 0))
+        self.assertEqual(self.rig.owners.uids, set())
+        self.assertEqual(owners_file(self.rig)["uids"], [])
+
+    def test_a_failed_name_lookup_does_not_lock_the_account_out(self):
+        self.rig.make(uid=b"bob", rk=True)
+        self.rig.names[BOB] = "bob"                     # the lookup works again
+        st, r = self.rig.make(uid=b"bob", rk=True)
+        self.assertEqual(st, 0)
+        self.assertEqual(self.rig.ga(self.rig.cid(r))[0], 0)
+        self.assertEqual(owners_file(self.rig)["names"], {str(BOB): "bob"})
+
+    def test_a_restart_after_the_failed_lookup_serves_the_account(self):
+        self.rig.make(uid=b"bob", rk=True)
+        self.rig.names[BOB] = "bob"
+        self.rig.make(uid=b"bob", rk=True)
+        self.rig.rebuild()
+        self.assertEqual(self.rig.call(ctap2.CMD_GET_ASSERTION, {1: RP, 2: CDH})[0], 0)
+
+    def test_the_name_looked_up_for_the_request_is_the_one_recorded(self):
+        # The lookup works when the request starts and fails by the time the
+        # credential is finished: the uid is still listed with its name.
+        self.rig.names[BOB] = "bob"
+        orig = self.rig.owners.name_of
+        calls = []
+
+        def flaky(uid):
+            calls.append(uid)
+            return orig(uid) if len(calls) == 1 else None
+        self.rig.owners.name_of = flaky
+        st, r = self.rig.make(uid=b"bob", rk=True)
+        self.assertEqual(st, 0)
+        self.assertEqual(owners_file(self.rig)["names"], {str(BOB): "bob"})
+        self.rig.owners.name_of = orig
+        self.assertEqual(self.rig.ga(self.rig.cid(r))[0], 0)
+
 
 class Node(FakeDev):
     """A device node: remembers that it was removed."""

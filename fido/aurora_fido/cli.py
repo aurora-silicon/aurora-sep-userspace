@@ -284,7 +284,7 @@ def cmd_disable(a):
 def cmd_adopt_legacy(a):
     import pwd
     try:
-        uid = pwd.getpwnam(a.user).pw_uid
+        pw = pwd.getpwnam(a.user)
     except KeyError:
         print(f"aurora-fido: no such user: {a.user}", file=sys.stderr)
         return 1
@@ -296,7 +296,7 @@ def cmd_adopt_legacy(a):
             print(f"aurora-fido: systemctl stop {UNIT}: {out}", file=sys.stderr)
             return 1
     os.makedirs(a.state_dir, mode=0o700, exist_ok=True)
-    owners.Owners(a.state_dir, current=lambda: None).adopt(uid)
+    owners.Owners(a.state_dir, current=lambda: None).adopt(pw.pw_uid, pw.pw_name)
     if active == "active":
         _systemctl("start")
     print(f"Credentials made before their owner was recorded now belong to {a.user} only.")

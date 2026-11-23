@@ -167,6 +167,7 @@ class Authenticator:
         # handled. A request for another uid drops all of that state first.
         self._session_uid = None
         self._request_uid = None
+        self._request_name = None         # its account name, looked up for the request
         # More of that state, kept by others: each is called when it is dropped
         # (the U2F background call).
         self.session_state = []
@@ -219,7 +220,7 @@ class Authenticator:
                         self._cm = None
                     resp = h(params, ctx)
                 finally:
-                    self._request_uid = None
+                    self._request_uid = self._request_name = None
         except CtapError as e:
             log.info("command 0x%02x: %s", cmd, e)
             return bytes([e.code])
@@ -320,7 +321,7 @@ class Authenticator:
         continuations, the last refusal) is dropped before the request runs.
         With no active local session nothing but getInfo is answered."""
         if self.owners is None:
-            self._request_uid = None
+            self._request_uid = self._request_name = None
             return None
         uid = self.owners.current()
         if uid != self._session_uid:
@@ -331,10 +332,16 @@ class Authenticator:
                             "seat user")
         if uid is None:
             raise CtapError(ERR_OPERATION_DENIED, "no active local session on seat0")
-        if self.owners.gone(uid):
+        # The name is looked up once, before anything is made: a uid is listed
+        # (owners.add) only with the name it had, so a lookup that fails now
+        # refuses this request instead of every later one.
+        name = self.owners.name_of(uid)
+        if name is None:
+            raise CtapError(ERR_OPERATION_DENIED, "no account name for uid %d" % uid)
+        if self.owners.gone(uid, name):
             raise CtapError(ERR_OPERATION_DENIED, "uid %d had another account name when "
                             "its credentials here were made" % uid)
-        self._request_uid = uid
+        self._request_uid, self._request_name = uid, name
         return uid
 
     def _drop_session(self):
@@ -354,6 +361,11 @@ class Authenticator:
         if self._request_uid is None:
             raise CtapError(ERR_OPERATION_DENIED, "no active local session on seat0")
         return self._request_uid
+
+    def add_owner(self, uid):
+        """uid (the request's) has finished a credential: list it with the
+        account name looked up for this request."""
+        self.owners.add(uid, self._request_name if uid == self._request_uid else None)
 
     def mine(self, cred, uid):
         """True when cred (a Credential, or None) belongs to the request's uid."""
@@ -518,7 +530,7 @@ class Authenticator:
         # Only now is the account one that has made a credential here (reset
         # is refused to the others from here on): the touch matched.
         if self.owners is not None:
-            self.owners.add(owner)
+            self.add_owner(owner)
 
         if rk:
             ok = self.store.put({
