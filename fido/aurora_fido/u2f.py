@@ -136,11 +136,21 @@ class Background:
     def stop(self):
         self.cancel.set()
 
+    def drop(self):
+        """Forget the request: a running call is cancelled, and neither it nor a
+        finished one is handed to a later poll."""
+        with self.lock:
+            self.cancel.set()
+            self.key = None
+            self.result = None
+
 
 class U2F:
     def __init__(self, auth):
         self.auth = auth            # the CTAP2 Authenticator: backend, vault, counter, user
         self.presence = Background()
+        # The background call is for one account: gone with its other session state.
+        auth.session_state.append(self.presence.drop)
         self._att = ec.generate_private_key(ec.SECP256R1())
         self._att_point = self._att.public_key().public_bytes(
             Encoding.X962, PublicFormat.UncompressedPoint)
@@ -187,7 +197,8 @@ class U2F:
         a = self.auth
         owner = a.client_uid()
         prompt = touchid.Prompt("register", None, "U2F")
-        ok = self.presence.poll(("reg", app, chal), lambda cancel: (
+        # The key names the account too: a touch is for the account that asked.
+        ok = self.presence.poll(("reg", owner, app, chal), lambda cancel: (
             a.user.verify(prompt, cancel), True))
         if ok is None:
             return _sw(SW_CONDITIONS_NOT_SATISFIED)
@@ -204,8 +215,9 @@ class U2F:
         if len(data) < 65 or len(data) != 65 + data[64]:
             return _sw(SW_WRONG_LENGTH)
         chal, app, kh = data[:32], data[32:64], data[65:]
+        owner = self.auth.client_uid()
         cred = self.auth.vault.unwrap(app, kh)
-        if not self.auth.mine(cred, self.auth.client_uid()) or not self.auth._usable(cred, "U2F"):
+        if not self.auth.mine(cred, owner) or not self.auth._usable(cred, "U2F"):
             return _sw(SW_WRONG_DATA)
         if p1 == 0x07:                                  # check-only
             return _sw(SW_CONDITIONS_NOT_SATISFIED)
@@ -228,7 +240,7 @@ class U2F:
                 return touchid.NO_MATCH, None
             return r, (ctr, sig)
 
-        got = self.presence.poll(("auth", app, chal, kh), job)
+        got = self.presence.poll(("auth", owner, app, chal, kh), job)
         if got is None:
             return _sw(SW_CONDITIONS_NOT_SATISFIED)
         ctr, sig = got

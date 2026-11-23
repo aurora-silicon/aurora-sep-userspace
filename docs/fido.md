@@ -114,10 +114,12 @@ access-control list. The daemon keeps the accounts apart itself:
   until `sudo aurora-fido disable --forget`.
 - Session state belongs to the account it was made for: the
   pinUvAuthToken (and the credential-management permission behind it), the
-  key agreement key, and the getNextAssertion and credential-management
-  "next" lists. When a request comes for another account, or with no active
-  session, all of it is dropped before the request runs, so a token or a
-  list made for one account never serves another.
+  key agreement key, the getNextAssertion and credential-management "next"
+  lists, and the U2F touch a polling client is waiting for or has just been
+  given. When a request comes for another account, or with no active
+  session, all of it is dropped before the request runs (a U2F prompt that
+  is still up is cancelled), so a token, a list or a touch made for one
+  account never serves another.
 - A process that opened the hidraw node while its user was active keeps it
   open after a user switch; its requests are then for the new active user,
   whose finger the enclave waits for and whose session gets the

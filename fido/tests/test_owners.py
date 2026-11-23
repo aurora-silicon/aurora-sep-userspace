@@ -24,6 +24,7 @@ sys.path.insert(0, HERE)
 
 from aurora_fido import cbor, cli, creds, ctap2, daemon, owners, pinuv, u2f  # noqa: E402
 from aurora_fido import errors as E  # noqa: E402
+import stub  # noqa: E402
 from test_ctap import CDH, Platform, Rig, parse_auth_data  # noqa: E402
 
 ALICE, BOB = 1001, 1002
@@ -74,6 +75,10 @@ class OwnedRig(Rig):
             self.auth.store.put({"rpId": RP, "rpIdHash": RP_HASH, "userId": uid,
                                  "credId": cid, "pub": bytes(point), "credProtect": 1})
         return cid
+
+
+def apdu(ins, p1, data):
+    return bytes([0, ins, p1, 0, 0]) + struct.pack(">H", len(data)) + data + b"\x00\x00"
 
 
 def cm_call(rig, plat, tok, sub, params=None, auth=True):
@@ -175,9 +180,6 @@ class PerAccountTest(unittest.TestCase):
     def test_u2f_is_per_account(self):
         app = hashlib.sha256(b"https://u2f.example").digest()
 
-        def apdu(ins, p1, data):
-            return bytes([0, ins, p1, 0, 0]) + struct.pack(">H", len(data)) + data + b"\x00\x00"
-
         def poll(a):
             for _ in range(200):
                 r = self.rig.u2f.handle(a)
@@ -196,7 +198,6 @@ class PerAccountTest(unittest.TestCase):
         self.assertEqual(self.rig.u2f.handle(check), b"\x6a\x80")     # unknown to Bob
         self.rig.seat.uid = None
         self.assertEqual(self.rig.u2f.handle(check), b"\x6a\x80")        # not usable by anyone now
-
 
 class SessionBindingTest(unittest.TestCase):
     """Tokens and continuations belong to the account that made them: a change of
@@ -282,6 +283,40 @@ class SessionBindingTest(unittest.TestCase):
         self.assertEqual(self.rig.backend.signs, signs)
         self.rig.seat.uid = ALICE
         self.assertEqual(self.rig.call(ctap2.CMD_GET_NEXT_ASSERTION)[0], E.ERR_NOT_ALLOWED)
+
+    def test_a_u2f_touch_does_not_cross_to_another_account(self):
+        app, chal = hashlib.sha256(b"https://u2f.example").digest(), os.urandom(32)
+        reg = apdu(u2f.INS_REGISTER, 0, chal + app)
+        self.rig.seat.uid = ALICE
+        self.assertEqual(self.rig.u2f.handle(reg), b"\x69\x85")       # prompt started
+        self.rig.u2f.presence.thread.join(5)                          # and matched
+        touches = self.rig.backend.touches
+        self.rig.seat.uid = BOB                                       # the same request bytes
+        self.assertEqual(self.rig.u2f.handle(reg), b"\x69\x85")
+        self.assertEqual(self.rig.owners.uids, set())
+        # Bob's own ceremony takes its own touch and makes his own credential.
+        self.rig.u2f.presence.thread.join(5)
+        r = self.rig.u2f.handle(reg)
+        self.assertEqual(r[-2:], b"\x90\x00")
+        self.assertEqual(self.rig.backend.touches, touches + 1)
+        self.assertEqual(self.rig.owners.uids, {BOB})
+        # Nor back to Alice: her finished touch went with the switch.
+        self.rig.seat.uid = ALICE
+        self.assertEqual(self.rig.u2f.handle(reg), b"\x69\x85")
+
+    def test_a_u2f_prompt_ends_when_the_account_changes(self):
+        self.rig.mode = stub.WAIT
+        reg = apdu(u2f.INS_REGISTER, 0, os.urandom(32) + RP_HASH)
+        self.rig.seat.uid = ALICE
+        self.assertEqual(self.rig.u2f.handle(reg), b"\x69\x85")
+        waiting, cancel = self.rig.u2f.presence.thread, self.rig.u2f.presence.cancel
+        self.assertFalse(cancel.is_set())
+        self.rig.seat.uid = BOB
+        self.assertEqual(self.rig.call(ctap2.CMD_CLIENT_PIN, {1: 2, 2: 2})[0], 0)
+        self.assertTrue(cancel.is_set())
+        waiting.join(5)
+        self.assertFalse(waiting.is_alive())
+        self.assertIsNone(self.rig.u2f.presence.key)
 
     def test_the_same_account_keeps_its_session(self):
         self.rig.seat.uid = ALICE

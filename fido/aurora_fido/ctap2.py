@@ -167,6 +167,9 @@ class Authenticator:
         # handled. A request for another uid drops all of that state first.
         self._session_uid = None
         self._request_uid = None
+        # More of that state, kept by others: each is called when it is dropped
+        # (the U2F background call).
+        self.session_state = []
         # Signs the answers to silent (up=false) probes; never a credential key.
         self._probe_key = ec.generate_private_key(ec.SECP256R1())
 
@@ -331,6 +334,8 @@ class Authenticator:
         self._cm = None
         self._next = None
         self._refused = None
+        for drop in self.session_state:
+            drop()
 
     def client_uid(self):
         """The uid of the request being handled (begin_request), or None when the
