@@ -123,8 +123,9 @@ access-control list. The daemon keeps the accounts apart itself:
 - `owners.json` keeps the account name each uid had. A uid that has another
   name now, or none, is not the account that made those credentials (the
   account was removed, renamed, or its uid given to a new account): every
-  request for that uid is refused, the journal says so once, and the uid
-  still counts for the reset rule. Nothing is deleted or handed over. A
+  request for that uid is refused, the journal says so (again if it
+  happens again after the name came back), and the uid still counts for
+  the reset rule. Nothing is deleted or handed over. A
   request whose uid has no name at that moment (the account lookup failed)
   is refused before anything is made, so an account is never listed
   without its name.

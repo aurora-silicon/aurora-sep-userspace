@@ -574,6 +574,19 @@ class AccountNameTest(unittest.TestCase):
         rig.names = {}
         self.assertEqual(rig.ga(cid)[0], 0)
 
+    def test_gone_is_logged_again_after_the_name_came_back(self):
+        self.rig.names[ALICE] = "carol"
+        with self.assertLogs("aurora-fido", "WARNING") as cm:
+            self.assertEqual(self.rig.ga(self.cid)[0], E.ERR_OPERATION_DENIED)
+            self.assertEqual(self.rig.ga(self.cid)[0], E.ERR_OPERATION_DENIED)
+        self.assertEqual(sum("its credentials here were made by" in m for m in cm.output), 1)
+        self.rig.names[ALICE] = "alice"
+        self.assertEqual(self.rig.ga(self.cid)[0], 0)
+        self.rig.names[ALICE] = "dave"
+        with self.assertLogs("aurora-fido", "WARNING") as cm:
+            self.assertEqual(self.rig.ga(self.cid)[0], E.ERR_OPERATION_DENIED)
+        self.assertEqual(sum("'dave'" in m for m in cm.output), 1)
+
 
 class NameLookupTest(unittest.TestCase):
     """The account name cannot be looked up when a uid makes its first credential."""

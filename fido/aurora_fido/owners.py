@@ -205,6 +205,8 @@ class Owners:
         if now is None:
             now = self.name_of(uid)
         if was is not None and was == now:
+            # Its name is back: log it again if it goes another time.
+            self._gone_logged.discard(uid)
             return False
         if uid not in self._gone_logged:
             self._gone_logged.add(uid)
