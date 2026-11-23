@@ -103,7 +103,9 @@ access-control list. The daemon keeps the accounts apart itself:
   unknown: it is not found, listed, used or deleted, and an exclude list
   ignores it.
 - Reset (which deletes every credential) is refused while another account
-  has made credentials here (`owners.json` lists the uids).
+  has made credentials here (`owners.json` lists the uids). An account is
+  listed when its first credential is finished, that is, after the touch
+  matched: a request that was refused or timed out lists nobody.
 - Credentials made before owners were recorded carry no uid. When this
   version first opens such a store it gives them to the only account with
   prints in `/var/lib/fprint`. With no such account or several, they are

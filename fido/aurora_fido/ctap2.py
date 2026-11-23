@@ -477,8 +477,6 @@ class Authenticator:
                 # Never a weaker key than the site's rule asks for.
                 log.warning("site rule for %s asks for a policy this kernel cannot make", rp_id)
                 raise CtapError(ERR_UNSUPPORTED_OPTION, "site policy")
-        if self.owners is not None:
-            self.owners.add(owner)
         handle, point = self.backend.create(flags)
         sealed = None
         if hmac_secret:
@@ -508,6 +506,10 @@ class Authenticator:
             raise BackendError("the new key's signature does not verify")
         if auth_param is not None:
             self.token.consumed_by_mc_ga()
+        # Only now is the account one that has made a credential here (reset
+        # is refused to the others from here on): the touch matched.
+        if self.owners is not None:
+            self.owners.add(owner)
 
         if rk:
             ok = self.store.put({

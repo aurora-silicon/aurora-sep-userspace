@@ -202,11 +202,11 @@ class U2F:
             a.user.verify(prompt, cancel), True))
         if ok is None:
             return _sw(SW_CONDITIONS_NOT_SATISFIED)
-        if a.owners is not None:
-            a.owners.add(owner)
         handle, point = a.backend.create(a.flags)
         cred = Credential(handle, 1, a.policy, owner=owner)
         kh = a.vault.wrap(app, cred, ID_MAX_U2F)
+        if a.owners is not None:
+            a.owners.add(owner)
         sig = self._att_sign(hashlib.sha256(b"\x00" + app + chal + kh + point).digest())
         log.info("U2F registration")
         return _sw(SW_NO_ERROR, b"\x05" + point + bytes([len(kh)]) + kh + self._att_cert + sig)

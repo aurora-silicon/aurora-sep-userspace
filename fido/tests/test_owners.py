@@ -81,6 +81,11 @@ def apdu(ins, p1, data):
     return bytes([0, ins, p1, 0, 0]) + struct.pack(">H", len(data)) + data + b"\x00\x00"
 
 
+def owners_file(rig):
+    with open(os.path.join(rig.state, owners.FILE)) as f:
+        return json.load(f)
+
+
 def cm_call(rig, plat, tok, sub, params=None, auth=True):
     p = {1: sub}
     if params is not None:
@@ -198,6 +203,35 @@ class PerAccountTest(unittest.TestCase):
         self.assertEqual(self.rig.u2f.handle(check), b"\x6a\x80")     # unknown to Bob
         self.rig.seat.uid = None
         self.assertEqual(self.rig.u2f.handle(check), b"\x6a\x80")        # not usable by anyone now
+
+    def test_an_account_owns_nothing_before_its_first_credential(self):
+        """Only a finished credential (the touch matched) makes its account one
+        that reset has to respect."""
+        self.assertEqual(self.rig.make()[0], 0)                   # Alice has one
+        self.rig.seat.uid = BOB
+        for mode, want in ((stub.TIMEOUT, E.ERR_USER_ACTION_TIMEOUT),
+                           (stub.NO_MATCH, E.ERR_OPERATION_DENIED)):
+            self.rig.mode = mode
+            self.assertEqual(self.rig.make(rk=True)[0], want)
+            reg = apdu(u2f.INS_REGISTER, 0, os.urandom(32) + RP_HASH)
+            self.assertEqual(self.rig.u2f.handle(reg), b"\x69\x85")
+            self.rig.u2f.presence.thread.join(5)
+            self.assertEqual(self.rig.u2f.handle(reg), b"\x69\x85")
+        self.rig.mode = stub.MATCH
+        self.assertEqual(self.rig.owners.uids, {ALICE})
+        self.assertEqual(owners_file(self.rig)["uids"], [ALICE])
+        self.assertEqual(self.rig.auth.store.count(), 0)
+        self.rig.seat.uid = ALICE
+        self.rig.auth.started = self.rig.clock()
+        self.assertEqual(self.rig.call(ctap2.CMD_RESET)[0], 0)
+        # Once the other account does have a credential, reset is refused.
+        self.assertEqual(self.rig.make()[0], 0)
+        self.rig.seat.uid = BOB
+        self.assertEqual(self.rig.make()[0], 0)
+        self.assertEqual(owners_file(self.rig)["uids"], [ALICE, BOB])
+        self.rig.seat.uid = ALICE
+        self.assertEqual(self.rig.call(ctap2.CMD_RESET)[0], E.ERR_NOT_ALLOWED)
+
 
 class SessionBindingTest(unittest.TestCase):
     """Tokens and continuations belong to the account that made them: a change of

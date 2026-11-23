@@ -17,7 +17,8 @@ them apart itself:
   listed, used or deleted only for its own uid; for every other user it
   looks unknown.
 - Reset deletes every credential, so it is refused while any other account
-  owns credentials here (owners.json lists every uid that made one).
+  owns credentials here (owners.json lists every uid that made one, added
+  when its first credential is finished, that is, after the touch matched).
 
 Credentials made before owners were recorded carry no uid. They belong to
 one account, the "legacy owner", fixed once when this version first opens an
@@ -144,6 +145,7 @@ class Owners:
         return cred_owner == uid
 
     def add(self, uid):
+        """uid has made a credential here (call it when the credential is finished)."""
         if uid not in self.uids:
             self.uids.add(uid)
             self.save()
