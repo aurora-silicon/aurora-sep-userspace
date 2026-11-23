@@ -574,6 +574,28 @@ class AccountNameTest(unittest.TestCase):
         rig.names = {}
         self.assertEqual(rig.ga(cid)[0], 0)
 
+    def test_the_legacy_owner_is_named_as_requests_look_it_up(self):
+        """Two passwd names for one uid, the prints under the second: the name
+        recorded is the one getpwuid gives, as for every request."""
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp)
+        d = os.path.join(tmp, "alias", "apple-sep", "0")
+        os.makedirs(d)
+        with open(os.path.join(d, "7"), "wb") as f:
+            f.write(b"print")
+
+        class Pw:
+            pw_uid, pw_name = ALICE, "alias"
+        real = owners.pwd.getpwnam
+        owners.pwd.getpwnam = lambda n: Pw if n == "alias" else real(n)
+        self.addCleanup(setattr, owners.pwd, "getpwnam", real)
+        rig = OwnedRig(seat=Seat(ALICE), fprint=tmp, legacy_store=True,
+                       names={ALICE: "primary"})        # getpwuid(ALICE)
+        self.addCleanup(rig.close)
+        cid = rig.unowned()
+        self.assertEqual(owners_file(rig)["names"], {str(ALICE): "primary"})
+        self.assertEqual(rig.ga(cid)[0], 0)
+
     def test_gone_is_logged_again_after_the_name_came_back(self):
         self.rig.names[ALICE] = "carol"
         with self.assertLogs("aurora-fido", "WARNING") as cm:

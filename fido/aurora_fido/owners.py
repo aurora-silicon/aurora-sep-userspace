@@ -146,10 +146,11 @@ class Owners:
         if self.legacy_store:
             accounts = fprint_names(fprint_dir)
             if len(accounts) == 1:
-                # Named from the passwd entry just found, not by another lookup
-                # that could fail and leave it without a name.
+                # Named as requests will look it up (by uid); the name of the
+                # passwd entry just found only if that lookup fails, so that
+                # it is never left without a name.
                 (self.legacy, name), = accounts.items()
-                self.names[self.legacy] = name
+                self.names[self.legacy] = self.name_of(self.legacy) or name
                 log.info("credentials made before owners were recorded belong to uid %d "
                          "(the only account with prints)", self.legacy)
         self.save()

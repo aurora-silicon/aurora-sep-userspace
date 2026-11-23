@@ -172,7 +172,7 @@ class U2F:
                 try:
                     return self._dispatch(ins, p1, data)
                 finally:
-                    self.auth._request_uid = None
+                    self.auth._request_uid = self.auth._request_name = None
         except InvalidHandle:
             return _sw(SW_WRONG_DATA)
         except CtapError:
