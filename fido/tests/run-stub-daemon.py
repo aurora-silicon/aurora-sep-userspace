@@ -13,6 +13,9 @@ before /dev/sep-key is in the running kernel. Never install or ship this.
   --touch match|no-match|timeout    scripted enclave touch for --keys stub
   --secret file                     master secret in STATE/master (plain file)
   --secret sep --seal-helper PATH   master secret sealed by this Mac's SEP
+  --seat-file FILE                  credentials per account, as aurora-fidod keeps
+                                    them: FILE holds the uid of the seat's user
+                                    (empty: nobody), read at every request
 """
 
 import argparse
@@ -24,7 +27,7 @@ here = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(here, ".."))
 sys.path.insert(0, here)
 
-from aurora_fido import daemon, paths  # noqa: E402
+from aurora_fido import daemon, owners, paths  # noqa: E402
 from aurora_fido.backend import open_backend  # noqa: E402
 from aurora_fido.uhid import UhidDevice  # noqa: E402
 import stub  # noqa: E402
@@ -39,6 +42,7 @@ def main():
     ap.add_argument("--secret", choices=("file", "sep"), default="file")
     ap.add_argument("--seal-helper", default=paths.SEAL_HELPER)
     ap.add_argument("--config", default=None)
+    ap.add_argument("--seat-file", default=None)
     ap.add_argument("--name", default=None)
     ap.add_argument("-v", "--verbose", action="store_true")
     a = ap.parse_args()
@@ -72,11 +76,18 @@ def main():
     policy, note = daemon.resolve_policy(cfg, backend.flags_supported)
     if note:
         log.info("%s", note)
+    own = None
+    if a.seat_file:
+        def seat():
+            with open(a.seat_file) as f:
+                uid = f.read().strip()
+            return int(uid) if uid else None
+        own = owners.Owners(a.state_dir, seat)
     user = daemon.enclave_user(cfg, backend, a.state_dir, policy)
     auth, u = daemon.build(cfg, a.state_dir, backend, user, secret, policy,
-                           daemon.LegacyLog(a.state_dir))
+                           daemon.LegacyLog(a.state_dir), own)
     daemon.serve(auth, u, lambda: UhidDevice(name=name, phys="aurora-fido-test"),
-                 info=daemon.key_store_info(backend))
+                 info=daemon.key_store_info(backend), seat=own and own.current)
     return 0
 
 

@@ -170,6 +170,9 @@ class Authenticator:
         # More of that state, kept by others: each is called when it is dropped
         # (the U2F background call).
         self.session_state = []
+        # (uid) -> bool, from the transport: False when the request came in on a
+        # device node made for another seat user (ctaphid.CtapHid.for_user).
+        self.for_user = None
         # Signs the answers to silent (up=false) probes; never a credential key.
         self._probe_key = ec.generate_private_key(ec.SECP256R1())
 
@@ -323,6 +326,9 @@ class Authenticator:
         if uid != self._session_uid:
             self._drop_session()
             self._session_uid = uid
+        if self.for_user is not None and not self.for_user(uid):
+            raise CtapError(ERR_OPERATION_DENIED, "the device node was made for another "
+                            "seat user")
         if uid is None:
             raise CtapError(ERR_OPERATION_DENIED, "no active local session on seat0")
         self._request_uid = uid

@@ -98,6 +98,15 @@ access-control list. The daemon keeps the accounts apart itself:
   process opened the hidraw node, so the seat is the identity the daemon
   has.) With no active local user session (a login screen before anyone is
   logged in) nothing but getInfo is answered, as with `vault = user`.
+- The device node is made for that user. When the seat's user changes (a
+  user switch, a logout, the first login), the daemon removes the uhid device
+  and makes it again, with either `vault` setting: a handle a process opened
+  while its user was active ends with the old node (reads and writes fail),
+  and udev gives the new node to the new user. The daemon learns of the
+  change from logind (`sd_login_monitor`); a request that arrives on a node
+  made for another user is not answered and replaces the node as well. A
+  request that was waiting for a touch at that moment is cancelled. Browsers
+  see the key unplugged and plugged in again.
 - A new credential records that uid inside its credential ID, encrypted and
   authenticated under the master secret. Another account's credential looks
   unknown: it is not found, listed, used or deleted, and an exclude list
@@ -122,12 +131,11 @@ access-control list. The daemon keeps the accounts apart itself:
   session, all of it is dropped before the request runs (a U2F prompt that
   is still up is cancelled), so a token, a list or a touch made for one
   account never serves another.
-- A process that opened the hidraw node while its user was active keeps it
-  open after a user switch; its requests are then for the new active user,
-  whose finger the enclave waits for and whose session gets the
-  notification. A request made inside the active user's session on behalf
-  of another account (`su - other` with `pam_u2f`) is also for the active
-  user, so it does not find the other account's registration.
+- A request made inside the active user's session on behalf of another
+  account (`su - other` with `pam_u2f`) is for the active user, so it does
+  not find the other account's registration. The same holds for a handle
+  the active user's own process passes to another account's process: the
+  daemon sees the seat, not the process.
 - The `max_resident` passkey slots are one budget for all accounts: the
   remaining count reported to each account is the store's.
 - With `touchid-current` (what `auto` makes without the enclave password

@@ -231,9 +231,33 @@ def owners_info(own):
             "legacy_owner": name, "legacy_unassigned": own.legacy_unassigned}
 
 
-def serve(auth, u, device_factory, run_dir=None, info=None):
+def watch_seat(monitor, seat, changed):
+    """Tell changed(uid) the seat's user each time logind's seat state changes."""
+    while True:
+        monitor.wait()
+        changed(seat())
+
+
+def serve(auth, u, device_factory, run_dir=None, info=None, seat=None):
+    """seat: () -> uid of seat0's active user or None, when requests are for
+    that user: the device node is made again each time it changes (ctaphid.py),
+    at once when logind says so, else at the next request."""
     dev = device_factory()
-    hid = ctaphid.CtapHid(dev, auth, u)
+    if seat is None:
+        hid = ctaphid.CtapHid(dev, auth, u)
+    else:
+        hid = ctaphid.CtapHid(dev, auth, u, reopen=device_factory, user=seat())
+        auth.for_user = hid.for_user
+        try:
+            monitor = touchid.SeatMonitor()
+        except OSError as e:
+            # Without it the change is still seen at the next request, which
+            # is refused (it may come from a handle of the user before).
+            log.warning("cannot watch logind for a change of the seat's user (%s): the "
+                        "first request after one will be refused", e)
+        else:
+            threading.Thread(target=watch_seat, args=(monitor, seat, hid.for_user),
+                             name="seat-watch", daemon=True).start()
     stop = threading.Event()
     for s in (signal.SIGTERM, signal.SIGINT):
         signal.signal(s, lambda *_: stop.set())
@@ -245,7 +269,7 @@ def serve(auth, u, device_factory, run_dir=None, info=None):
     finally:
         if u:
             u.presence.stop()
-        dev.close()
+        hid.dev.close()
         if run_dir:
             try:
                 os.unlink(os.path.join(run_dir, "status.json"))
@@ -262,7 +286,9 @@ def serve_per_user(run_dir):
               "enforcement": "enclave", "u2f": False,
               "keys_detail": "each user's passkey agent (aurora-passkeyd) keeps that user's "
                              "credentials; requests go to seat0's active user"}
-    serve(RemoteAuthenticator(), None, lambda: UhidDevice(name=DEVICE_NAME), run_dir, status)
+    auth = RemoteAuthenticator()
+    serve(auth, None, lambda: UhidDevice(name=DEVICE_NAME), run_dir, status,
+          seat=auth.active_uid)
     return 0
 
 
@@ -334,7 +360,8 @@ def main(argv=None):
         log.warning("credentials made before the Secure Enclave checked Touch ID are refused "
                     "(%d stored passkeys, %d sites seen); register them again",
                     status["legacy_resident"], len(legacy.seen))
-    serve(auth, u, lambda: UhidDevice(name=DEVICE_NAME), a.run_dir, status)
+    serve(auth, u, lambda: UhidDevice(name=DEVICE_NAME), a.run_dir, status,
+          seat=own.current)
     return 0
 
 

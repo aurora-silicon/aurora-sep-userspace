@@ -22,10 +22,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, ".."))
 sys.path.insert(0, HERE)
 
-from aurora_fido import cbor, cli, creds, ctap2, daemon, owners, pinuv, u2f  # noqa: E402
+from aurora_fido import cbor, cli, creds, ctap2, ctaphid, daemon, owners, pinuv, touchid, u2f  # noqa: E402
 from aurora_fido import errors as E  # noqa: E402
 import stub  # noqa: E402
-from test_ctap import CDH, Platform, Rig, parse_auth_data  # noqa: E402
+from test_ctap import CDH, FakeDev, Platform, Rig, parse_auth_data, read_msg  # noqa: E402
 
 ALICE, BOB = 1001, 1002
 RP = "example.com"
@@ -473,6 +473,175 @@ class LegacyOwnerTest(unittest.TestCase):
             self.assertEqual(rig.call(ctap2.CMD_RESET)[0], E.ERR_NOT_ALLOWED)
         finally:
             rig.close()
+
+
+class Node(FakeDev):
+    """A device node: remembers that it was removed."""
+
+    def __init__(self):
+        super().__init__()
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+class SeatDeviceTest(unittest.TestCase):
+    """The device node is made for one seat user: when the seat's user changes it
+    is removed (handles opened before end with it) and made again."""
+
+    def setUp(self):
+        self.rig = OwnedRig()
+        self.addCleanup(self.rig.close)
+        self.nodes = []
+        self.hid = ctaphid.CtapHid(self.node(), self.rig.auth, self.rig.u2f,
+                                   reopen=self.node, user=self.rig.seat())
+        self.rig.auth.for_user = self.hid.for_user
+
+    def node(self):
+        self.nodes.append(Node())
+        return self.nodes[-1]
+
+    def send(self, cid, cmd, payload):
+        for f in ctaphid.frames(cid, cmd, payload):
+            self.hid.step(f)
+
+    def init(self):
+        self.send(ctaphid.BROADCAST, ctaphid.CMD_INIT, os.urandom(8))
+        return struct.unpack(">I", read_msg(self.hid.dev)[2][8:12])[0]
+
+    def cbor(self, cid, cmd, params=None):
+        self.send(cid, ctaphid.CMD_CBOR,
+                  bytes([cmd]) + (cbor.encode(params) if params is not None else b""))
+
+    def answer(self):
+        c, cmd, data = read_msg(self.hid.dev)
+        self.assertEqual(cmd, ctaphid.CMD_CBOR)
+        return data[0], (cbor.decode(data[1:]) if len(data) > 1 else None)
+
+    def finish(self):
+        self.assertTrue(self.hid.txn.finished.wait(5))
+
+    MAKE = {1: CDH, 2: {"id": RP}, 3: {"id": b"alice"},
+            4: [{"type": "public-key", "alg": -7}], 7: {"rk": True}}
+
+    def test_a_request_on_a_node_made_for_the_user_before_gets_no_answer(self):
+        cid = self.init()
+        self.cbor(cid, ctap2.CMD_MAKE_CREDENTIAL, self.MAKE)
+        self.assertEqual(self.answer()[0], 0)
+        old = self.hid.dev
+        self.rig.seat.uid = BOB                         # Alice's process keeps its handle
+        signs, touches = self.rig.backend.signs, self.rig.backend.touches
+        for cmd, params in ((ctap2.CMD_GET_ASSERTION, {1: RP, 2: CDH}),
+                            (ctap2.CMD_SELECTION, None)):
+            self.cbor(cid, cmd, params)
+            if self.hid.txn is not None:
+                self.finish()
+        self.assertEqual(old.out, [])                   # no answer, no keepalive
+        self.assertEqual((self.rig.backend.signs, self.rig.backend.touches), (signs, touches))
+        self.assertTrue(old.closed)                     # the node is gone, a new one is up
+        self.assertEqual(len(self.nodes), 2)
+        self.assertIs(self.hid.dev, self.nodes[1])
+        self.assertFalse(self.hid.dev.closed)
+        # The old channel means nothing on the new node; Bob's client starts over.
+        self.send(cid, ctaphid.CMD_PING, b"x")
+        self.assertEqual(read_msg(self.hid.dev)[1:], (ctaphid.CMD_ERROR,
+                                                      bytes([E.ERR_INVALID_CHANNEL])))
+        cid = self.init()
+        self.cbor(cid, ctap2.CMD_GET_ASSERTION, {1: RP, 2: CDH})
+        self.assertEqual(self.answer()[0], E.ERR_NO_CREDENTIALS)
+        self.cbor(cid, ctap2.CMD_MAKE_CREDENTIAL, self.MAKE)
+        self.assertEqual(self.answer()[0], 0)
+        self.assertEqual(len(self.nodes), 2)
+
+    def test_u2f_on_a_node_made_for_the_user_before_gets_no_answer(self):
+        cid = self.init()
+        old = self.hid.dev
+        self.rig.seat.uid = BOB
+        self.send(cid, ctaphid.CMD_MSG, apdu(u2f.INS_REGISTER, 0, os.urandom(32) + RP_HASH))
+        self.finish()
+        self.assertEqual(old.out, [])
+        self.assertIsNone(self.rig.u2f.presence.thread)               # no prompt either
+        self.hid.step(None)
+        self.assertTrue(old.closed)
+
+    def test_the_node_is_made_again_when_logind_reports_the_change(self):
+        """The seat watch sees the change before any request: the request that
+        waits for a touch ends, and the next user's first request is served."""
+        self.rig.mode = stub.WAIT
+        cid = self.init()
+        self.cbor(cid, ctap2.CMD_MAKE_CREDENTIAL, self.MAKE)
+        while read_msg(self.hid.dev, skip_keepalive=False)[2] != \
+                bytes([ctaphid.KEEPALIVE_UPNEEDED]):
+            pass
+        old = self.hid.dev
+        self.rig.seat.uid = BOB
+        self.hid.for_user(self.rig.seat())              # what watch_seat() calls
+        self.finish()
+        old.out.clear()                                 # keepalives from before the change
+        self.hid.step(None)
+        self.assertTrue(old.closed)
+        self.assertEqual(old.out, [])                   # the cancelled request: no answer
+        self.assertEqual(self.rig.owners.uids, set())
+        self.rig.mode = stub.MATCH
+        cid = self.init()
+        self.cbor(cid, ctap2.CMD_MAKE_CREDENTIAL, self.MAKE)
+        st, r = self.answer()
+        self.assertEqual(st, 0)
+        c = self.rig.auth.vault.unwrap(RP_HASH, parse_auth_data(r[2])["cred_id"])
+        self.assertEqual(c.owner, BOB)
+        self.assertEqual(len(self.nodes), 2)
+
+    def test_the_node_stays_while_the_seat_user_stays(self):
+        cid = self.init()
+        self.hid.for_user(ALICE)
+        self.hid.step(None)
+        self.cbor(cid, ctap2.CMD_MAKE_CREDENTIAL, self.MAKE)
+        self.assertEqual(self.answer()[0], 0)
+        self.assertEqual(len(self.nodes), 1)
+
+    def test_no_session_removes_the_node_of_the_user_before(self):
+        cid = self.init()
+        old = self.hid.dev
+        self.rig.seat.uid = None                        # a login screen
+        self.cbor(cid, ctap2.CMD_SELECTION)
+        self.finish()
+        self.hid.step(None)
+        self.assertTrue(old.closed)
+        self.assertEqual(old.out, [])
+        cid = self.init()                               # getInfo is still answered
+        self.cbor(cid, ctap2.CMD_GET_INFO)
+        self.assertEqual(self.answer()[0], 0)
+
+    def test_a_device_not_tied_to_the_seat_is_never_replaced(self):
+        hid = ctaphid.CtapHid(Node(), self.rig.auth, self.rig.u2f)
+        self.assertTrue(hid.for_user(BOB))
+        hid.step(None)
+        self.assertFalse(hid.dev.closed)
+
+    def test_watch_seat_reports_each_change(self):
+        class Monitor:
+            def __init__(self):
+                self.left = 2
+
+            def wait(self):
+                if not self.left:
+                    raise StopIteration
+                self.left -= 1
+
+        seen = []
+        seats = iter((BOB, None))
+        with self.assertRaises(StopIteration):
+            daemon.watch_seat(Monitor(), lambda: next(seats), seen.append)
+        self.assertEqual(seen, [BOB, None])
+
+    def test_seat_monitor(self):
+        if not os.path.isdir("/run/systemd/seats"):
+            self.skipTest("no logind here")
+        m = touchid.SeatMonitor()
+        self.addCleanup(m.close)
+        self.assertGreaterEqual(m.fd, 0)
+        self.assertFalse(m.wait(0))
 
 
 class PolkitRuleTest(unittest.TestCase):

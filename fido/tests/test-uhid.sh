@@ -257,6 +257,18 @@ fido2-assert -G -p -i "$work/as.in" -o /dev/null "$dev" 2>"$work/err" &&
 		no "timeout: unexpected error $(cat "$work/err")"
 }
 stop
+
+# Credentials per account, and a hidraw handle kept across a change of the
+# seat's user (its own test daemon, which is told who the seat's user is;
+# software keys only).
+if [ "${KEYS:-stub}" = stub ]; then
+	if out=$(python3 "$here/uhid-seat.py" 2>&1); then
+		ok "per-account credentials and a change of the seat's user ($(grep -c '^PASS' <<<"$out") checks)"
+	else
+		no "per-account credentials and a change of the seat's user"
+		sed 's/^/    /' <<<"$out"
+	fi
+fi
 grep -q "TEST HARNESS" "$work/daemon.log" && ok "harness says what keys it uses: $(grep -m1 -o 'TEST HARNESS: .*' "$work/daemon.log")" || no "harness warning missing"
 
 echo
