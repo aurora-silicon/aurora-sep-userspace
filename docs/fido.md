@@ -115,6 +115,17 @@ access-control list. The daemon keeps the accounts apart itself:
   has made credentials here (`owners.json` lists the uids). An account is
   listed when its first credential is finished, that is, after the touch
   matched: a request that was refused or timed out lists nobody.
+- `owners.json` keeps the account name each uid had. A uid that has another
+  name now, or none, is not the account that made those credentials (the
+  account was removed, renamed, or its uid given to a new account): every
+  request for that uid is refused, the journal says so once, and the uid
+  still counts for the reset rule. Nothing is deleted or handed over.
+  Giving the account its name back restores it; otherwise the way out is
+  `sudo aurora-fido disable --forget`, which deletes every account's
+  credentials. Not covered: an account removed and created again with the
+  same name and uid is the same account to the daemon, and one account's
+  credentials cannot be deleted on their own yet (a credential ID carries
+  the uid only).
 - Credentials made before owners were recorded carry no uid. When this
   version first opens such a store it gives them to the only account with
   prints in `/var/lib/fprint`. With no such account or several, they are

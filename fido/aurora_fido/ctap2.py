@@ -331,6 +331,9 @@ class Authenticator:
                             "seat user")
         if uid is None:
             raise CtapError(ERR_OPERATION_DENIED, "no active local session on seat0")
+        if self.owners.gone(uid):
+            raise CtapError(ERR_OPERATION_DENIED, "uid %d had another account name when "
+                            "its credentials here were made" % uid)
         self._request_uid = uid
         return uid
 

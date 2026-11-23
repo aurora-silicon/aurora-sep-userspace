@@ -48,14 +48,19 @@ class OwnedRig(Rig):
     def __init__(self, seat=None, fprint=None, legacy_store=False, **kw):
         super().__init__(**kw)
         self.seat = seat or Seat()
+        # The account name of each uid now; other uids are looked up in passwd.
+        self.names = {ALICE: "alice", BOB: "bob"}
         if legacy_store:
             with open(os.path.join(self.state, "master.sep"), "wb") as f:
                 f.write(b"old")
         self.fprint = fprint or os.path.join(self.tmp.name, "fprint")
         self.rebuild()
 
+    def name_of(self, uid):
+        return self.names[uid] if uid in self.names else owners.account_name(uid)
+
     def rebuild(self):
-        self.owners = owners.Owners(self.state, self.seat, self.fprint)
+        self.owners = owners.Owners(self.state, self.seat, self.fprint, self.name_of)
         self.auth, self.u2f = daemon.build(self.cfg, self.state, self.backend, self.user,
                                            self.secret, self.policy,
                                            lambda rp, why: self.legacy.append((rp, why)),
@@ -466,13 +471,88 @@ class LegacyOwnerTest(unittest.TestCase):
             self.assertTrue(rig.owners.others(ALICE))
             # Repairing the legacy owner does not open reset: who made the other
             # credentials is still not known.
-            owners.Owners(rig.state, lambda: None, rig.fprint).adopt(ALICE)
+            owners.Owners(rig.state, lambda: None, rig.fprint, rig.name_of).adopt(ALICE)
             rig.rebuild()
             self.assertTrue(rig.owners.owns(ALICE, None))
             self.assertTrue(rig.owners.others(ALICE))
             self.assertEqual(rig.call(ctap2.CMD_RESET)[0], E.ERR_NOT_ALLOWED)
         finally:
             rig.close()
+
+
+class AccountNameTest(unittest.TestCase):
+    """A uid is the account that made its credentials only while it has the
+    account name it had then."""
+
+    def setUp(self):
+        self.rig = OwnedRig()
+        self.addCleanup(self.rig.close)
+        _, r = self.rig.make(uid=b"alice", rk=True)
+        self.cid = self.rig.cid(r)
+
+    def refused(self):
+        signs, touches = self.rig.backend.signs, self.rig.backend.touches
+        self.assertEqual(self.rig.ga(self.cid)[0], E.ERR_OPERATION_DENIED)
+        self.assertEqual(self.rig.call(ctap2.CMD_GET_ASSERTION, {1: RP, 2: CDH})[0],
+                         E.ERR_OPERATION_DENIED)
+        self.assertEqual(self.rig.make()[0], E.ERR_OPERATION_DENIED)
+        self.assertEqual(self.rig.call(ctap2.CMD_SELECTION)[0], E.ERR_OPERATION_DENIED)
+        self.assertEqual(self.rig.call(ctap2.CMD_CLIENT_PIN, {1: 2, 2: 2})[0],
+                         E.ERR_OPERATION_DENIED)
+        reg = apdu(u2f.INS_REGISTER, 0, os.urandom(32) + RP_HASH)
+        self.assertEqual(self.rig.u2f.handle(reg), b"\x69\x85")
+        self.assertIsNone(self.rig.u2f.presence.thread)               # and no prompt
+        self.assertEqual((self.rig.backend.signs, self.rig.backend.touches), (signs, touches))
+        self.assertEqual(self.rig.call(ctap2.CMD_GET_INFO)[0], 0)
+
+    def test_the_name_is_recorded_with_the_uid(self):
+        self.assertEqual(owners_file(self.rig)["names"], {str(ALICE): "alice"})
+        self.rig.rebuild()
+        self.assertEqual(self.rig.ga(self.cid)[0], 0)
+
+    def test_a_uid_with_another_account_name_is_refused(self):
+        self.rig.names[ALICE] = "carol"                 # the uid went to a new account
+        self.refused()
+        self.rig.rebuild()                              # also after a restart
+        self.refused()
+        self.assertEqual(owners_file(self.rig)["names"], {str(ALICE): "alice"})
+        self.assertEqual(self.rig.auth.store.count(), 1)             # nothing deleted
+        # It still counts as another account's credentials for reset.
+        self.rig.seat.uid = BOB
+        self.assertEqual(self.rig.call(ctap2.CMD_RESET)[0], E.ERR_NOT_ALLOWED)
+        self.assertEqual(self.rig.make()[0], 0)                      # Bob is not affected
+        # The account's name back: its credentials are its own again.
+        self.rig.names[ALICE] = "alice"
+        self.rig.seat.uid = ALICE
+        self.assertEqual(self.rig.ga(self.cid)[0], 0)
+
+    def test_a_uid_without_an_account_is_refused(self):
+        self.rig.names[ALICE] = None
+        self.refused()
+
+    def test_a_uid_listed_without_a_name_is_refused(self):
+        d = owners_file(self.rig)
+        del d["names"]
+        with open(os.path.join(self.rig.state, owners.FILE), "w") as f:
+            json.dump(d, f)
+        self.rig.rebuild()
+        self.refused()
+
+    def test_the_legacy_owner_is_named_too(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp)
+        me = pwd.getpwuid(os.getuid()).pw_name
+        d = os.path.join(tmp, me, "apple-sep", "0")
+        os.makedirs(d)
+        with open(os.path.join(d, "7"), "wb") as f:
+            f.write(b"print")
+        rig = OwnedRig(seat=Seat(os.getuid()), fprint=tmp, legacy_store=True)
+        self.addCleanup(rig.close)
+        cid = rig.unowned()
+        self.assertEqual(owners_file(rig)["names"], {str(os.getuid()): me})
+        self.assertEqual(rig.ga(cid)[0], 0)
+        rig.names[os.getuid()] = "someone-else"
+        self.assertEqual(rig.ga(cid)[0], E.ERR_OPERATION_DENIED)
 
 
 class Node(FakeDev):

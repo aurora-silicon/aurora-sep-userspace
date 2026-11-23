@@ -19,6 +19,11 @@ them apart itself:
 - Reset deletes every credential, so it is refused while any other account
   owns credentials here (owners.json lists every uid that made one, added
   when its first credential is finished, that is, after the touch matched).
+- A uid is listed with the account name it had. When the uid has another
+  name now, or none (the account was removed, or the uid was given to a new
+  account), it is not the account that made those credentials: its requests
+  are refused, and it still counts for the reset rule. Nothing is deleted or
+  reassigned on its own.
 
 Credentials made before owners were recorded carry no uid. They belong to
 one account, the "legacy owner", fixed once when this version first opens an
@@ -34,7 +39,7 @@ known any more), so reset stays refused until `aurora-fido disable --forget`.
 
 File owners.json (root-only, in the state dir):
   {"version": 1, "legacy_store": bool, "legacy": uid or null, "uids": [uid, ...],
-   "owners_unknown": bool}
+   "names": {"uid": account name, ...}, "owners_unknown": bool}
 """
 
 import json
@@ -77,13 +82,24 @@ def fprint_accounts(root=FPRINT_DIR):
     return sorted(out)
 
 
+def account_name(uid):
+    try:
+        return pwd.getpwuid(uid).pw_name
+    except KeyError:
+        return None
+
+
 class Owners:
-    def __init__(self, state_dir, current=seat_uid, fprint_dir=FPRINT_DIR):
+    def __init__(self, state_dir, current=seat_uid, fprint_dir=FPRINT_DIR,
+                 name_of=account_name):
         self.path = os.path.join(state_dir, FILE)
         self.current = current          # () -> uid of the request, or None
+        self.name_of = name_of          # uid -> the account's name now, or None
         self.legacy_store = False
         self.legacy = None
         self.uids = set()
+        self.names = {}                 # uid -> account name when it was recorded
+        self._gone_logged = set()
         self.damaged = False
         self.owners_unknown = False
         if not self._load():
@@ -110,6 +126,10 @@ class Owners:
         legacy = d.get("legacy")
         self.legacy = legacy if isinstance(legacy, int) and legacy >= 0 else None
         self.uids = {u for u in d["uids"] if isinstance(u, int) and u >= 0}
+        names = d.get("names")
+        if isinstance(names, dict):
+            self.names = {int(u): n for u, n in names.items()
+                          if u.isdigit() and isinstance(n, str)}
         self.owners_unknown = bool(d.get("owners_unknown"))
         return True
 
@@ -121,6 +141,7 @@ class Owners:
             accounts = fprint_accounts(fprint_dir)
             if len(accounts) == 1:
                 self.legacy = accounts[0]
+                self._name(self.legacy)
                 log.info("credentials made before owners were recorded belong to uid %d "
                          "(the only account with prints)", self.legacy)
         self.save()
@@ -129,7 +150,9 @@ class Owners:
         if self.damaged:
             return                  # keep the damaged file for root to look at
         d = {"version": 1, "legacy_store": self.legacy_store, "legacy": self.legacy,
-             "uids": sorted(self.uids), "owners_unknown": self.owners_unknown}
+             "uids": sorted(self.uids),
+             "names": {str(u): n for u, n in sorted(self.names.items())},
+             "owners_unknown": self.owners_unknown}
         creds.atomic_write(self.path, json.dumps(d, indent=1).encode() + b"\n")
 
     @property
@@ -144,11 +167,36 @@ class Owners:
             return self.legacy_store and self.legacy == uid
         return cred_owner == uid
 
+    def _name(self, uid):
+        name = self.name_of(uid)
+        if name is None:
+            self.names.pop(uid, None)
+        else:
+            self.names[uid] = name
+
     def add(self, uid):
         """uid has made a credential here (call it when the credential is finished)."""
         if uid not in self.uids:
             self.uids.add(uid)
+            if uid != self.legacy:
+                self._name(uid)
             self.save()
+
+    def gone(self, uid):
+        """True when credentials here were made for uid by an account that had
+        another name than uid has now: the account they belong to is gone."""
+        if uid not in self.uids and not (self.legacy_store and self.legacy == uid):
+            return False
+        was, now = self.names.get(uid), self.name_of(uid)
+        if was is not None and was == now:
+            return False
+        if uid not in self._gone_logged:
+            self._gone_logged.add(uid)
+            log.warning("uid %d is %s now, and its credentials here were made by %s: "
+                        "requests for it are refused (docs: Accounts)", uid,
+                        repr(now) if now else "no account",
+                        repr(was) if was else "an account whose name was not recorded")
+        return True
 
     def others(self, uid):
         """True when an account other than uid owns (or may own) credentials here."""
@@ -159,10 +207,13 @@ class Owners:
     def cleared(self):
         """After a reset: nobody's credentials are left."""
         self.legacy_store, self.legacy, self.uids = False, None, set()
+        self.names = {}
         self.owners_unknown = False
         self.save()
 
     def adopt(self, uid):
         """Give the credentials without a recorded owner to uid (root, by hand)."""
         self.legacy_store, self.legacy, self.damaged = True, uid, False
+        if uid not in self.uids:
+            self._name(uid)
         self.save()
