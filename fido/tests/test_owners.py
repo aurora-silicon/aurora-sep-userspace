@@ -658,7 +658,7 @@ class SeatDeviceTest(unittest.TestCase):
             pass
         old = self.hid.dev
         self.rig.seat.uid = BOB
-        self.hid.for_user(self.rig.seat())              # what watch_seat() calls
+        self.hid.seat_event(self.rig.seat())            # what watch_seat() calls
         self.finish()
         old.out.clear()                                 # keepalives from before the change
         self.hid.step(None)
@@ -698,8 +698,95 @@ class SeatDeviceTest(unittest.TestCase):
     def test_a_device_not_tied_to_the_seat_is_never_replaced(self):
         hid = ctaphid.CtapHid(Node(), self.rig.auth, self.rig.u2f)
         self.assertTrue(hid.for_user(BOB))
+        hid.seat_event(BOB)
         hid.step(None)
         self.assertFalse(hid.dev.closed)
+
+    def _alice_has_a_passkey(self):
+        cid = self.init()
+        self.cbor(cid, ctap2.CMD_MAKE_CREDENTIAL, self.MAKE)
+        self.assertEqual(self.answer()[0], 0)
+        return cid
+
+    def test_a_change_and_back_before_the_reader_looks_replaces_the_node(self):
+        """Bob is active for a moment (and may open the node), then Alice again,
+        both before the reader's next turn: the node still goes."""
+        self._alice_has_a_passkey()
+        old = self.hid.dev
+        self.hid.for_user(BOB)
+        self.hid.for_user(ALICE)
+        self.hid.step(None)
+        self.assertTrue(old.closed)
+        self.assertEqual(len(self.nodes), 2)
+
+    def test_a_handle_kept_across_a_change_and_back_gets_no_answer(self):
+        self._alice_has_a_passkey()
+        old = self.hid.dev
+        cid = self.init()                               # a handle on this node
+        self.hid.for_user(BOB)
+        self.hid.for_user(ALICE)
+        signs, touches = self.rig.backend.signs, self.rig.backend.touches
+        self.cbor(cid, ctap2.CMD_GET_ASSERTION, {1: RP, 2: CDH})
+        if self.hid.txn is not None:
+            self.finish()
+        self.assertEqual(old.out, [])
+        self.assertEqual((self.rig.backend.signs, self.rig.backend.touches), (signs, touches))
+        self.assertTrue(old.closed)
+
+    def test_a_seat_event_that_reads_the_same_uid_replaces_the_node(self):
+        """One logind wake for Alice -> Bob -> Alice; the seat reads Alice."""
+        self._alice_has_a_passkey()
+        old = self.hid.dev
+
+        class Monitor:
+            left = 1
+
+            def wait(self):
+                if not self.left:
+                    raise StopIteration
+                self.left -= 1
+
+        with self.assertRaises(StopIteration):
+            daemon.watch_seat(Monitor(), lambda: ALICE, self.hid.seat_event)
+        self.hid.step(None)
+        self.assertTrue(old.closed)
+        cid = self.init()                               # Alice is served on the new node
+        self.cbor(cid, ctap2.CMD_GET_ASSERTION, {1: RP, 2: CDH})
+        self.assertEqual(self.answer()[0], 0)
+
+    def test_a_seat_event_cancels_the_waiting_request_even_for_the_same_uid(self):
+        self.rig.mode = stub.WAIT
+        cid = self.init()
+        self.cbor(cid, ctap2.CMD_MAKE_CREDENTIAL, self.MAKE)
+        while read_msg(self.hid.dev, skip_keepalive=False)[2] != \
+                bytes([ctaphid.KEEPALIVE_UPNEEDED]):
+            pass
+        old = self.hid.dev
+        self.hid.seat_event(ALICE)
+        self.finish()
+        old.out.clear()
+        self.hid.step(None)
+        self.assertTrue(old.closed)
+        self.assertEqual(old.out, [])
+        self.assertEqual(self.rig.owners.uids, set())
+
+    def test_a_failed_seat_lookup_in_the_watch_still_replaces_the_node(self):
+        old = self.hid.dev
+
+        class Monitor:
+            left = 1
+
+            def wait(self):
+                if not self.left:
+                    raise StopIteration
+                self.left -= 1
+
+        def broken():
+            raise OSError("loginctl")
+        with self.assertRaises(StopIteration):
+            daemon.watch_seat(Monitor(), broken, self.hid.seat_event)
+        self.hid.step(None)
+        self.assertTrue(old.closed)
 
     def test_watch_seat_reports_each_change(self):
         class Monitor:
@@ -716,6 +803,38 @@ class SeatDeviceTest(unittest.TestCase):
         with self.assertRaises(StopIteration):
             daemon.watch_seat(Monitor(), lambda: next(seats), seen.append)
         self.assertEqual(seen, [BOB, None])
+
+    def test_no_seat_watch_no_service(self):
+        """Without logind's watch the daemon does not serve a seat-tied node."""
+        made = []
+
+        def no_watch():
+            raise OSError(2, "no logind")
+        with self.assertLogs("aurora-fido", "ERROR"):
+            rc = daemon.serve(self.rig.auth, self.rig.u2f, lambda: made.append(1) or Node(),
+                              seat=self.rig.seat, seat_monitor=no_watch)
+        self.assertEqual(rc, 1)
+        self.assertEqual(made, [])
+
+    def test_the_daemon_stops_when_the_seat_watch_ends(self):
+        import signal
+        for sig in (signal.SIGTERM, signal.SIGINT):     # serve() sets its own
+            self.addCleanup(signal.signal, sig, signal.getsignal(sig))
+
+        class Polled(Node):
+            def poll(self, timeout):
+                time.sleep(timeout)
+
+        class Broken:
+            def wait(self):
+                raise OSError(5, "gone")
+        made = []
+        with self.assertLogs("aurora-fido", "ERROR"):
+            rc = daemon.serve(self.rig.auth, self.rig.u2f,
+                              lambda: made.append(Polled()) or made[-1],
+                              seat=self.rig.seat, seat_monitor=Broken)
+        self.assertEqual(rc, 1)
+        self.assertTrue(made[-1].closed)
 
     def test_seat_monitor(self):
         if not os.path.isdir("/run/systemd/seats"):

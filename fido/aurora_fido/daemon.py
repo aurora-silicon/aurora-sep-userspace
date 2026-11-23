@@ -232,33 +232,52 @@ def owners_info(own):
 
 
 def watch_seat(monitor, seat, changed):
-    """Tell changed(uid) the seat's user each time logind's seat state changes."""
+    """Tell changed(uid) the seat's user after each change of logind's seat
+    state, also when the uid reads the same as before (the seat may have been
+    another user's in between)."""
     while True:
         monitor.wait()
-        changed(seat())
+        try:
+            uid = seat()
+        except Exception as e:      # the node must still be made again
+            log.warning("cannot look up the seat's user: %s", e)
+            uid = None
+        changed(uid)
 
 
-def serve(auth, u, device_factory, run_dir=None, info=None, seat=None):
+def serve(auth, u, device_factory, run_dir=None, info=None, seat=None,
+          seat_monitor=None):
     """seat: () -> uid of seat0's active user or None, when requests are for
-    that user: the device node is made again each time it changes (ctaphid.py),
-    at once when logind says so, else at the next request."""
+    that user: the device node is made again after each change of the seat
+    (ctaphid.py), which seat_monitor() (default: logind's) reports. Without
+    that watch the daemon does not serve: a seat that went to another user
+    and back is not visible at request time. Returns the exit status."""
+    stop = threading.Event()
+    failed = []
+    if seat is not None:
+        try:
+            # Before the seat is read and the node made, so that no change
+            # between the two goes unseen.
+            monitor = (seat_monitor or touchid.SeatMonitor)()
+        except OSError as e:
+            log.error("cannot watch logind for changes of the seat's user (%s): not "
+                      "serving, as a node made for one user could stay open to another", e)
+            return 1
     dev = device_factory()
     if seat is None:
         hid = ctaphid.CtapHid(dev, auth, u)
     else:
         hid = ctaphid.CtapHid(dev, auth, u, reopen=device_factory, user=seat())
         auth.for_user = hid.for_user
-        try:
-            monitor = touchid.SeatMonitor()
-        except OSError as e:
-            # Without it the change is still seen at the next request, which
-            # is refused (it may come from a handle of the user before).
-            log.warning("cannot watch logind for a change of the seat's user (%s): the "
-                        "first request after one will be refused", e)
-        else:
-            threading.Thread(target=watch_seat, args=(monitor, seat, hid.for_user),
-                             name="seat-watch", daemon=True).start()
-    stop = threading.Event()
+
+        def watch():
+            try:
+                watch_seat(monitor, seat, hid.seat_event)
+            except Exception:
+                log.exception("the watch of the seat's user ended: stopping")
+                failed.append(True)
+                stop.set()
+        threading.Thread(target=watch, name="seat-watch", daemon=True).start()
     for s in (signal.SIGTERM, signal.SIGINT):
         signal.signal(s, lambda *_: stop.set())
     log.info("security key ready (keys: %s, Touch ID checked by the Secure Enclave)",
@@ -276,6 +295,7 @@ def serve(auth, u, device_factory, run_dir=None, info=None, seat=None):
             except OSError:
                 pass
         log.info("security key removed")
+    return 1 if failed else 0
 
 
 def serve_per_user(run_dir):
@@ -287,9 +307,8 @@ def serve_per_user(run_dir):
               "keys_detail": "each user's passkey agent (aurora-passkeyd) keeps that user's "
                              "credentials; requests go to seat0's active user"}
     auth = RemoteAuthenticator()
-    serve(auth, None, lambda: UhidDevice(name=DEVICE_NAME), run_dir, status,
-          seat=auth.active_uid)
-    return 0
+    return serve(auth, None, lambda: UhidDevice(name=DEVICE_NAME), run_dir, status,
+                 seat=auth.active_uid)
 
 
 POLICY_TEXT = {
@@ -360,9 +379,8 @@ def main(argv=None):
         log.warning("credentials made before the Secure Enclave checked Touch ID are refused "
                     "(%d stored passkeys, %d sites seen); register them again",
                     status["legacy_resident"], len(legacy.seen))
-    serve(auth, u, lambda: UhidDevice(name=DEVICE_NAME), a.run_dir, status,
-          seat=own.current)
-    return 0
+    return serve(auth, u, lambda: UhidDevice(name=DEVICE_NAME), a.run_dir, status,
+                 seat=own.current)
 
 
 if __name__ == "__main__":

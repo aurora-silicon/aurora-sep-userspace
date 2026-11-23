@@ -86,10 +86,14 @@ class CtapHid:
                  reopen=None, user=None):
         self.dev = device
         # reopen() makes the device again for a new seat user (None: the device
-        # is not tied to the seat). dev_user is the seat user the present node
-        # was made for, want_user the seat's user as last reported (for_user).
+        # is not tied to the seat). want_user is the seat's user as last
+        # reported. seat_gen counts the seat changes seen (each logind event,
+        # each uid change), dev_gen is seat_gen when the present node was made:
+        # a node made before the last change is replaced even when the uid is
+        # the same again (A -> B -> A between two looks at the seat).
         self.reopen = reopen
-        self.dev_user = self.want_user = user
+        self.want_user = user
+        self.seat_gen = self.dev_gen = 0
         self.auth = authenticator
         self.u2f = u2f
         self.clock = clock
@@ -133,33 +137,47 @@ class CtapHid:
     # -- the seat user the device node is for ---------------------------------------------
 
     def _stale(self):
-        return self.reopen is not None and self.want_user != self.dev_user
+        return self.reopen is not None and self.dev_gen != self.seat_gen
+
+    def _changed_locked(self, uid):
+        self.want_user = uid
+        self.seat_gen += 1
+        if self._busy():
+            self.txn.abandoned = True
+            self.txn.cancel.set()
+
+    def seat_event(self, uid):
+        """logind reported a change of the seat's state; uid is its user now
+        (any thread). The node is replaced whatever uid is: the seat may have
+        been another user's in between, who could open this node then."""
+        if self.reopen is None:
+            return
+        with self.send_lock:
+            self._changed_locked(uid)
 
     def for_user(self, uid):
-        """The seat's user is uid now (any thread). A node made for another user
-        is replaced on the reader's next turn; until then nothing is read from
-        it, and the request running on it is cancelled and gets no answer.
-        False when the request being handled is such a request."""
+        """The request being handled is for seat user uid (any thread). A node
+        made for another user, or before a seat change, is replaced on the
+        reader's next turn; until then nothing is read from it, and the request
+        running on it is cancelled and gets no answer. False when the request
+        being handled is such a request."""
         if self.reopen is None:
             return True
         with self.send_lock:
             if uid != self.want_user:
-                self.want_user = uid
-                if self._busy():
-                    self.txn.abandoned = True
-                    self.txn.cancel.set()
+                self._changed_locked(uid)
             return not (self._busy() and self.txn.abandoned)
 
     def _replace(self):
         with self.send_lock:
-            user = self.want_user
+            gen = self.seat_gen
             new = self.reopen()
             old, self.dev = self.dev, new
-            self.dev_user = user
+            self.dev_gen = gen
             self.asm = None
             self.channels = set()
         old.close()
-        log.info("the seat's user changed: security key device made again")
+        log.info("the seat changed: security key device made again")
 
     def _busy(self):
         return self.txn is not None and not self.txn.finished.is_set()
@@ -265,7 +283,7 @@ class CtapHid:
         txn = _Txn(cid, cmd)
         with self.send_lock:
             if self._stale():
-                return              # for_user() ran since the reader looked
+                return              # the seat changed since the reader looked
             self.txn = txn
 
         def worker():

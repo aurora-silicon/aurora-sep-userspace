@@ -105,10 +105,13 @@ access-control list. The daemon keeps the accounts apart itself:
   and makes it again, with either `vault` setting: a handle a process opened
   while its user was active ends with the old node (reads and writes fail),
   and udev gives the new node to the new user. The daemon learns of the
-  change from logind (`sd_login_monitor`); a request that arrives on a node
-  made for another user is not answered and replaces the node as well. A
-  request that was waiting for a touch at that moment is cancelled. Browsers
-  see the key unplugged and plugged in again.
+  change from logind (`sd_login_monitor`) and makes the node again after
+  every change logind reports, also when the seat is back with the same user
+  (a switch to another user and back). A request that arrives on a node made
+  for another user is not answered and replaces the node as well. A request
+  that was waiting for a touch at that moment is cancelled. Browsers see the
+  key unplugged and plugged in again. Without the logind watch the daemon
+  does not start (the journal says why; systemd tries again).
 - A new credential records that uid inside its credential ID, encrypted and
   authenticated under the master secret. Another account's credential looks
   unknown: it is not found, listed, used or deleted, and an exclude list

@@ -64,6 +64,16 @@ def wait_for(cond, seconds=10.0):
     return None
 
 
+def node_after(old):
+    """The node made after the HID device old, once the daemon is done making
+    nodes: a request that sees a seat change before the watch does replaces the
+    node, and the watch's report replaces it once more."""
+    if not wait_for(lambda: [n for n in nodes() if n[1] != old]):
+        return None
+    time.sleep(0.5)
+    return wait_for(lambda: [n for n in nodes() if n[1] != old])
+
+
 class Handle:
     """One open hidraw handle speaking CTAPHID."""
 
@@ -167,7 +177,7 @@ def main():
             err = a.dead()
             check(err in (errno.ENODEV, errno.EIO),
                   "the kept handle is dead: %s" % (errno.errorcode.get(err) if err else "still alive"))
-            new = wait_for(lambda: [n for n in nodes() if n[1] != node[1]])
+            new = node_after(node[1])
             check(bool(new), "a new device node is up")
             if not new:
                 return 1
@@ -182,9 +192,8 @@ def main():
 
             # Back to the first user: again a new node, and its passkey is still its own.
             seat_is(first)
-            b.write(b.cid, ctaphid.CMD_CBOR, bytes([ctap2.CMD_SELECTION]))
             check(b.dead() in (errno.ENODEV, errno.EIO), "the second user's handle is dead after the change back")
-            again = wait_for(lambda: [n for n in nodes() if n[1] != new[0][1]])
+            again = node_after(new[0][1])
             if not again:
                 check(False, "a new device node is up")
                 return 1
@@ -192,6 +201,22 @@ def main():
             st, r = c.cbor(ctap2.CMD_GET_ASSERTION, {1: "seat.example", 2: CDH})
             check(st == 0 and r[4]["id"] == b"first" and 5 not in r,
                   "the first user finds only its own passkey on the new node")
+
+            # The seat goes to the second user and straight back: a handle opened
+            # on the node of that moment still ends, though the uid is the same.
+            d = Handle(again[0][0])
+            seat_is(second)
+            seat_is(first)
+            check(d.dead() in (errno.ENODEV, errno.EIO),
+                  "a handle kept across a change and back is dead")
+            last = node_after(again[0][1])
+            if not last:
+                check(False, "a new device node is up after the change and back")
+                return 1
+            e = Handle(last[0][0])
+            st, r = e.cbor(ctap2.CMD_GET_ASSERTION, {1: "seat.example", 2: CDH})
+            check(st == 0 and r[4]["id"] == b"first",
+                  "the first user is served on the node made after it")
         finally:
             daemon.terminate()
             daemon.wait(10)

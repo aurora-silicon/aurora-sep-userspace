@@ -15,13 +15,16 @@ before /dev/sep-key is in the running kernel. Never install or ship this.
   --secret sep --seal-helper PATH   master secret sealed by this Mac's SEP
   --seat-file FILE                  credentials per account, as aurora-fidod keeps
                                     them: FILE holds the uid of the seat's user
-                                    (empty: nobody), read at every request
+                                    (empty: nobody), read at every request; a new
+                                    FILE (rename over it) stands for logind's
+                                    report of a seat change
 """
 
 import argparse
 import logging
 import os
 import sys
+import time
 
 here = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(here, ".."))
@@ -32,6 +35,30 @@ from aurora_fido.backend import open_backend  # noqa: E402
 from aurora_fido.uhid import UhidDevice  # noqa: E402
 import stub  # noqa: E402
 from stub import FileSecret, StubKeyBackend  # noqa: E402
+
+
+class SeatFileMonitor:
+    """Stands in for touchid.SeatMonitor: wakes when the seat file is replaced
+    or written (polled, as tests switch it by renaming a new file over it)."""
+
+    def __init__(self, path):
+        self.path = path
+        self.last = self._look()
+
+    def _look(self):
+        try:
+            st = os.stat(self.path)
+        except FileNotFoundError:
+            return None
+        return st.st_ino, st.st_mtime_ns, st.st_size
+
+    def wait(self):
+        while True:
+            now = self._look()
+            if now != self.last:
+                self.last = now
+                return True
+            time.sleep(0.02)
 
 
 def main():
@@ -86,9 +113,9 @@ def main():
     user = daemon.enclave_user(cfg, backend, a.state_dir, policy)
     auth, u = daemon.build(cfg, a.state_dir, backend, user, secret, policy,
                            daemon.LegacyLog(a.state_dir), own)
-    daemon.serve(auth, u, lambda: UhidDevice(name=name, phys="aurora-fido-test"),
-                 info=daemon.key_store_info(backend), seat=own and own.current)
-    return 0
+    return daemon.serve(auth, u, lambda: UhidDevice(name=name, phys="aurora-fido-test"),
+                        info=daemon.key_store_info(backend), seat=own and own.current,
+                        seat_monitor=lambda: SeatFileMonitor(a.seat_file))
 
 
 if __name__ == "__main__":
