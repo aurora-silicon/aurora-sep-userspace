@@ -748,7 +748,7 @@ console.log(JSON.stringify(r === undefined ? null : r));
                              capture_output=True, text=True, check=True).stdout
         return json.loads(out)
 
-    def test_enrolment_needs_the_password_every_time(self):
+    def test_enrolment_needs_authentication_every_time(self):
         enroll = "net.reactivated.fprint.device.enroll"
         self.assertEqual(self.run_rule(enroll), "auth_self")
         self.assertEqual(self.run_rule(enroll, active=False), "no")

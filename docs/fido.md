@@ -97,7 +97,9 @@ access-control list. The daemon keeps the accounts apart itself:
   the user the hidraw node's `uaccess` ACL follows. (uhid does not say which
   process opened the hidraw node, so the seat is the identity the daemon
   has.) With no active local user session (a login screen before anyone is
-  logged in) nothing but getInfo is answered, as with `vault = user`.
+  logged in) nothing but getInfo is answered, as with `vault = user`. Only a
+  session of logind class `user` counts: a greeter does not, and neither does
+  root on a console (class `user-early`).
 - The device node is made for that user. When the seat's user changes (a
   user switch, a logout, the first login), the daemon removes the uhid device
   and makes it again, with either `vault` setting: a handle a process opened
@@ -363,10 +365,13 @@ The cases a strong attacker can still use, and what bounds them:
   does not approve it; the change retires the credential instead. Either list
   names every account's fingers, which is why the daemon keeps accounts apart
   itself (Accounts, above). The enclave does not ask for a password to
-  enrol: through fprintd, enrolling needs your login password every time
-  (`40-aurora-fprint-enroll.rules`, polkit `auth_self` for
-  `net.reactivated.fprint.device.enroll`; fprintd passes polkit no reader
-  name, so the rule covers every reader on the machine), but root, or
+  enrol: through fprintd, enrolling needs authentication by the account
+  every time (`40-aurora-fprint-enroll.rules`, polkit `auth_self` for
+  `net.reactivated.fprint.device.enroll`: whatever the polkit-1 PAM stack
+  accepts for that user, the login password, or a fingerprint of that user
+  where `pam_fprintd` is part of it; fprintd passes polkit no reader name,
+  so the rule covers every reader on the machine, and it is installed with
+  the package, so it applies whether or not aurora-fido is enabled), but root, or
   anything with `CAP_SYS_ADMIN` on `/dev/sep-bio`, can enrol a finger without
   it. So against root, use `touchid-current`, and note that a finger root
   enrols still satisfies `touchid-any` credentials.
