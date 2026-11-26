@@ -20,9 +20,11 @@ Errors are org.aurora.Passkeys.Error.<DOMException name>, for example
 org.aurora.Passkeys.Error.NotAllowedError; a wrong password is
 org.aurora.Passkeys.Error.WrongPassword.
 
-Callers: only the session's own uid, and, when allow_names is set, only the
-current owner of one of those bus names (the portal). Every signature is
-still an enclave-checked touch or password; this layer decides nothing.
+Callers: only the current owner of one of the allow_names bus names (the
+portal), running as the session's own uid. With no allow_names, every call
+is refused: ListCredentials answers without a touch, so the service is only
+for a portal that has checked the relying party's origin. Every signature is
+still an enclave-checked touch or password.
 """
 
 import logging
@@ -161,8 +163,7 @@ class ProviderService:
             uid = self.query.send_and_get_reply(message_bus.GetConnectionUnixUser(sender)).body[0]
             if uid != self.uid:
                 return False
-            if not self.allow_names:
-                return True
+            # Only a configured portal: no names, no callers.
             for name in self.allow_names:
                 r = self.query.send_and_get_reply(message_bus.GetNameOwner(name))
                 if r.header.message_type == MessageType.method_return and r.body[0] == sender:
