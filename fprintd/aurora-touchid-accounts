@@ -1,0 +1,73 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# Delete the fingerprints of accounts that no longer exist.
+#
+# fprintd stores prints under a username, and for Touch ID it records next to
+# them the uid and instance of the account they belong to. Removing an account
+# leaves both behind, and so does re-creating it. Run whenever /etc/passwd
+# changes (aurora-touchid-accounts.path) and at boot, this deletes through
+# fprintd the prints of every username whose account is gone, or whose
+# account now has another uid than the one recorded.
+#
+# When fprintd cannot delete them (the reader is unavailable, or the enclave
+# refuses), the record gets a new instance and no uid, so that the prints
+# never verify again; the next run tries again.
+#
+# Only a username that the passwd database does not know at all (getent
+# status 2) counts as gone: a lookup that fails otherwise deletes nothing.
+
+set -u
+
+storage=${STATE_DIRECTORY:-/var/lib/fprint}
+storage=${storage%%:*}
+status=0
+
+invalidate() {
+	# $1: the account's storage directory. Keep the prints, bind them to
+	# nothing: no uid, and an instance no print was enrolled under.
+	instance=$(cat /proc/sys/kernel/random/uuid) || return 1
+	tmp=$(mktemp "$1/.account.XXXXXX") || return 1
+	printf '[Account]\nUID=\nInstance=%s\n' "$instance" >"$tmp" &&
+		chmod 600 "$tmp" && mv -f "$tmp" "$1/account" ||
+		{ rm -f "$tmp"; return 1; }
+}
+
+for dir in "$storage"/*/; do
+	[ -d "$dir" ] || continue
+	dir=${dir%/}
+	user=${dir##*/}
+	record="$dir/account"
+
+	entry=$(getent passwd "$user")
+	lookup=$?
+	if [ "$lookup" -ne 0 ] && [ "$lookup" -ne 2 ]; then
+		echo "Keeping the prints of $user: looking up the account failed ($lookup)" >&2
+		continue
+	fi
+	current=
+	[ "$lookup" -eq 0 ] && current=$(printf '%s\n' "$entry" | cut -d: -f3)
+
+	if [ -f "$record" ]; then
+		recorded=$(sed -n 's/^UID=//p' "$record" | head -n 1)
+		[ -n "$current" ] && [ "$current" = "$recorded" ] && continue
+	else
+		# Prints from before records existed: the account that holds the
+		# name now adopts them, so only a vanished account loses them.
+		[ -n "$current" ] && continue
+	fi
+
+	if fprintd-delete "$user" >/dev/null 2>&1; then
+		rm -f "$record"
+		rmdir "$dir" 2>/dev/null || :
+		echo "Deleted the fingerprints that the removed account $user left"
+	elif invalidate "$dir"; then
+		echo "Could not delete the fingerprints that the removed account $user left; they no longer verify" >&2
+		status=1
+	else
+		echo "Could not delete or invalidate the fingerprints of the removed account $user" >&2
+		status=1
+	fi
+done
+
+exit "$status"

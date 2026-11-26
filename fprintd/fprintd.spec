@@ -1,6 +1,6 @@
 Name:		fprintd
 Version:	1.94.5
-Release:	99%{?dist}.aurora4
+Release:	99%{?dist}.aurora5
 Summary:	D-Bus service for Fingerprint reader access
 
 # man page is GFDL-1.1-or-later
@@ -10,7 +10,14 @@ Patch0:	0001-preserve-print-on-device-delete-failure.patch
 Patch1:	0002-report-lockout-and-fall-back-to-the-password.patch
 Patch2:	0003-say-why-the-reader-needs-the-password.patch
 Patch3:	0004-dont-ask-for-a-finger-the-reader-will-not-take.patch
+Patch4:	0005-bind-touch-id-prints-to-the-account-they-were-enrolled-for.patch
 Source1:	test_account_gate.py
+Source2:	aurora-touchid-accounts
+Source3:	aurora-touchid-accounts.service
+Source4:	aurora-touchid-accounts.path
+Source5:	90-aurora-touchid-accounts.preset
+Source6:	test_account_binding.py
+Source7:	test_touchid_accounts.sh
 Url:		http://www.freedesktop.org/wiki/Software/fprint/fprintd
 
 BuildRequires:	meson
@@ -28,6 +35,9 @@ BuildRequires:	pkgconfig(systemd)
 BuildRequires:	python3
 BuildRequires:	python3-dbusmock
 BuildRequires:	python3-libpamtest
+BuildRequires:	systemd-rpm-macros
+# test_account_binding.py compiles account_binding.c against GLib
+BuildRequires:	pkgconfig(glib-2.0)
 Provides:	fprintd(aurora-sep) = 1
 Requires:	libfprint(aurora-sep) >= 5
 Requires:	libfprint(aurora-sep-lockout)
@@ -95,11 +105,35 @@ fi
 %install
 %meson_install
 mkdir -p $RPM_BUILD_ROOT/%{_localstatedir}/lib/fprint
+install -Dm755 %{SOURCE2} $RPM_BUILD_ROOT%{_libexecdir}/aurora-touchid-accounts
+install -Dm644 %{SOURCE3} $RPM_BUILD_ROOT%{_unitdir}/aurora-touchid-accounts.service
+install -Dm644 %{SOURCE4} $RPM_BUILD_ROOT%{_unitdir}/aurora-touchid-accounts.path
+install -Dm644 %{SOURCE5} $RPM_BUILD_ROOT%{_presetdir}/90-aurora-touchid-accounts.preset
 
 %find_lang %{name}
 
 %check
 python3 %{SOURCE1} src/device.c
+python3 %{SOURCE6} src/account_binding.c
+sh %{SOURCE7} %{SOURCE2}
+
+%post
+%systemd_post aurora-touchid-accounts.path aurora-touchid-accounts.service
+# Not opt in: removing an account must remove its fingerprints. So an upgrade
+# from a release without the units enables them as well, and the watch starts
+# at once rather than at the next boot.
+if [ -d /run/systemd/system ]; then
+  if [ $1 -gt 1 ]; then
+    systemctl --no-reload preset aurora-touchid-accounts.path aurora-touchid-accounts.service >/dev/null 2>&1 || :
+  fi
+  systemctl start aurora-touchid-accounts.path >/dev/null 2>&1 || :
+fi
+
+%preun
+%systemd_preun aurora-touchid-accounts.path aurora-touchid-accounts.service
+
+%postun
+%systemd_postun aurora-touchid-accounts.path aurora-touchid-accounts.service
 
 %postun pam
 if [ $1 -eq 0 ]; then
@@ -115,6 +149,10 @@ fi
 %{_datadir}/dbus-1/system.d/net.reactivated.Fprint.conf
 %{_datadir}/dbus-1/system-services/net.reactivated.Fprint.service
 %{_unitdir}/fprintd.service
+%{_libexecdir}/aurora-touchid-accounts
+%{_unitdir}/aurora-touchid-accounts.service
+%{_unitdir}/aurora-touchid-accounts.path
+%{_presetdir}/90-aurora-touchid-accounts.preset
 %{_datadir}/polkit-1/actions/net.reactivated.fprint.device.policy
 %attr(0700, -, -) %{_localstatedir}/lib/fprint
 %{_mandir}/man1/fprintd.1.gz
@@ -130,6 +168,12 @@ fi
 %{_datadir}/dbus-1/interfaces/net.reactivated.Fprint.Manager.xml
 
 %changelog
+* Thu Nov 26 2026 Dj <43033058+DjDeveloperr@users.noreply.github.com> - 1.94.5-99.aurora5
+- Bind Touch ID prints to the account they were enrolled for (uid and an
+  instance GUID), so an account created later with the same username does
+  not get them, and delete the fingerprints of removed accounts whenever
+  /etc/passwd changes and at boot.
+
 * Tue Nov 10 2026 Ryan Murray <ryan@aurorasilicon.org> - 1.94.5-99.aurora4
 - Don't emit VerifyFingerSelected while the reader needs the password, so
   pam_fprintd and GNOME don't ask for a finger before "Your password is

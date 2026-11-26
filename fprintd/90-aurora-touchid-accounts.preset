@@ -1,0 +1,5 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Removing an account must also remove its fingerprints: the next account
+# with that name would otherwise find them. Not opt in.
+enable aurora-touchid-accounts.path
+enable aurora-touchid-accounts.service

@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+[Unit]
+Description=Delete the fingerprints of removed accounts
+Documentation=file:///usr/libexec/aurora-touchid-accounts
+# fprintd keeps a removed account's prints under its username, where an
+# account created later with the same name would find them. Started by
+# aurora-touchid-accounts.path whenever /etc/passwd changes, and at boot.
+After=dbus.service
+ConditionDirectoryNotEmpty=/var/lib/fprint
+CollectMode=inactive-or-failed
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/aurora-touchid-accounts
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/fprint
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
