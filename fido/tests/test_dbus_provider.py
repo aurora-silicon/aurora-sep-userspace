@@ -21,6 +21,7 @@ try:
     from jeepney import DBusAddress, MessageType, new_method_call
     from jeepney.bus_messages import message_bus
     from jeepney.io.blocking import open_dbus_connection
+    from jeepney.io import threading as jthreading
     from aurora_fido import dbus_provider as dp
     HAVE = bool(os.environ.get("DBUS_SESSION_BUS_ADDRESS"))
 except ImportError:
@@ -56,13 +57,16 @@ class DbusProviderTest(unittest.TestCase):
         self.assertTrue(self.svc.request_name())
         self.t = threading.Thread(target=self.svc.serve_forever, daemon=True)
         self.t.start()
-        self.client = open_dbus_connection(bus="SESSION", enable_fds=True)
+        # A request and its Cancel come from one connection, in two threads.
+        self.client_conn = jthreading.open_dbus_connection(bus="SESSION", enable_fds=True)
+        self.client = jthreading.DBusRouter(self.client_conn)
         if own_portal:
             self.client.send_and_get_reply(message_bus.RequestName(PORTAL, 4))
         self.addr = DBusAddress(dp.PATH, bus_name=dp.BUS_NAME, interface=dp.IFACE)
 
     def tearDown(self):
         self.client.close()
+        self.client_conn.close()
         self.svc.close()
         self.t.join(2)
         self.tmp.cleanup()
