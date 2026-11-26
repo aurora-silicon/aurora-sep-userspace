@@ -76,7 +76,10 @@ The enclave holds three fingerprints for all accounts together.
 lets an account enrol one itself. Another one needs
 `net.reactivated.fprint.device.enroll-additional`, which defaults to
 administrator authentication, so no account can fill the reader for the
-others. `fprintd/test_account_binding.py` and `fprintd/test_touchid_accounts.sh`
+others. fprintd asks for it in its per-call authorization thread, so an open
+prompt holds up no other caller; `FPrintdVirtualStorageSharedSlotsTests` (run
+in CI against a build with the virtual storage reader as the shared one) shows
+the reader still verifies meanwhile. `fprintd/test_account_binding.py` and `fprintd/test_touchid_accounts.sh`
 test the record and the cleanup without a device.
 The spec is based on [Fedora's f45 fprintd spec](https://src.fedoraproject.org/rpms/fprintd/blob/f45/f/fprintd.spec);
 the patch targets [fprintd v1.94.5](https://gitlab.freedesktop.org/libfprint/fprintd/-/tags/v1.94.5).

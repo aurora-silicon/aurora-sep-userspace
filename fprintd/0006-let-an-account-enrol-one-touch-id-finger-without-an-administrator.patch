@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: Dj <43033058+DjDeveloperr@users.noreply.github.com>
-Date: Thu, 26 Nov 2026 02:33:30 -0500
-Subject: [PATCH] fprintd: let an account enrol one Touch ID finger without
- an administrator
+From: DjDeveloperr <hey@djdev.me>
+Date: Thu, 26 Nov 2026 04:50:09 -0500
+Subject: [PATCH] fprintd: let an account enrol one Touch ID finger without an
+ administrator
 
 Touch ID keeps the fingerprints of all accounts on a Mac in one enclave
 context, which holds three. Any active user could enrol three of their own
@@ -16,11 +16,22 @@ the others unless an administrator allows it. Prints that an earlier
 account of the same name left behind don't count towards the account's
 share.
 
-Signed-off-by: Dj <43033058+DjDeveloperr@users.noreply.github.com>
+The administrator is asked in action_authorization_handler(), which GDBus
+runs in a thread per call, like fprintd's other interactive checks, so an
+open prompt holds up no other caller. EnrollStart checks the count again,
+without asking, and refuses unless that authorization was granted.
+
+FPRINTD_SHARED_SLOTS_DRIVER names the reader with shared slots ("apple-sep");
+the new FPrintdVirtualStorageSharedSlotsTests build it as the virtual storage
+reader, and show that a second finger needs the action and that, while its
+prompt is open, the reader still verifies and other clients get answers.
+
+Signed-off-by: DjDeveloperr <hey@djdev.me>
 ---
- data/net.reactivated.fprint.device.policy.in | 10 +++++
- src/device.c                                 | 43 ++++++++++++++++++++
- 2 files changed, 53 insertions(+)
+ data/net.reactivated.fprint.device.policy.in | 10 +++
+ src/device.c                                 | 89 ++++++++++++++++++++
+ tests/fprintd.py                             | 70 +++++++++++++++
+ 3 files changed, 169 insertions(+)
 
 diff --git a/data/net.reactivated.fprint.device.policy.in b/data/net.reactivated.fprint.device.policy.in
 index 609a289..8297100 100644
@@ -44,22 +55,51 @@ index 609a289..8297100 100644
      <description>Select a user to manage fingerprints for</description>
      <message>Privileges are required to manage fingerprints for other users.</message>
 diff --git a/src/device.c b/src/device.c
-index 9e4ae27..3160dbd 100644
+index 9e4ae27..200bc16 100644
 --- a/src/device.c
 +++ b/src/device.c
-@@ -2276,6 +2276,36 @@ aurora_account_resolves (const char *username)
+@@ -63,6 +63,7 @@ static gboolean delete_enrolled_fingers (FprintDevice *rdev,
+                                          GError      **error);
+ 
+ static GQuark quark_auth_user = 0;
++static GQuark quark_enroll_additional = 0;
+ 
+ typedef enum {
+   ACTION_NONE = 0,
+@@ -439,6 +440,7 @@ fprint_device_class_init (FprintDeviceClass *klass)
+     g_signal_lookup ("verify-finger-selected", FPRINT_TYPE_DEVICE);
+ 
+   quark_auth_user = g_quark_from_static_string ("authorized-user");
++  quark_enroll_additional = g_quark_from_static_string ("enroll-additional-authorized");
+ }
+ 
+ static void
+@@ -2276,6 +2278,49 @@ aurora_account_resolves (const char *username)
           found->pw_uid != (uid_t) -1;
  }
  
 +/* Touch ID holds three fingerprints for all the accounts on a Mac together.
 + * An account enrols one itself; each further one needs an administrator, so
-+ * that no account can fill the reader for the others. */
++ * that no account can fill the reader for the others. The tests name a
++ * virtual storage reader here instead, to exercise the same paths. */
++#ifndef FPRINTD_SHARED_SLOTS_DRIVER
++#define FPRINTD_SHARED_SLOTS_DRIVER "apple-sep"
++#endif
 +#define AURORA_SELF_ENROLLED_FINGERS 1
 +#define AURORA_ENROLL_ADDITIONAL_ACTION "net.reactivated.fprint.device.enroll-additional"
 +
 +/* The fingers other than `finger` that the account has enrolled on the
 + * device. Prints an earlier account of the same name left behind don't
-+ * count: the enrolment deletes or ignores them. */
++ * count: the enrolment deletes or ignores them. Called from the method
++ * handler and from the authorization thread; both only read storage. */
++static gboolean
++has_shared_slots (FprintDevice *rdev)
++{
++  FprintDevicePrivate *priv = fprint_device_get_instance_private (rdev);
++
++  return g_strcmp0 (fp_device_get_driver (priv->dev), FPRINTD_SHARED_SLOTS_DRIVER) == 0;
++}
++
 +static guint
 +aurora_enrolled_fingers (FprintDevice *rdev,
 +                         const char   *username,
@@ -84,23 +124,142 @@ index 9e4ae27..3160dbd 100644
  static gboolean
  fprint_device_enroll_start (FprintDBusDevice      *dbus_dev,
                              GDBusMethodInvocation *invocation,
-@@ -2317,6 +2347,19 @@ fprint_device_enroll_start (FprintDBusDevice      *dbus_dev,
-           g_dbus_method_invocation_return_gerror (invocation, error);
+@@ -2318,6 +2363,22 @@ fprint_device_enroll_start (FprintDBusDevice      *dbus_dev,
            return TRUE;
          }
-+
-+      if (aurora_enrolled_fingers (rdev, session->username, finger) >= AURORA_SELF_ENROLLED_FINGERS &&
-+          !_fprint_device_check_polkit_for_action (rdev, invocation,
-+                                                   AURORA_ENROLL_ADDITIONAL_ACTION,
-+                                                   &error))
-+        {
-+          g_prefix_error (&error,
-+                          "Touch ID holds three fingerprints for all accounts on this Mac; "
-+                          "an administrator must allow more than %d for one account: ",
-+                          AURORA_SELF_ENROLLED_FINGERS);
-+          g_dbus_method_invocation_return_gerror (invocation, error);
-+          return TRUE;
-+        }
      }
++
++  /* The administrator was asked, without blocking other callers, in
++   * action_authorization_handler(). Check again here, without asking: the
++   * account may have enrolled another finger since. */
++  if (has_shared_slots (rdev) &&
++      aurora_enrolled_fingers (rdev, session->username, finger) >= AURORA_SELF_ENROLLED_FINGERS &&
++      !g_object_get_qdata (G_OBJECT (invocation), quark_enroll_additional))
++    {
++      g_set_error (&error, FPRINT_ERROR, FPRINT_ERROR_PERMISSION_DENIED,
++                   "Touch ID holds three fingerprints for all accounts on this Mac; "
++                   "an administrator must allow more than %d for one account: "
++                   "Not Authorized: %s",
++                   AURORA_SELF_ENROLLED_FINGERS, AURORA_ENROLL_ADDITIONAL_ACTION);
++      g_dbus_method_invocation_return_gerror (invocation, error);
++      return TRUE;
++    }
    store.print_data_load (priv->dev, finger,
                           session->username, &existing_print);
+ 
+@@ -2879,6 +2940,34 @@ action_authorization_handler (GDBusInterfaceSkeleton *interface,
+                                                    &error))
+     return handle_unauthorized_access (rdev, invocation, error);
+ 
++  /* Likewise for an account's further fingers on a reader whose slots all
++   * accounts share: the administrator prompt must not hold up other calls. */
++  if (g_str_equal (method_name, "EnrollStart") && has_shared_slots (rdev))
++    {
++      g_autoptr(SessionData) session = session_data_get (priv);
++      const char *finger_name = NULL;
++      FpFinger finger;
++
++      g_variant_get (g_dbus_method_invocation_get_parameters (invocation), "(&s)", &finger_name);
++      finger = finger_name_to_fp_finger (finger_name);
++
++      if (session && session->username && finger != FP_FINGER_UNKNOWN &&
++          aurora_enrolled_fingers (rdev, session->username, finger) >= AURORA_SELF_ENROLLED_FINGERS)
++        {
++          if (!_fprint_device_check_polkit_for_action (rdev, invocation,
++                                                       AURORA_ENROLL_ADDITIONAL_ACTION,
++                                                       &error))
++            {
++              g_prefix_error (&error,
++                              "Touch ID holds three fingerprints for all accounts on this Mac; "
++                              "an administrator must allow more than %d for one account: ",
++                              AURORA_SELF_ENROLLED_FINGERS);
++              return handle_unauthorized_access (rdev, invocation, error);
++            }
++          g_object_set_qdata (G_OBJECT (invocation), quark_enroll_additional, GINT_TO_POINTER (TRUE));
++        }
++    }
++
+   g_debug ("Authorization granted to %s to call method '%s' for device '%s'!",
+            g_dbus_method_invocation_get_sender (invocation),
+            g_dbus_method_invocation_get_method_name (invocation),
+diff --git a/tests/fprintd.py b/tests/fprintd.py
+index f72205d..574746a 100644
+--- a/tests/fprintd.py
++++ b/tests/fprintd.py
+@@ -3535,6 +3535,76 @@ def list_tests():
+     import unittest_inspector
+     return unittest_inspector.list_tests(sys.modules[__name__])
+ 
++class FPrintdVirtualStorageSharedSlotsTests(FPrintdVirtualStorageDeviceBaseTest):
++    '''An account's further fingers on a reader whose slots all accounts share
++    need an administrator, and asking one must not hold up other callers.
++
++    The shared-slots reader is Touch ID; these tests need an fprintd built with
++    FPRINTD_SHARED_SLOTS_DRIVER="virtual_device_storage" and run only with
++    FPRINTD_SHARED_SLOTS_TESTS=1.'''
++
++    enroll_additional = FPRINT_NAMESPACE.lower() + '.device.enroll-additional'
++    allowed = [FprintDevicePermission.set_username,
++               FprintDevicePermission.enroll,
++               FprintDevicePermission.verify]
++
++    def setUp(self):
++        if os.environ.get('FPRINTD_SHARED_SLOTS_TESTS') != '1':
++            self.skipTest('needs fprintd built with the virtual storage reader as shared-slots reader')
++        super().setUp()
++        self._polkitd_obj.SetAllowed(self.allowed)
++        self.device.Claim('(s)', 'testuser')
++        self.enroll_print('whorl', finger='left-thumb')
++
++    def tearDown(self):
++        self._polkitd_obj.SimulateHangActions([''])
++        self._polkitd_obj.ReleaseHangingCalls()
++        self.try_release()
++        super().tearDown()
++
++    def test_first_finger_needs_no_administrator(self):
++        self.assertEqual(self.device.ListEnrolledFingers('(s)', 'testuser'), ['left-thumb'])
++
++    def test_second_finger_needs_an_administrator(self):
++        with self.assertFprintError('PermissionDenied'):
++            self.device.EnrollStart('(s)', 'right-thumb')
++        self.assertEqual(self.device.ListEnrolledFingers('(s)', 'testuser'), ['left-thumb'])
++
++        self._polkitd_obj.SetAllowed(self.allowed + [self.enroll_additional])
++        self.enroll_print('arch', finger='right-thumb')
++        self.assertEqual(set(self.device.ListEnrolledFingers('(s)', 'testuser')),
++                         {'left-thumb', 'right-thumb'})
++
++    def test_pending_administrator_prompt_blocks_no_other_caller(self):
++        self._polkitd_obj.SimulateHangActions([self.enroll_additional])
++        self.call_device_method_async('EnrollStart', '(s)', ['right-thumb'])
++        while not self._polkitd_obj.HaveHangingCalls():
++            ctx.iteration(False)
++
++        # While the administrator prompt is open, fprintd answers other callers.
++        # Another client is told the reader is in use, at once.
++        gdbus = self.gdbus_device_method_call_process('Claim', ['testuser'])
++        self.addCleanup(gdbus.kill)
++        gdbus.wait(timeout=10)
++        with self.assertFprintError('AlreadyInUse'):
++            raise GLib.GError(gdbus.stdout.read())
++        self.assertEqual(self.device.ListEnrolledFingers('(s)', 'testuser'), ['left-thumb'])
++
++        # And the reader still verifies.
++        self.device.VerifyStart('(s)', 'left-thumb')
++        self.send_image('whorl')
++        self.wait_for_result()
++        self.assertTrue(self._verify_stopped)
++        self.assertEqual(self._last_result, 'verify-match')
++        self.device.VerifyStop()
++
++        # Nobody answers the prompt: the enrolment is refused.
++        self._polkitd_obj.ReleaseHangingCalls()
++        with self.assertFprintError('PermissionDenied'):
++            self.wait_for_device_reply(method='EnrollStart')
++        self.assertEqual(self.device.ListEnrolledFingers('(s)', 'testuser'), ['left-thumb'])
++
++
+ if __name__ == '__main__':
+     if len(sys.argv) == 2 and sys.argv[1] == "list-tests":
+         for machine, human in list_tests():

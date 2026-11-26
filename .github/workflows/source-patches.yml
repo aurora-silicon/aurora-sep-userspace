@@ -211,6 +211,11 @@ jobs:
           PKG_CONFIG_PATH=/usr/local/lib64/pkgconfig meson setup build -Dpam=true -Dman=false -Dsystemd=false -Dgtk_doc=false
           meson compile -C build
           python3 ../fprintd/test_account_binding.py src/account_binding.c
+          # The same fprintd with the virtual storage reader as the reader whose
+          # slots all accounts share, for FPrintdVirtualStorageSharedSlotsTests.
+          CFLAGS='-DFPRINTD_SHARED_SLOTS_DRIVER=\"virtual_device_storage\"' PKG_CONFIG_PATH=/usr/local/lib64/pkgconfig \
+            meson setup build-shared -Dpam=false -Dman=false -Dsystemd=false -Dgtk_doc=false
+          meson compile -C build-shared
       - name: Run failed-delete fprintd regression cases
         env:
           GI_TYPELIB_PATH: /usr/local/lib64/girepository-1.0
@@ -246,6 +251,14 @@ jobs:
             FPrintdVirtualNoStorageDevicePasswordRequiredTests.test_identify_password_required_after_boot_asks_no_finger \
             FPrintdVirtualNoStorageDevicePasswordRequiredTests.test_verify_after_password_asks_for_finger
           meson test -C build --print-errorlogs --suite test_pam_fprintd
+      - name: Run the Touch ID per-account share cases
+        env:
+          GI_TYPELIB_PATH: /usr/local/lib64/girepository-1.0
+          LD_LIBRARY_PATH: /usr/local/lib64
+        run: |
+          cd fprintd-v1.94.5
+          export FPRINT_BUILD_DIR="$PWD/build-shared/src" TOPSRCDIR="$PWD" FPRINTD_SHARED_SLOTS_TESTS=1
+          python3 tests/fprintd.py FPrintdVirtualStorageSharedSlotsTests
 
   touchid-rearm:
     runs-on: ubuntu-latest
