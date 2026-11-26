@@ -21,7 +21,7 @@ import sys
 import threading
 import time
 
-from . import __version__, creds, ctap2, ctaphid, enclave, paths, touchid, u2f
+from . import __version__, creds, ctap2, ctaphid, enclave, owners, paths, touchid, u2f
 from .backend import BackendError, open_backend
 
 log = logging.getLogger("aurora-fido")
@@ -34,8 +34,9 @@ DEFAULTS = {
     "touchid": {"user": "auto", "timeout": "30", "max_tries": "3", "notify": "yes",
                 "policy": "auto"},
     "authenticator": {"attestation": "self", "max_resident": "256", "u2f": "yes",
-                      # system: credentials in STATE_DIR (0.2). user: each request goes to
-                      # the passkey agent (aurora-passkeyd) of seat0's active user.
+                      # system: credentials in STATE_DIR, each kept for the account that
+                      # made it (owners.py). user: each request goes to the passkey agent
+                      # (aurora-passkeyd) of seat0's active user.
                       "vault": "system"},
     "keys": {"store": "auto"},
 }
@@ -94,7 +95,8 @@ def resolve_policy(cfg, flags_supported):
     """(policy, note): the credential policy the enclave can enforce here.
 
     "auto" (the default) is touchid-or-password, macOS's default, when the
-    kernel can have the enclave check the user's password, else touchid-any.
+    kernel can have the enclave check the user's password, else touchid-current
+    (a finger enrolled later does not approve the credential), else touchid-any.
     A policy named in the config that the enclave cannot enforce is an error,
     never a weaker policy.
     """
@@ -102,6 +104,12 @@ def resolve_policy(cfg, flags_supported):
     if name == "auto":
         if flags_supported & creds.POLICY_FLAGS[creds.POLICY_TOUCHID_OR_PASSWORD]:
             return creds.POLICY_TOUCHID_OR_PASSWORD, None
+        if flags_supported & creds.POLICY_FLAGS[creds.POLICY_TOUCHID_CURRENT]:
+            return creds.POLICY_TOUCHID_CURRENT, (
+                "Touch ID only, the fingers enrolled when a credential is made: this "
+                "kernel's Secure Enclave interface cannot check your password, so there is "
+                "no password fallback, and adding or removing a finger retires the "
+                "credentials made before")
         return creds.POLICY_TOUCHID_ANY, (
             "Touch ID only: this kernel's Secure Enclave interface cannot check your "
             "password, so there is no password fallback (touchid-or-password needs it)")
@@ -156,8 +164,10 @@ def legacy_resident(vault, store, backend):
     return n
 
 
-def build(cfg, state_dir, backend, user, secret, policy, on_legacy=lambda rp, why: None):
-    """Wire the authenticator; secret has load() and new()."""
+def build(cfg, state_dir, backend, user, secret, policy, on_legacy=lambda rp, why: None,
+          owners=None):
+    """Wire the authenticator; secret has load() and new(); owners: owners.Owners
+    for the system vault (credentials kept apart per account), None for one user."""
     os.makedirs(state_dir, mode=0o700, exist_ok=True)
     max_rk = cfg.getint("authenticator", "max_resident")
 
@@ -169,7 +179,8 @@ def build(cfg, state_dir, backend, user, secret, policy, on_legacy=lambda rp, wh
     auth = ctap2.Authenticator(
         backend, user, vault, store, creds.Counter(state_dir),
         attestation=cfg.get("authenticator", "attestation"),
-        new_vault=lambda: fresh(secret.new()), policy=policy, on_legacy=on_legacy)
+        new_vault=lambda: fresh(secret.new()), policy=policy, on_legacy=on_legacy,
+        owners=owners)
     u = u2f.U2F(auth) if cfg.getboolean("authenticator", "u2f") else None
     return auth, u
 
@@ -207,10 +218,68 @@ def key_store_info(backend):
                     else "not offered: the enclave's wrong-password count does not survive a restart yet")}
 
 
-def serve(auth, u, device_factory, run_dir=None, info=None):
-    dev = device_factory()
-    hid = ctaphid.CtapHid(dev, auth, u)
+def owners_info(own):
+    """For status.json: whose the credentials made before owners were recorded are."""
+    name = None
+    if own.legacy is not None:
+        try:
+            import pwd
+            name = pwd.getpwuid(own.legacy).pw_name
+        except KeyError:
+            name = str(own.legacy)
+    return {"per_account": True, "legacy_store": own.legacy_store,
+            "legacy_owner": name, "legacy_unassigned": own.legacy_unassigned}
+
+
+def watch_seat(monitor, seat, woke, user_is):
+    """After each change of logind's seat state call woke() at once, then
+    user_is(uid) with the seat's user as looked up after it (also when it
+    reads the same as before: the seat may have been another user's in
+    between). woke() comes first because the lookup takes a while."""
+    while True:
+        monitor.wait()
+        woke()
+        try:
+            uid = seat()
+        except Exception as e:      # the node is made again all the same
+            log.warning("cannot look up the seat's user: %s", e)
+            uid = None
+        user_is(uid)
+
+
+def serve(auth, u, device_factory, run_dir=None, info=None, seat=None,
+          seat_monitor=None):
+    """seat: () -> uid of seat0's active user or None, when requests are for
+    that user: the device node is made again after each change of the seat
+    (ctaphid.py), which seat_monitor() (default: logind's) reports. Without
+    that watch the daemon does not serve: a seat that went to another user
+    and back is not visible at request time. Returns the exit status."""
     stop = threading.Event()
+    failed = []
+    if seat is not None:
+        try:
+            # Before the seat is read and the node made, so that no change
+            # between the two goes unseen.
+            monitor = (seat_monitor or touchid.SeatMonitor)()
+        except OSError as e:
+            log.error("cannot watch logind for changes of the seat's user (%s): not "
+                      "serving, as a node made for one user could stay open to another", e)
+            return 1
+    dev = device_factory()
+    if seat is None:
+        hid = ctaphid.CtapHid(dev, auth, u)
+    else:
+        hid = ctaphid.CtapHid(dev, auth, u, reopen=device_factory, user=seat())
+        auth.for_user = hid.for_user
+
+        def watch():
+            try:
+                watch_seat(monitor, seat, hid.seat_woke, hid.seat_is)
+            except Exception:
+                log.exception("the watch of the seat's user ended: stopping")
+                failed.append(True)
+                stop.set()
+        threading.Thread(target=watch, name="seat-watch", daemon=True).start()
     for s in (signal.SIGTERM, signal.SIGINT):
         signal.signal(s, lambda *_: stop.set())
     log.info("security key ready (keys: %s, Touch ID checked by the Secure Enclave)",
@@ -221,13 +290,14 @@ def serve(auth, u, device_factory, run_dir=None, info=None):
     finally:
         if u:
             u.presence.stop()
-        dev.close()
+        hid.dev.close()
         if run_dir:
             try:
                 os.unlink(os.path.join(run_dir, "status.json"))
             except OSError:
                 pass
         log.info("security key removed")
+    return 1 if failed else 0
 
 
 def serve_per_user(run_dir):
@@ -238,8 +308,9 @@ def serve_per_user(run_dir):
               "enforcement": "enclave", "u2f": False,
               "keys_detail": "each user's passkey agent (aurora-passkeyd) keeps that user's "
                              "credentials; requests go to seat0's active user"}
-    serve(RemoteAuthenticator(), None, lambda: UhidDevice(name=DEVICE_NAME), run_dir, status)
-    return 0
+    auth = RemoteAuthenticator()
+    return serve(auth, None, lambda: UhidDevice(name=DEVICE_NAME), run_dir, status,
+                 seat=auth.active_uid)
 
 
 POLICY_TEXT = {
@@ -285,9 +356,12 @@ def main(argv=None):
         a.run_dir, dict(status, legacy_refused_rps=n)))
     try:
         os.makedirs(a.state_dir, mode=0o700, exist_ok=True)
+        # Before the master secret is first made: a store without owners.json
+        # but with a master secret was made by an older version.
+        own = owners.Owners(a.state_dir)
         user = enclave_user(cfg, backend, a.state_dir, policy)
         auth, u = build(cfg, a.state_dir, backend, user,
-                        SealedSecret(a.state_dir, a.seal_helper), policy, legacy)
+                        SealedSecret(a.state_dir, a.seal_helper), policy, legacy, own)
     except (RuntimeError, OSError, subprocess.SubprocessError) as e:
         log.error("cannot open the sealed master secret: %s", e)
         return 1
@@ -297,13 +371,18 @@ def main(argv=None):
                   touchid_user=cfg.get("touchid", "user"), u2f=u is not None,
                   policy=pol, policy_detail=POLICY_TEXT[pol] + " (enforced by the Secure Enclave)",
                   policy_note=note, legacy_resident=legacy_resident(auth.vault, auth.store, backend),
-                  legacy_refused_rps=len(legacy.seen))
+                  legacy_refused_rps=len(legacy.seen), vault="system",
+                  owners=owners_info(own))
+    if own.legacy_unassigned:
+        log.warning("credentials made before aurora-fido recorded their owner are refused "
+                    "until root names their account (not exactly one account has prints in "
+                    "%s): sudo aurora-fido adopt-legacy USER", owners.FPRINT_DIR)
     if status["legacy_resident"] or legacy.seen:
         log.warning("credentials made before the Secure Enclave checked Touch ID are refused "
                     "(%d stored passkeys, %d sites seen); register them again",
                     status["legacy_resident"], len(legacy.seen))
-    serve(auth, u, lambda: UhidDevice(name=DEVICE_NAME), a.run_dir, status)
-    return 0
+    return serve(auth, u, lambda: UhidDevice(name=DEVICE_NAME), a.run_dir, status,
+                 seat=own.current)
 
 
 if __name__ == "__main__":

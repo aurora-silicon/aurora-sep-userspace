@@ -144,6 +144,20 @@ class AgentTest(unittest.TestCase):
         self.assertEqual(st, E.ERR_NO_CREDENTIALS)
         self.assertEqual(b.backend.signs, 0)
 
+    def test_a_request_on_a_node_made_for_another_seat_user(self):
+        a = self.agent("u")
+        f = Fidod({UID: a.path})
+        f.active = UID
+        seen = []
+        f.auth.for_user = lambda uid: seen.append(uid) or False      # ctaphid: stale node
+        creates = a.backend.creates
+        self.assertEqual(f.make()[0], E.ERR_OPERATION_DENIED)
+        self.assertEqual(a.backend.creates, creates)                # the agent was not asked
+        self.assertEqual(f.call(ctap2.CMD_GET_INFO)[0], 0)
+        self.assertEqual(seen, [UID, UID])
+        f.auth.for_user = lambda uid: True
+        self.assertEqual(f.make()[0], 0)
+
     def test_no_active_user(self):
         a = self.agent("u")
         f = Fidod({UID: a.path})

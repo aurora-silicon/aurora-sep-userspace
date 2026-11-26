@@ -1,0 +1,24 @@
+// SPDX-License-Identifier: MIT
+// Enrolling or deleting a fingerprint (fprintd's net.reactivated.fprint.device.enroll)
+// needs authentication by the account (auth_self) every time, not only once
+// in a while. What counts is up to the polkit-1 PAM stack: the user's
+// password, or a fingerprint of that user where pam_fprintd is part of it.
+//
+// On these Macs every Linux enrolment lands in one Secure Enclave user, so a
+// new finger can approve whatever an existing finger approves (touchid-any
+// keys, the Touch ID security key's presence checks). fprintd's own default
+// for this action is auth_self_keep, which skips the authentication for a
+// few minutes after an earlier one for it.
+//
+// fprintd passes no polkit details (no device or driver name), so the rule
+// cannot be limited to the apple-sep reader; it covers this action on this
+// machine, whether or not the Touch ID security key is enabled. Sessions
+// that are not local and active keep fprintd's "no". Root (sudo
+// fprintd-enroll) is left to the defaults.
+polkit.addRule(function(action, subject) {
+    if (action.id != "net.reactivated.fprint.device.enroll" || subject.user == "root")
+        return polkit.Result.NOT_HANDLED;
+    if (!subject.local || !subject.active)
+        return polkit.Result.NO;
+    return polkit.Result.AUTH_SELF;
+});

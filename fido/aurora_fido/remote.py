@@ -42,6 +42,9 @@ class RemoteAuthenticator:
         self.socket_path = socket_path
         self.timeout = timeout
         self._info = {}                 # uid -> last getInfo reply (per user: it counts their passkeys)
+        # (uid) -> bool, from the transport: False when the request came in on a
+        # device node made for another seat user (ctaphid.CtapHid.for_user).
+        self.for_user = None
         self.lock = threading.Lock()
 
     @staticmethod
@@ -67,6 +70,9 @@ class RemoteAuthenticator:
         ctx = ctx or ctap2.Ctx()
         is_info = data[:1] == bytes([ctap2.CMD_GET_INFO])
         uid = self.active_uid()
+        if self.for_user is not None and not self.for_user(uid):
+            log.info("request on a device node made for another seat user: refused")
+            return self._fallback(is_info, None)
         if uid is None:
             log.info("no active local session on seat0: request refused")
             return self._fallback(is_info, None)

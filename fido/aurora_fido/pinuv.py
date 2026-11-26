@@ -142,8 +142,9 @@ class Token:
         self.user_verified = False
         self.user_present = False
         self.started = 0.0
+        self.owner = None           # uid it was issued for (system vault), or None
 
-    def begin(self, permissions, rp_id, verified=True):
+    def begin(self, permissions, rp_id, verified=True, owner=None):
         """verified=False: a token for makeCredential/getAssertion only; the
         enclave's touch at each signature is the user verification."""
         self.reset()
@@ -153,6 +154,7 @@ class Token:
         self.user_verified = verified
         self.user_present = verified
         self.started = self.clock()
+        self.owner = owner
 
     def expired(self):
         if not self.in_use:
@@ -164,12 +166,13 @@ class Token:
             self.user_present = False
         return False
 
-    def check(self, protocol, msg, param, permission, rp_id=None):
+    def check(self, protocol, msg, param, permission, rp_id=None, owner=None):
         """True when param authenticates msg with this token for permission.
 
-        Binds the token to rp_id on first use if it is not bound yet.
+        Binds the token to rp_id on first use if it is not bound yet. A token
+        issued for another account (owner) never verifies.
         """
-        if self.expired() or not protocol.verify(self.value, msg, param):
+        if self.expired() or self.owner != owner or not protocol.verify(self.value, msg, param):
             return False
         if not self.permissions & permission:
             return None

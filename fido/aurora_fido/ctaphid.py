@@ -6,6 +6,11 @@ keeps going: CANCEL on the busy channel cancels it, INIT on that channel
 abandons it, and any other request gets CHANNEL_BUSY. The worker's peer
 thread sends KEEPALIVE every 100 ms (PROCESSING, or UPNEEDED while Touch ID
 is asked for).
+
+The device node is made for one seat user (udev's `uaccess` gives the hidraw
+node to the user of the active session). When the seat's user changes, the
+device is removed and made again: handles opened under the user before end
+with the old node, and the new node gets the new user's ACL.
 """
 
 import logging
@@ -77,8 +82,18 @@ class _Txn:
 
 
 class CtapHid:
-    def __init__(self, device, authenticator, u2f=None, clock=time.monotonic):
+    def __init__(self, device, authenticator, u2f=None, clock=time.monotonic,
+                 reopen=None, user=None):
         self.dev = device
+        # reopen() makes the device again for a new seat user (None: the device
+        # is not tied to the seat). want_user is the seat's user as last
+        # reported. seat_gen counts the seat changes seen (each logind event,
+        # each uid change), dev_gen is seat_gen when the present node was made:
+        # a node made before the last change is replaced even when the uid is
+        # the same again (A -> B -> A between two looks at the seat).
+        self.reopen = reopen
+        self.want_user = user
+        self.seat_gen = self.dev_gen = 0
         self.auth = authenticator
         self.u2f = u2f
         self.clock = clock
@@ -104,14 +119,77 @@ class CtapHid:
 
     def run(self, stop):
         while not stop.is_set():
-            report = self.dev.poll(0.1)
-            if self.asm and self.clock() - self.asm.t > ASSEMBLY_TIMEOUT:
-                self.error(self.asm.cid, ERR_TIMEOUT)
-                self.asm = None
-            if report is not None:
-                self.packet(report)
+            self.step(self.dev.poll(0.1))
         if self.txn:
             self.txn.cancel.set()
+
+    def step(self, report):
+        """One turn of the reader: report is what the device had (or None)."""
+        if self._stale():
+            self._replace()         # report came in on the old node: not handled
+            return
+        if self.asm and self.clock() - self.asm.t > ASSEMBLY_TIMEOUT:
+            self.error(self.asm.cid, ERR_TIMEOUT)
+            self.asm = None
+        if report is not None:
+            self.packet(report)
+
+    # -- the seat user the device node is for ---------------------------------------------
+
+    def _stale(self):
+        return self.reopen is not None and self.dev_gen != self.seat_gen
+
+    def _changed_locked(self, uid):
+        self.want_user = uid
+        self.seat_gen += 1
+        if self._busy():
+            self.txn.abandoned = True
+            self.txn.cancel.set()
+
+    def seat_woke(self):
+        """logind's seat state changed (any thread; the watch calls it at the
+        wake, before it looks the seat's user up, which takes a while): the
+        node is stale from now on, whatever the seat's user turns out to be,
+        as the seat may have been another user's in between, who could open
+        this node then. Nothing is read from it any more, and the request
+        running on it is cancelled and gets no answer."""
+        if self.reopen is None:
+            return
+        with self.send_lock:
+            self._changed_locked(self.want_user)
+
+    def seat_is(self, uid):
+        """The watch's lookup after seat_woke(): uid is the seat's user now.
+        No new change (a later one wakes the watch again)."""
+        if self.reopen is None:
+            return
+        with self.send_lock:
+            self.want_user = uid
+
+
+    def for_user(self, uid):
+        """The request being handled is for seat user uid (any thread). A node
+        made for another user, or before a seat change, is replaced on the
+        reader's next turn; until then nothing is read from it, and the request
+        running on it is cancelled and gets no answer. False when the request
+        being handled is such a request."""
+        if self.reopen is None:
+            return True
+        with self.send_lock:
+            if uid != self.want_user:
+                self._changed_locked(uid)
+            return not (self._busy() and self.txn.abandoned)
+
+    def _replace(self):
+        with self.send_lock:
+            gen = self.seat_gen
+            new = self.reopen()
+            old, self.dev = self.dev, new
+            self.dev_gen = gen
+            self.asm = None
+            self.channels = set()
+        old.close()
+        log.info("the seat changed: security key device made again")
 
     def _busy(self):
         return self.txn is not None and not self.txn.finished.is_set()
@@ -215,7 +293,10 @@ class CtapHid:
 
     def _start(self, cid, cmd, work):
         txn = _Txn(cid, cmd)
-        self.txn = txn
+        with self.send_lock:
+            if self._stale():
+                return              # the seat changed since the reader looked
+            self.txn = txn
 
         def worker():
             try:

@@ -12,6 +12,7 @@ import html
 import logging
 import os
 import pwd
+import select
 import subprocess
 
 log = logging.getLogger("aurora-fido")
@@ -89,6 +90,41 @@ def seat_session():
         return sid, p["Name"], int(p["User"])
     except (KeyError, ValueError):
         return None
+
+
+class SeatMonitor:
+    """Wakes when logind's seat state changes (sd_login_monitor(3), "seat":
+    a seat's active session among them). OSError where there is no logind."""
+
+    def __init__(self, category=b"seat"):
+        import ctypes               # only the daemon's seat watch needs it
+        self._null = ctypes.c_void_p
+        self._lib = ctypes.CDLL("libsystemd.so.0")
+        self._lib.sd_login_monitor_unref.restype = ctypes.c_void_p
+        self._lib.sd_login_monitor_unref.argtypes = [ctypes.c_void_p]
+        self._lib.sd_login_monitor_flush.argtypes = [ctypes.c_void_p]
+        self._lib.sd_login_monitor_get_fd.argtypes = [ctypes.c_void_p]
+        self._m = self._null()
+        r = self._lib.sd_login_monitor_new(category, ctypes.byref(self._m))
+        if r < 0:
+            raise OSError(-r, "sd_login_monitor_new: " + os.strerror(-r))
+        self.fd = self._lib.sd_login_monitor_get_fd(self._m)
+        if self.fd < 0:
+            self.close()
+            raise OSError(-self.fd, "sd_login_monitor_get_fd: " + os.strerror(-self.fd))
+
+    def wait(self, timeout=None):
+        """True once something changed (blocks without a timeout)."""
+        r, _, _ = select.select([self.fd], [], [], timeout)
+        if not r:
+            return False
+        self._lib.sd_login_monitor_flush(self._m)
+        return True
+
+    def close(self):
+        if self._m:
+            self._lib.sd_login_monitor_unref(self._m)
+            self._m = self._null()
 
 
 class Notifier:

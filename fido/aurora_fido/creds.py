@@ -15,7 +15,8 @@ Credential ID, version 1 (every credential, resident or not):
   aad = "aurora-fido/cred/1" | kind | rpIdHash
 
   kind 0x00: payload is CBOR {1: key handle, 3: credProtect, 4: policy,
-             7: hmac-secret CredRandom pair sealed to the key by the enclave}
+             7: hmac-secret CredRandom pair sealed to the key by the enclave,
+             8: uid of the Unix account that owns it (system vault; owners.py)}
              (aurora-fido 0.1 also wrote 2: seed[32] and 6: an enrolled-set
              digest; such credentials are legacy and refused)
   kind 0x01: payload is CBOR {5: ref[16]}, and the kind-0 payload lives in
@@ -91,8 +92,9 @@ class Credential:
     """What a credential ID opens to."""
 
     def __init__(self, handle, cred_protect=1, policy=POLICY_TOUCHID_ANY, sealed=None,
-                 legacy=None):
+                 legacy=None, owner=None):
         self.handle = handle
+        self.owner = owner          # uid that made it (system vault), None: not recorded
         self.cred_protect = cred_protect
         self.policy = policy
         self.sealed = sealed        # hmac-secret CredRandom pair, sealed to the key
@@ -124,6 +126,8 @@ class Vault:
         payload = {1: cred.handle, 3: cred.cred_protect, 4: cred.policy}
         if cred.sealed is not None:
             payload[7] = cred.sealed
+        if cred.owner is not None:
+            payload[8] = cred.owner
         cid = self._seal(KIND_INLINE, rp_id_hash, payload)
         if len(cid) <= max_len:
             return cid
@@ -167,12 +171,16 @@ class Vault:
             return None
         if sealed is not None and not isinstance(sealed, bytes):
             return None
+        owner = p.get(8)
+        if owner is not None and (not isinstance(owner, int) or isinstance(owner, bool)
+                                  or owner < 0):
+            return None
         legacy = None
         if 2 in p:
             legacy = "made by aurora-fido 0.1, when the touch was checked outside the enclave"
         elif h[:4] == b"AFSK":
             legacy = "a sealed software key of aurora-fido 0.1"
-        return Credential(h, cp, pol, sealed, legacy)
+        return Credential(h, cp, pol, sealed, legacy, owner)
 
     def seal_record(self, record):
         nonce = secrets.token_bytes(12)
@@ -233,10 +241,12 @@ class ResidentStore:
                 return r
         return None
 
-    def put(self, record):
-        """Store record, replacing one for the same RP and user ID."""
+    def put(self, record, same_owner=None):
+        """Store record, replacing one for the same RP and user ID (and, with
+        same_owner(old record) given, only one of the same owner)."""
         for old in self.for_rp(record["rpIdHash"]):
-            if old.get("userId") == record["userId"]:
+            if old.get("userId") == record["userId"] and (
+                    same_owner is None or same_owner(old)):
                 self.delete(old["credId"])
         if self.count() >= self.max_count:
             return False
