@@ -1,0 +1,598 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dj <43033058+DjDeveloperr@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 02:32:57 -0500
+Subject: [PATCH] fprintd: bind Touch ID prints to the account they were
+ enrolled for
+
+Prints are stored under a username, and a username outlives its account:
+delete an account, create another with the same name, and the new account
+found the old one's prints, so the old account's finger verified as the new
+one. For the Touch ID driver, each account's storage directory now keeps a
+record of the account its prints belong to: its uid, an instance GUID, and
+the instance each print was enrolled under. A print verifies, is listed, and
+blocks a new enrolment of its finger only while the account the username
+names now has the recorded uid and the print carries the recorded instance.
+
+An enrolment for an account whose record names another uid starts a new
+instance; the earlier account's print for the same finger is deleted first,
+from the device and from storage, and its other prints stay unusable until
+they are deleted. Deletion still reaches every stored print, so removing a
+user's prints also removes those an earlier account left. Prints stored
+before records existed are adopted, all together, by the account that holds
+their username when a record is first needed.
+
+Signed-off-by: Dj <43033058+DjDeveloperr@users.noreply.github.com>
+---
+ src/account_binding.c | 266 ++++++++++++++++++++++++++++++++++++++++++
+ src/account_binding.h |  32 +++++
+ src/device.c          |  46 +++++++-
+ src/file_storage.c    |  53 +++++++++
+ src/file_storage.h    |   4 +
+ src/main.c            |   5 +
+ src/meson.build       |   2 +
+ src/storage.h         |   6 +
+ 8 files changed, 411 insertions(+), 3 deletions(-)
+ create mode 100644 src/account_binding.c
+ create mode 100644 src/account_binding.h
+
+diff --git a/src/account_binding.c b/src/account_binding.c
+new file mode 100644
+index 0000000..19179ed
+--- /dev/null
++++ b/src/account_binding.c
+@@ -0,0 +1,266 @@
++/*
++ * Bind stored prints to the account they were enrolled for
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * Prints are stored under a username, and a username outlives its account:
++ * delete an account, create another with the same name, and the new account
++ * would find the old one's prints. So each account's storage directory keeps
++ * a record of the account its prints belong to: its uid and an instance
++ * GUID, and the instance each print was enrolled under. A print belongs to
++ * the account that the username names now only while that account has the
++ * recorded uid and the print carries the recorded instance.
++ *
++ * A record whose uid no longer matches is replaced, with a new instance, at
++ * the next enrolment. Account removal invalidates it (a new instance, no
++ * uid), so that a print the removal could not delete never matches again.
++ * Prints stored before records existed are adopted, all at once, by the
++ * account that holds their username when a record is first needed.
++ */
++
++#include <errno.h>
++#include <pwd.h>
++#include <string.h>
++#include <sys/types.h>
++
++#include "account_binding.h"
++
++#define GROUP_ACCOUNT "Account"
++#define GROUP_PRINTS "Prints"
++#define KEY_UID "UID"
++#define KEY_INSTANCE "Instance"
++
++G_STATIC_ASSERT (sizeof (uid_t) <= sizeof (guint32));
++
++gboolean
++account_binding_lookup_uid (const char *username, guint32 *uid)
++{
++  struct passwd account;
++  struct passwd *found = NULL;
++  char buffer[16384];
++
++  if (username == NULL || *username == '\0')
++    return FALSE;
++
++  if (getpwnam_r (username, &account, buffer, sizeof (buffer), &found) != 0 ||
++      found == NULL || g_strcmp0 (found->pw_name, username) != 0 ||
++      found->pw_uid == (uid_t) -1)
++    return FALSE;
++
++  *uid = found->pw_uid;
++  return TRUE;
++}
++
++static char *
++record_path (const char *base_store)
++{
++  return g_build_filename (base_store, ACCOUNT_BINDING_RECORD, NULL);
++}
++
++/* Print keys are paths below the account's storage directory. Escape them
++ * so that no key file syntax ('=', '[', ']') or whitespace can occur. */
++static char *
++escape_key (const char *key)
++{
++  return g_uri_escape_string (key, "/", FALSE);
++}
++
++/* The record, or NULL with missing set when the account has none. A record
++ * that exists but cannot be read is not missing: nothing is adopted then. */
++static GKeyFile *
++record_load (const char *base_store, gboolean *missing)
++{
++  g_autoptr(GKeyFile) record = g_key_file_new ();
++  g_autoptr(GError) error = NULL;
++  g_autofree char *path = record_path (base_store);
++
++  *missing = FALSE;
++  if (g_key_file_load_from_file (record, path, G_KEY_FILE_NONE, &error))
++    return g_steal_pointer (&record);
++
++  if (g_error_matches (error, G_FILE_ERROR, G_FILE_ERROR_NOENT))
++    *missing = TRUE;
++  else
++    g_warning ("Ignoring unreadable account record %s: %s", path, error->message);
++
++  return NULL;
++}
++
++static gboolean
++record_save (const char *base_store, GKeyFile *record, GError **error)
++{
++  g_autofree char *path = record_path (base_store);
++  g_autofree char *data = NULL;
++  gsize length;
++
++  if (g_mkdir_with_parents (base_store, 0700) < 0)
++    {
++      g_set_error (error, G_FILE_ERROR, g_file_error_from_errno (errno),
++                   "Could not create %s: %s", base_store, g_strerror (errno));
++      return FALSE;
++    }
++
++  data = g_key_file_to_data (record, &length, NULL);
++  return g_file_set_contents (path, data, length, error);
++}
++
++static GKeyFile *
++record_new (guint32 uid)
++{
++  GKeyFile *record = g_key_file_new ();
++  g_autofree char *instance = g_uuid_string_random ();
++
++  g_key_file_set_uint64 (record, GROUP_ACCOUNT, KEY_UID, uid);
++  g_key_file_set_string (record, GROUP_ACCOUNT, KEY_INSTANCE, instance);
++  return record;
++}
++
++static gboolean
++is_print_name (const char *name)
++{
++  /* Print files are named by a single hex digit, the finger. */
++  return name[0] != '\0' && name[1] == '\0' && g_ascii_isxdigit (name[0]);
++}
++
++/* A first record for an account whose prints were stored before records
++ * existed: every print of the driver stored under the username is its own. */
++static GKeyFile *
++record_adopt (const char *base_store, guint32 uid, const char *driver)
++{
++  g_autoptr(GKeyFile) record = record_new (uid);
++  g_autofree char *instance = g_key_file_get_string (record, GROUP_ACCOUNT, KEY_INSTANCE, NULL);
++  g_autofree char *driver_dir = g_build_filename (base_store, driver, NULL);
++  g_autoptr(GDir) devices = g_dir_open (driver_dir, 0, NULL);
++  const char *device;
++
++  while (devices && (device = g_dir_read_name (devices)))
++    {
++      g_autofree char *device_dir = g_build_filename (driver_dir, device, NULL);
++      g_autoptr(GDir) prints = g_dir_open (device_dir, 0, NULL);
++      const char *print;
++
++      while (prints && (print = g_dir_read_name (prints)))
++        {
++          g_autofree char *key = NULL;
++          g_autofree char *escaped = NULL;
++
++          if (!is_print_name (print))
++            continue;
++
++          key = g_build_filename (driver, device, print, NULL);
++          escaped = escape_key (key);
++          g_key_file_set_string (record, GROUP_PRINTS, escaped, instance);
++        }
++    }
++
++  return g_steal_pointer (&record);
++}
++
++/* The record's instance when it is the record of the account with `uid`. */
++static char *
++record_instance_for (GKeyFile *record, guint32 uid)
++{
++  g_autoptr(GError) error = NULL;
++  guint64 recorded = g_key_file_get_uint64 (record, GROUP_ACCOUNT, KEY_UID, &error);
++
++  if (error != NULL || recorded != uid)
++    return NULL;
++
++  return g_key_file_get_string (record, GROUP_ACCOUNT, KEY_INSTANCE, NULL);
++}
++
++gboolean
++account_binding_bind (const char *base_store,
++                      const char *username,
++                      const char *driver,
++                      const char *key,
++                      GError    **error)
++{
++  g_autoptr(GKeyFile) record = NULL;
++  g_autofree char *instance = NULL;
++  g_autofree char *escaped = NULL;
++  gboolean missing;
++  guint32 uid;
++
++  if (!account_binding_lookup_uid (username, &uid))
++    {
++      g_set_error (error, G_FILE_ERROR, G_FILE_ERROR_NOENT,
++                   "Unix account '%s' has no passwd entry or uid", username ? username : "");
++      return FALSE;
++    }
++
++  record = record_load (base_store, &missing);
++  if (record == NULL && missing)
++    record = record_adopt (base_store, uid, driver);
++  if (record != NULL)
++    instance = record_instance_for (record, uid);
++  if (instance == NULL)
++    {
++      /* Another account's record, an invalidated one or an unreadable one:
++       * this account starts a new instance, and none of the stored prints
++       * belong to it. */
++      g_clear_pointer (&record, g_key_file_unref);
++      record = record_new (uid);
++      instance = g_key_file_get_string (record, GROUP_ACCOUNT, KEY_INSTANCE, NULL);
++    }
++
++  escaped = escape_key (key);
++  g_key_file_set_string (record, GROUP_PRINTS, escaped, instance);
++  return record_save (base_store, record, error);
++}
++
++gboolean
++account_binding_is_bound (const char *base_store,
++                          const char *username,
++                          const char *driver,
++                          const char *key)
++{
++  g_autoptr(GKeyFile) record = NULL;
++  g_autofree char *instance = NULL;
++  g_autofree char *escaped = NULL;
++  g_autofree char *enrolled_under = NULL;
++  gboolean missing;
++  guint32 uid;
++
++  if (!account_binding_lookup_uid (username, &uid))
++    return FALSE;
++
++  record = record_load (base_store, &missing);
++  if (record == NULL && missing)
++    {
++      g_autoptr(GError) error = NULL;
++
++      record = record_adopt (base_store, uid, driver);
++      if (!record_save (base_store, record, &error))
++        g_warning ("Could not record the account of %s's prints: %s", username, error->message);
++    }
++  if (record == NULL)
++    return FALSE;
++
++  instance = record_instance_for (record, uid);
++  if (instance == NULL)
++    return FALSE;
++
++  escaped = escape_key (key);
++  enrolled_under = g_key_file_get_string (record, GROUP_PRINTS, escaped, NULL);
++  return g_strcmp0 (enrolled_under, instance) == 0;
++}
++
++void
++account_binding_forget (const char *base_store, const char *key)
++{
++  g_autoptr(GKeyFile) record = NULL;
++  g_autoptr(GError) error = NULL;
++  g_autofree char *escaped = escape_key (key);
++  gboolean missing;
++
++  record = record_load (base_store, &missing);
++  if (record == NULL || !g_key_file_remove_key (record, GROUP_PRINTS, escaped, NULL))
++    return;
++
++  if (!record_save (base_store, record, &error))
++    g_warning ("Could not update the account record in %s: %s", base_store, error->message);
++}
+diff --git a/src/account_binding.h b/src/account_binding.h
+new file mode 100644
+index 0000000..da3903b
+--- /dev/null
++++ b/src/account_binding.h
+@@ -0,0 +1,32 @@
++/*
++ * Bind stored prints to the account they were enrolled for
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ */
++
++#pragma once
++
++#include <glib.h>
++
++/* The record kept next to an account's prints, in its storage directory. */
++#define ACCOUNT_BINDING_RECORD "account"
++
++gboolean account_binding_lookup_uid (const char *username,
++                                     guint32    *uid);
++
++gboolean account_binding_bind (const char *base_store,
++                               const char *username,
++                               const char *driver,
++                               const char *key,
++                               GError    **error);
++
++gboolean account_binding_is_bound (const char *base_store,
++                                   const char *username,
++                                   const char *driver,
++                                   const char *key);
++
++void account_binding_forget (const char *base_store,
++                             const char *key);
+diff --git a/src/device.c b/src/device.c
+index 4ec69e5..9e4ae27 100644
+--- a/src/device.c
++++ b/src/device.c
+@@ -1245,6 +1245,44 @@ load_user_prints (FprintDevice *rdev,
+   return g_steal_pointer (&res);
+ }
+ 
++/* Whether a stored print belongs to the account its username names now, and
++ * so may verify, be listed or stand in the way of an enrolment. Prints that
++ * an earlier account of the same name left behind can still be deleted. */
++static gboolean
++print_is_bound (FprintDevice *rdev,
++                FpFinger      finger,
++                const char   *username)
++{
++  FprintDevicePrivate *priv = fprint_device_get_instance_private (rdev);
++
++  if (store.print_is_bound == NULL || store.print_is_bound (priv->dev, finger, username))
++    return TRUE;
++
++  g_message ("Ignoring the %s print that an earlier account named %s left behind",
++             fp_finger_to_name (finger), username);
++  return FALSE;
++}
++
++static GPtrArray *
++load_bound_user_prints (FprintDevice *rdev,
++                        const char   *username)
++{
++  g_autoptr(GPtrArray) prints = load_user_prints (rdev, username);
++  guint i = 0;
++
++  while (i < prints->len)
++    {
++      FpPrint *print = g_ptr_array_index (prints, i);
++
++      if (print_is_bound (rdev, fp_print_get_finger (print), username))
++        i++;
++      else
++        g_ptr_array_remove_index (prints, i);
++    }
++
++  return g_steal_pointer (&prints);
++}
++
+ static GPtrArray *
+ load_all_prints (FprintDevice *rdev)
+ {
+@@ -1713,7 +1751,7 @@ fprint_device_verify_start (FprintDBusDevice      *dbus_dev,
+ 
+   if (finger == FP_FINGER_UNKNOWN)
+     {
+-      gallery = load_user_prints (rdev, session->username);
++      gallery = load_bound_user_prints (rdev, session->username);
+ 
+       if (!gallery->len)
+         {
+@@ -1777,6 +1815,8 @@ fprint_device_verify_start (FprintDBusDevice      *dbus_dev,
+       else
+         {
+           store.print_data_load (priv->dev, finger, session->username, &print);
++          if (print && !print_is_bound (rdev, finger, session->username))
++            g_clear_object (&print);
+         }
+ 
+       if (!print)
+@@ -2289,7 +2329,7 @@ fprint_device_enroll_start (FprintDBusDevice      *dbus_dev,
+ 
+   if (existing_print)
+     {
+-      if (aurora)
++      if (aurora && print_is_bound (rdev, finger, session->username))
+         {
+           g_set_error (&error, FPRINT_ERROR, FPRINT_ERROR_FINGER_ALREADY_ENROLLED,
+                        "finger already enrolled; delete it explicitly before enrolling again");
+@@ -2399,7 +2439,7 @@ fprint_device_list_enrolled_fingers (FprintDBusDevice      *dbus_dev,
+ 
+   user = g_object_get_qdata (G_OBJECT (invocation), quark_auth_user);
+   g_assert (user);
+-  prints = load_user_prints (rdev, user);
++  prints = load_bound_user_prints (rdev, user);
+ 
+   ret = g_ptr_array_new ();
+   for (i = 0; i < prints->len; i++)
+diff --git a/src/file_storage.c b/src/file_storage.c
+index e12fe58..17a8cfa 100644
+--- a/src/file_storage.c
++++ b/src/file_storage.c
+@@ -37,8 +37,13 @@
+ 
+ #include <fprint.h>
+ 
++#include "account_binding.h"
+ #include "file_storage.h"
+ 
++/* Touch ID keeps every account's fingerprints in one enclave, and its prints
++ * are bound to the account they were enrolled for (account_binding.c). */
++#define BOUND_DRIVER "apple-sep"
++
+ #define FILE_STORAGE_PATH "/var/lib/fprint"
+ #define DIR_PERMS 0700
+ 
+@@ -123,6 +128,16 @@ file_storage_get_basestore_for_username (const char *username)
+   return g_build_filename (get_storage_path (), username, NULL);
+ }
+ 
++/* A print's path below its account's storage directory. */
++static char *
++get_print_key (const char *driver, const char *device_id, FpFinger finger)
++{
++  char fingername[2];
++
++  g_snprintf (fingername, 2, "%x", finger);
++  return g_build_filename (driver, device_id, fingername, NULL);
++}
++
+ int
+ file_storage_print_data_save (FpPrint *print)
+ {
+@@ -164,6 +179,21 @@ file_storage_print_data_save (FpPrint *print)
+       return err->code;
+     }
+ 
++  if (g_strcmp0 (fp_print_get_driver (print), BOUND_DRIVER) == 0)
++    {
++      g_autofree char *key = get_print_key (fp_print_get_driver (print),
++                                            fp_print_get_device_id (print),
++                                            fp_print_get_finger (print));
++
++      if (!account_binding_bind (base_store, fp_print_get_username (print),
++                                 BOUND_DRIVER, key, &err))
++        {
++          g_warning ("Not keeping %s: %s", path, err->message);
++          g_unlink (path);
++          return -EIO;
++        }
++    }
++
+   g_debug ("file_storage_print_data_save(): print saved to %s", path);
+ 
+   return 0;
+@@ -254,6 +284,15 @@ file_storage_print_data_delete (FpDevice *dev, FpFinger finger, const char *user
+   g_debug ("file_storage_print_data_delete(): unlink(\"%s\") %s",
+            path, g_strerror (r));
+ 
++  if (r == 0 && g_strcmp0 (fp_device_get_driver (dev), BOUND_DRIVER) == 0)
++    {
++      g_autofree char *key = get_print_key (fp_device_get_driver (dev),
++                                            fp_device_get_device_id (dev),
++                                            finger);
++
++      account_binding_forget (base_store, key);
++    }
++
+   prints = file_storage_discover_prints (dev, username);
+   if (!prints)
+     {
+@@ -329,6 +368,20 @@ file_storage_discover_prints (FpDevice *dev, const char *username)
+   return list;
+ }
+ 
++gboolean
++file_storage_print_is_bound (FpDevice *dev, FpFinger finger, const char *username)
++{
++  g_autofree char *base_store = NULL;
++  g_autofree char *key = NULL;
++
++  if (g_strcmp0 (fp_device_get_driver (dev), BOUND_DRIVER) != 0)
++    return TRUE;
++
++  base_store = file_storage_get_basestore_for_username (username);
++  key = get_print_key (fp_device_get_driver (dev), fp_device_get_device_id (dev), finger);
++  return account_binding_is_bound (base_store, username, BOUND_DRIVER, key);
++}
++
+ GSList *
+ file_storage_discover_users (void)
+ {
+diff --git a/src/file_storage.h b/src/file_storage.h
+index 29e70df..acbafa6 100644
+--- a/src/file_storage.h
++++ b/src/file_storage.h
+@@ -38,3 +38,7 @@ int file_storage_deinit (void);
+ GSList *file_storage_discover_prints (FpDevice   *dev,
+                                       const char *username);
+ GSList *file_storage_discover_users (void);
++
++gboolean file_storage_print_is_bound (FpDevice   *dev,
++                                      FpFinger    finger,
++                                      const char *username);
+diff --git a/src/main.c b/src/main.c
+index eba2f4b..e1f3e07 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -51,6 +51,7 @@ set_storage_file (void)
+   store.print_data_delete = &file_storage_print_data_delete;
+   store.discover_prints = &file_storage_discover_prints;
+   store.discover_users = &file_storage_discover_users;
++  store.print_is_bound = &file_storage_print_is_bound;
+ }
+ 
+ static gboolean
+@@ -82,6 +83,10 @@ load_storage_module (const char *module_name)
+       return FALSE;
+     }
+ 
++  /* Optional: a module without it keeps every stored print usable. */
++  if (!g_module_symbol (module, "print_is_bound", (gpointer *) &store.print_is_bound))
++    store.print_is_bound = NULL;
++
+   g_module_make_resident (module);
+ 
+   return TRUE;
+diff --git a/src/meson.build b/src/meson.build
+index 20ab1a8..e7835d6 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -54,6 +54,8 @@ libfprintd_private = static_library('fprintd-private',
+ 
+ fprintd = executable('fprintd',
+     sources: [
++        'account_binding.c',
++        'account_binding.h',
+         'file_storage.c',
+         'file_storage.h',
+         'fprintd.h',
+diff --git a/src/storage.h b/src/storage.h
+index ef25a84..730dbd1 100644
+--- a/src/storage.h
++++ b/src/storage.h
+@@ -31,6 +31,9 @@ typedef int (*storage_print_data_delete)(FpDevice   *dev,
+ typedef GSList *(*storage_discover_prints)(FpDevice   *dev,
+                                            const char *username);
+ typedef GSList *(*storage_discover_users)(void);
++typedef gboolean (*storage_print_is_bound)(FpDevice   *dev,
++                                           FpFinger    finger,
++                                           const char *username);
+ typedef int (*storage_init)(void);
+ typedef int (*storage_deinit)(void);
+ 
+@@ -43,6 +46,9 @@ struct storage
+   storage_print_data_delete print_data_delete;
+   storage_discover_prints   discover_prints;
+   storage_discover_users    discover_users;
++  /* Whether a stored print belongs to the account its username names now.
++   * Optional: without it, every stored print does. */
++  storage_print_is_bound    print_is_bound;
+ };
+ 
+ typedef struct storage fp_storage;

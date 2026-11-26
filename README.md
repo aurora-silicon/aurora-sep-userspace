@@ -57,6 +57,30 @@ then tells the user to use the password and returns at once.
 `fprintd/test_account_gate.py` compiles the patched account gate with a
 fake passwd lookup and covers missing entries, lookup errors, invalid uid and
 name mismatch without a device operation.
+
+Touch ID prints belong to the account they were enrolled for, not just to its
+username. `fprintd/0005-bind-touch-id-prints-to-the-account-they-were-enrolled-for.patch`
+keeps `/var/lib/fprint/<user>/account`, which records the account's uid, an
+instance GUID and the instance each print was enrolled under. A print verifies
+and is listed only while the username's account has that uid and the print
+carries that instance, so an account created later under a removed account's
+name never gets its prints. `aurora-touchid-accounts`, run by
+`aurora-touchid-accounts.path` whenever `/etc/passwd` changes and at boot,
+deletes the fingerprints of removed or re-created accounts through
+`fprintd-delete`. Prints it cannot delete get an invalidated record and never
+verify again. Prints from before this change are adopted, once, by the account
+that holds their username.
+
+The enclave holds three fingerprints for all accounts together.
+`fprintd/0006-let-an-account-enrol-one-touch-id-finger-without-an-administrator.patch`
+lets an account enrol one itself. Another one needs
+`net.reactivated.fprint.device.enroll-additional`, which defaults to
+administrator authentication, so no account can fill the reader for the
+others. fprintd asks for it in its per-call authorization thread, so an open
+prompt holds up no other caller; `FPrintdVirtualStorageSharedSlotsTests` (run
+in CI against a build with the virtual storage reader as the shared one) shows
+the reader still verifies meanwhile. `fprintd/test_account_binding.py` and `fprintd/test_touchid_accounts.sh`
+test the record and the cleanup without a device.
 The spec is based on [Fedora's f45 fprintd spec](https://src.fedoraproject.org/rpms/fprintd/blob/f45/f/fprintd.spec);
 the patch targets [fprintd v1.94.5](https://gitlab.freedesktop.org/libfprint/fprintd/-/tags/v1.94.5).
 

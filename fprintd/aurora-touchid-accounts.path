@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+[Unit]
+Description=Watch for removed accounts that still have fingerprints
+
+[Path]
+PathChanged=/etc/passwd
+Unit=aurora-touchid-accounts.service
+
+[Install]
+WantedBy=paths.target
