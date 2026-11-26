@@ -34,7 +34,7 @@ from cryptography.hazmat.primitives.asymmetric.utils import Prehashed
 
 from . import cbor, creds, touchid
 from .backend import (BackendError, BagLocked, EnclaveCancelled, EnclaveRefused,
-                      EnclaveTimeout, InvalidHandle, PasswordRefused)
+                      EnclaveTimeout, InvalidHandle, PasswordRefused, is_and_handle)
 
 log = logging.getLogger("aurora-fido")
 
@@ -44,6 +44,7 @@ ENCLAVE_WAIT = 60.0
 # Results besides touchid.MATCH / NO_MATCH / TIMEOUT / CANCELLED:
 WRONG_PASSWORD = "wrong-password"     # the enclave refused the password (and counted it)
 BAG_LOCKED = "bag-locked"             # the user's key bag is locked: nothing under it works
+PASSWORD_NEEDED = "password-needed"   # a Touch ID AND password key was asked for without the password
 
 
 def verify_digest(point, digest, der_sig):
@@ -152,6 +153,11 @@ class EnclaveUser:
                     except BagLocked as e:
                         log.info("%s: %s", prompt.title(), e)
                         return BAG_LOCKED, None
+                    except PasswordRefused:
+                        # A Touch ID AND password key: the match happened, the
+                        # password did not. The enclave counted it; no retry here.
+                        log.info("%s: the enclave refused the password", prompt.title())
+                        return WRONG_PASSWORD, None
                 return touchid.NO_MATCH, None
             finally:
                 self.notifier.close(note)
@@ -173,7 +179,14 @@ class EnclaveUser:
 
     def sign(self, handle, digest, prompt, cancel, waiting=lambda: None, password=None):
         """(result, DER signature): the enclave signs after it saw a match, or
-        after it checked password (keys under the user's bag only)."""
+        after it checked password (keys under the user's bag only). A Touch ID
+        AND password key needs both: the enclave waits for the match, then
+        checks the password into the same context."""
+        if is_and_handle(handle):
+            if password is None:
+                return PASSWORD_NEEDED, None
+            return self._prompt(lambda: self.backend.sign_password(handle, digest, password),
+                                prompt, cancel, waiting)
         if password is not None:
             return self._with_password(
                 lambda: self.backend.sign_password(handle, digest, password), prompt)
@@ -181,7 +194,13 @@ class EnclaveUser:
 
     def unseal(self, handle, sealed, prompt, cancel, waiting=lambda: None, password=None):
         """(result, secret): the enclave releases a sealed secret after a match
-        (or after it checked password)."""
+        (or after it checked password; both for a Touch ID AND password key)."""
+        if is_and_handle(handle):
+            if password is None:
+                return PASSWORD_NEEDED, None
+            return self._prompt(
+                lambda: self.backend.unseal_password(handle, sealed, password),
+                prompt, cancel, waiting)
         if password is not None:
             return self._with_password(
                 lambda: self.backend.unseal_password(handle, sealed, password), prompt)

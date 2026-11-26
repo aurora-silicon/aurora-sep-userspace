@@ -78,13 +78,25 @@ POLICY_TOUCHID_OR_PASSWORD = 0   # Touch ID, or the user's password checked by t
 POLICY_TOUCHID_ANY = 1           # Touch ID only, any enrolled finger (.biometryAny)
 POLICY_TOUCHID_CURRENT = 2       # Touch ID only, the fingers enrolled now
                                  # (.biometryCurrentSet): an enrolment change retires it
+POLICY_TOUCHID_AND_PASSWORD = 3  # Touch ID and the user's password, both checked by the
+                                 # enclave in one context (.biometryAny | .and |
+                                 # .devicePasscode); keys under the user's bag only
+POLICY_TOUCHID_CURRENT_AND_PASSWORD = 4   # the same with .biometryCurrentSet
 POLICIES = {"touchid-or-password": POLICY_TOUCHID_OR_PASSWORD,
             "touchid-any": POLICY_TOUCHID_ANY,
-            "touchid-current": POLICY_TOUCHID_CURRENT}
+            "touchid-current": POLICY_TOUCHID_CURRENT,
+            "touchid-and-password": POLICY_TOUCHID_AND_PASSWORD,
+            "touchid-current-and-password": POLICY_TOUCHID_CURRENT_AND_PASSWORD}
 POLICY_NAMES = {v: k for k, v in POLICIES.items()}
-# SEP_KEY_CREATE_* flag for each policy (include/uapi/linux/apple-sep.h).
+# SEP_KEY_CREATE_* flags for each policy (include/uapi/linux/apple-sep.h):
+# BIOMETRY_CURRENT_SET 0x1, BIOMETRY_ANY 0x2, USER_PRESENCE 0x4,
+# DEVICE_PASSCODE 0x8, AND 0x10.
 POLICY_FLAGS = {POLICY_TOUCHID_OR_PASSWORD: 0x4, POLICY_TOUCHID_ANY: 0x2,
-                POLICY_TOUCHID_CURRENT: 0x1}
+                POLICY_TOUCHID_CURRENT: 0x1,
+                POLICY_TOUCHID_AND_PASSWORD: 0x2 | 0x8 | 0x10,
+                POLICY_TOUCHID_CURRENT_AND_PASSWORD: 0x1 | 0x8 | 0x10}
+# Policies whose every use needs the password as well as the finger.
+POLICIES_NEED_PASSWORD = (POLICY_TOUCHID_AND_PASSWORD, POLICY_TOUCHID_CURRENT_AND_PASSWORD)
 
 
 class Credential:
