@@ -11,6 +11,7 @@ Patch1:	0002-report-lockout-and-fall-back-to-the-password.patch
 Patch2:	0003-say-why-the-reader-needs-the-password.patch
 Patch3:	0004-dont-ask-for-a-finger-the-reader-will-not-take.patch
 Patch4:	0005-bind-touch-id-prints-to-the-account-they-were-enrolled-for.patch
+Patch5:	0006-let-an-account-enrol-one-touch-id-finger-without-an-administrator.patch
 Source1:	test_account_gate.py
 Source2:	aurora-touchid-accounts
 Source3:	aurora-touchid-accounts.service
@@ -173,6 +174,9 @@ fi
   instance GUID), so an account created later with the same username does
   not get them, and delete the fingerprints of removed accounts whenever
   /etc/passwd changes and at boot.
+- Let an account enrol one Touch ID finger itself; another needs the new
+  net.reactivated.fprint.device.enroll-additional action (administrator),
+  so that one account cannot take all three slots.
 
 * Tue Nov 10 2026 Ryan Murray <ryan@aurorasilicon.org> - 1.94.5-99.aurora4
 - Don't emit VerifyFingerSelected while the reader needs the password, so

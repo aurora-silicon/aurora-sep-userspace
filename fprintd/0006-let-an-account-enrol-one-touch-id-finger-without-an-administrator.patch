@@ -1,0 +1,106 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dj <43033058+DjDeveloperr@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 02:33:30 -0500
+Subject: [PATCH] fprintd: let an account enrol one Touch ID finger without
+ an administrator
+
+Touch ID keeps the fingerprints of all accounts on a Mac in one enclave
+context, which holds three. Any active user could enrol three of their own
+fingers and leave no slot for any other account, and other users could not
+delete those prints without administrator rights.
+
+An account now enrols its first finger itself. Enrolling another needs the
+new net.reactivated.fprint.device.enroll-additional action, which defaults
+to administrator authentication, so one account cannot fill the reader for
+the others unless an administrator allows it. Prints that an earlier
+account of the same name left behind don't count towards the account's
+share.
+
+Signed-off-by: Dj <43033058+DjDeveloperr@users.noreply.github.com>
+---
+ data/net.reactivated.fprint.device.policy.in | 10 +++++
+ src/device.c                                 | 43 ++++++++++++++++++++
+ 2 files changed, 53 insertions(+)
+
+diff --git a/data/net.reactivated.fprint.device.policy.in b/data/net.reactivated.fprint.device.policy.in
+index 609a289..8297100 100644
+--- a/data/net.reactivated.fprint.device.policy.in
++++ b/data/net.reactivated.fprint.device.policy.in
+@@ -29,6 +29,16 @@
+     </defaults>
+   </action>
+ 
++  <action id="net.reactivated.fprint.device.enroll-additional">
++    <description>Enroll more fingerprints for one account on a shared reader</description>
++    <message>The reader holds a few fingerprints for all accounts together. Privileges are required to enroll more than one for an account.</message>
++    <defaults>
++      <allow_any>no</allow_any>
++      <allow_inactive>no</allow_inactive>
++      <allow_active>auth_admin_keep</allow_active>
++    </defaults>
++  </action>
++
+   <action id="net.reactivated.fprint.device.setusername">
+     <description>Select a user to manage fingerprints for</description>
+     <message>Privileges are required to manage fingerprints for other users.</message>
+diff --git a/src/device.c b/src/device.c
+index 9e4ae27..3160dbd 100644
+--- a/src/device.c
++++ b/src/device.c
+@@ -2276,6 +2276,36 @@ aurora_account_resolves (const char *username)
+          found->pw_uid != (uid_t) -1;
+ }
+ 
++/* Touch ID holds three fingerprints for all the accounts on a Mac together.
++ * An account enrols one itself; each further one needs an administrator, so
++ * that no account can fill the reader for the others. */
++#define AURORA_SELF_ENROLLED_FINGERS 1
++#define AURORA_ENROLL_ADDITIONAL_ACTION "net.reactivated.fprint.device.enroll-additional"
++
++/* The fingers other than `finger` that the account has enrolled on the
++ * device. Prints an earlier account of the same name left behind don't
++ * count: the enrolment deletes or ignores them. */
++static guint
++aurora_enrolled_fingers (FprintDevice *rdev,
++                         const char   *username,
++                         FpFinger      finger)
++{
++  FprintDevicePrivate *priv = fprint_device_get_instance_private (rdev);
++  g_autoptr(GSList) fingers = store.discover_prints (priv->dev, username);
++  guint count = 0;
++  GSList *l;
++
++  for (l = fingers; l; l = l->next)
++    {
++      FpFinger other = GPOINTER_TO_UINT (l->data);
++
++      if (other != finger && print_is_bound (rdev, other, username))
++        count++;
++    }
++
++  return count;
++}
++
+ static gboolean
+ fprint_device_enroll_start (FprintDBusDevice      *dbus_dev,
+                             GDBusMethodInvocation *invocation,
+@@ -2317,6 +2347,19 @@ fprint_device_enroll_start (FprintDBusDevice      *dbus_dev,
+           g_dbus_method_invocation_return_gerror (invocation, error);
+           return TRUE;
+         }
++
++      if (aurora_enrolled_fingers (rdev, session->username, finger) >= AURORA_SELF_ENROLLED_FINGERS &&
++          !_fprint_device_check_polkit_for_action (rdev, invocation,
++                                                   AURORA_ENROLL_ADDITIONAL_ACTION,
++                                                   &error))
++        {
++          g_prefix_error (&error,
++                          "Touch ID holds three fingerprints for all accounts on this Mac; "
++                          "an administrator must allow more than %d for one account: ",
++                          AURORA_SELF_ENROLLED_FINGERS);
++          g_dbus_method_invocation_return_gerror (invocation, error);
++          return TRUE;
++        }
+     }
+   store.print_data_load (priv->dev, finger,
+                          session->username, &existing_print);

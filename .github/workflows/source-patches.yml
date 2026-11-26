@@ -56,6 +56,7 @@ jobs:
           git apply ../fprintd/0003-say-why-the-reader-needs-the-password.patch
           git apply ../fprintd/0004-dont-ask-for-a-finger-the-reader-will-not-take.patch
           git apply ../fprintd/0005-bind-touch-id-prints-to-the-account-they-were-enrolled-for.patch
+          git apply ../fprintd/0006-let-an-account-enrol-one-touch-id-finger-without-an-administrator.patch
           python3 -m py_compile tests/fprintd.py
           python3 ../fprintd/test_account_gate.py src/device.c
           sh ../fprintd/test_touchid_accounts.sh ../fprintd/aurora-touchid-accounts
@@ -206,6 +207,7 @@ jobs:
           git apply ../fprintd/0003-say-why-the-reader-needs-the-password.patch
           git apply ../fprintd/0004-dont-ask-for-a-finger-the-reader-will-not-take.patch
           git apply ../fprintd/0005-bind-touch-id-prints-to-the-account-they-were-enrolled-for.patch
+          git apply ../fprintd/0006-let-an-account-enrol-one-touch-id-finger-without-an-administrator.patch
           PKG_CONFIG_PATH=/usr/local/lib64/pkgconfig meson setup build -Dpam=true -Dman=false -Dsystemd=false -Dgtk_doc=false
           meson compile -C build
           python3 ../fprintd/test_account_binding.py src/account_binding.c

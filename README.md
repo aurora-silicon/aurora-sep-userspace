@@ -71,7 +71,12 @@ deletes the fingerprints of removed or re-created accounts through
 verify again. Prints from before this change are adopted, once, by the account
 that holds their username.
 
-`fprintd/test_account_binding.py` and `fprintd/test_touchid_accounts.sh`
+The enclave holds three fingerprints for all accounts together.
+`fprintd/0006-let-an-account-enrol-one-touch-id-finger-without-an-administrator.patch`
+lets an account enrol one itself. Another one needs
+`net.reactivated.fprint.device.enroll-additional`, which defaults to
+administrator authentication, so no account can fill the reader for the
+others. `fprintd/test_account_binding.py` and `fprintd/test_touchid_accounts.sh`
 test the record and the cleanup without a device.
 The spec is based on [Fedora's f45 fprintd spec](https://src.fedoraproject.org/rpms/fprintd/blob/f45/f/fprintd.spec);
 the patch targets [fprintd v1.94.5](https://gitlab.freedesktop.org/libfprint/fprintd/-/tags/v1.94.5).
