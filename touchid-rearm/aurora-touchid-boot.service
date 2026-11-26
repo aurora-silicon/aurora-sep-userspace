@@ -7,12 +7,15 @@ Documentation=file:///usr/share/doc/aurora-touchid-rearm/README.md
 # before fprintd. Every match goes through fprintd: the greeter, the lock
 # screen, sudo and text logins all ask it for the reader, and a request that
 # comes in earlier waits for fprintd's start job, so nothing can match before
-# the setting is applied. The display manager and user sessions are not held
-# back: the enclave takes seconds to come up after boot, and with automatic
-# login or a password login nothing needs it.
+# the setting is applied. DefaultDependencies=no prevents systemd from adding
+# an implicit Before=multi-user.target (from WantedBy=multi-user.target) so
+# the display manager and user sessions are not held back while the enclave
+# finishes coming up after boot.
+DefaultDependencies=no
 Wants=aurora-sep-ready.service
-After=aurora-sep-ready.service
-Before=fprintd.service
+After=sysinit.target aurora-sep-ready.service
+Before=fprintd.service shutdown.target
+Conflicts=shutdown.target
 
 [Service]
 Type=oneshot
