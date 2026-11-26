@@ -194,6 +194,12 @@ start without it.
   enclave checks it in place of a touch: one call, no retries, and each
   wrong password counts in the enclave (`CTAP2_ERR_PIN_INVALID`). CTAP over
   hidraw has no route for it while clientPIN stays off.
+- **The native front-end** (`org.aurora.Passkeys1` on the session bus) is
+  off unless `[native] portal_names` names the credentials portal's bus
+  names. Only the current owner of one of them, running as the user, is
+  answered. It lists a site's passkeys and accounts without a touch, so it
+  relies on the portal to check the site's origin; any other process of the
+  user is refused before the vault is read.
 - **Access to the device:** `/dev/sep-key` is root-only by default. For
   per-user mode, give the user (or a group) access to it. The kernel lets a
   non-root caller use only keys under that caller's own bag.

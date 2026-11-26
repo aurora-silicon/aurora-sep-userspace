@@ -387,9 +387,9 @@ def main(argv=None):
 def start_dbus(auth, cfg, gate=None):
     """The native front-end on the session bus (org.aurora.Passkeys1), if possible.
 
-    [native] portal_names: bus names allowed to call it (a credentials portal);
-    empty = any process of this user, which can already reach the security key
-    through hidraw, so it grants nothing new."""
+    [native] portal_names: the bus names allowed to call it (a credentials
+    portal). Empty, the default, leaves it off: it lists a site's passkeys
+    without a touch, which only a portal that checks the site's origin may ask."""
     try:
         from . import dbus_provider
         from .provider import Provider
@@ -397,6 +397,9 @@ def start_dbus(auth, cfg, gate=None):
         log.info("no D-Bus front-end (%s)", e)
         return None
     names = cfg.get("native", "portal_names", fallback="").split()
+    if not names:
+        log.info("no [native] portal_names; no D-Bus front-end")
+        return None
     try:
         svc = dbus_provider.ProviderService(Provider(auth, gate), allow_names=names)
         if not svc.request_name():
