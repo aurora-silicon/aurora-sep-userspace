@@ -9,6 +9,7 @@ reason of the driver's format is produced by a store that fails exactly
 that check. The quarantine keeps the newest two copies. Run from the
 Makefile's check."""
 import os
+import runpy
 import struct
 import subprocess
 import sys
@@ -16,6 +17,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 HERE = Path(__file__).resolve().parent
 SCRIPT = HERE.parent / 'aurora-sep-host-state-repair'
@@ -343,6 +345,33 @@ class Repair(unittest.TestCase):
         self.assertEqual(len(copies), 1)
         self.assertEqual(copies[0].read_bytes(), self.original)
         self.assertEqual(copies[0].stat().st_mode & 0o777, 0o600)
+
+    def test_reset_preserves_store_and_older_copies_if_quarantine_sync_fails(self):
+        original = b'refused store'
+        self.store.write_bytes(original)
+        self.quarantine.mkdir()
+        older_copies = [
+            self.quarantine / f'host-state-managed-202512{day}-000000-100.bin'
+            for day in (10, 11)
+        ]
+        for path in older_copies:
+            path.write_bytes(b'older copy')
+
+        with patch.dict(os.environ, AURORA_SEP_HOST_STATE=str(self.store),
+                        AURORA_SEP_QUARANTINE=str(self.quarantine)):
+            reset = runpy.run_path(str(SCRIPT))['reset']
+        with patch.dict(reset.__globals__, {
+            'sync_directory': self.fail_directory_sync,
+        }):
+            self.assertEqual(reset(), 1)
+
+        self.assertEqual(self.store.read_bytes(), original)
+        for path in older_copies:
+            self.assertEqual(path.read_bytes(), b'older copy')
+
+    def fail_directory_sync(self, path):
+        self.assertEqual(Path(path), self.quarantine)
+        raise OSError('simulated directory sync failure')
 
     def test_reset_leaves_a_whole_store_alone(self):
         original = make_file(self.store, superblock())

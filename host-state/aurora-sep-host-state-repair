@@ -168,7 +168,20 @@ def validate_superblock(sb):
     return True, detail, highest_end
 
 
+def sync_directory(path):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def backup(path, size):
+    parent = os.path.dirname(os.path.abspath(QUARANTINE))
+    quarantine_parents = [parent]
+    while not os.path.isdir(parent):
+        parent = os.path.dirname(parent)
+        quarantine_parents.append(parent)
     os.makedirs(QUARANTINE, mode=0o700, exist_ok=True)
     os.chmod(QUARANTINE, 0o700)
     stamp = time.strftime("%Y%m%d-%H%M%S")
@@ -186,8 +199,13 @@ def backup(path, size):
     with open(path, "rb") as src, dst:
         shutil.copyfileobj(src, dst)
         dst.flush()
+        os.fchmod(dst.fileno(), 0o600)
         os.fsync(dst.fileno())
-    os.chmod(dest, 0o600)
+    # The backup and its directory must survive a crash before we change
+    # the source or remove older copies.
+    sync_directory(QUARANTINE)
+    for parent in quarantine_parents:
+        sync_directory(parent)
     prune(dest)
     return dest
 
@@ -241,7 +259,12 @@ def reset():
     except OSError as e:
         log(f"cannot back up {STORE}: {e}")
         return 1
-    os.unlink(STORE)
+    try:
+        os.unlink(STORE)
+        sync_directory(os.path.dirname(os.path.abspath(STORE)))
+    except OSError as e:
+        log(f"cannot complete removal of {STORE}: {e}; backup is at {dest}")
+        return 1
     log(
         f"copied {STORE} ({size} bytes) to {dest} and removed it; the driver "
         "creates a fresh store at the next boot. Touch ID enrolments and the "
@@ -319,6 +342,7 @@ def main():
 def usage():
     print(f"usage: {sys.argv[0]} [--reset]", file=sys.stderr)
     return 2
+
 
 if __name__ == "__main__":
     if sys.argv[1:] == []:
