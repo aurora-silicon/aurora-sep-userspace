@@ -3,16 +3,21 @@
 """Checks the truncated host-state store repair against synthetic stores.
 
 A repairable prefix is zero-extended with its bytes kept, a refused or
-over-long file is moved aside untouched, and a whole store is never read
-past its size. Every refusal reason of the driver's format is produced by
-a store that fails exactly that check. Run from the Makefile's check."""
+over-long file is left in place unchanged until an administrator runs
+--reset, and a whole store is never read past its size. Every refusal
+reason of the driver's format is produced by a store that fails exactly
+that check. The quarantine keeps the newest two copies. Run from the
+Makefile's check."""
 import os
+import runpy
 import struct
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 HERE = Path(__file__).resolve().parent
 SCRIPT = HERE.parent / 'aurora-sep-host-state-repair'
@@ -84,27 +89,36 @@ class Repair(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def repair(self):
+    def repair(self, *args, **extra_env):
         env = dict(os.environ,
                    AURORA_SEP_HOST_STATE=str(self.store),
                    AURORA_SEP_QUARANTINE=str(self.quarantine))
-        return subprocess.run([sys.executable, str(SCRIPT)], env=env,
+        env.pop('JOURNAL_STREAM', None)
+        env.update(extra_env)
+        return subprocess.run([sys.executable, str(SCRIPT), *args], env=env,
                                capture_output=True, text=True, check=False)
 
     def backups(self):
         if not self.quarantine.exists():
             return []
-        return sorted(self.quarantine.glob('host-state-*.bin'))
+        return sorted(self.quarantine.glob('host-state-managed-*.bin'))
 
     def refuse(self, reason):
-        """The store is gone, one untouched copy is in the quarantine."""
+        """The store stays in place, unchanged, with no copy made, and the
+        log names the reason and the administrator's reset command."""
         result = self.repair()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(reason, result.stdout)
-        self.assertFalse(self.store.exists())
-        copies = self.backups()
-        self.assertEqual(len(copies), 1)
-        self.assertEqual(copies[0].read_bytes(), self.original)
+        self.assertIn(f'left {self.store} in place, unchanged', result.stdout)
+        self.assertIn('Touch ID stays off', result.stdout)
+        self.assertIn(f'{SCRIPT} --reset', result.stdout)
+        self.assertEqual(self.store.read_bytes(), self.original)
+        self.assertEqual(self.backups(), [])
+        # Every boot finds it the same way, and nothing piles up.
+        again = self.repair()
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertEqual(self.store.read_bytes(), self.original)
+        self.assertEqual(self.backups(), [])
         return result
 
     def test_whole_store_is_untouched(self):
@@ -292,41 +306,157 @@ class Repair(unittest.TestCase):
         self.original = make_file(self.store, superblock(intent_slot=1), cut=2 * BLOCK)
         self.refuse('bad empty intent')
 
-    def test_file_longer_than_a_store_is_moved_aside(self):
+    def test_file_longer_than_a_store_is_left_in_place(self):
         self.original = make_file(self.store, superblock(), cut=None,
                                   extra=b'\x5A' * BLOCK)
+        self.refuse('longer than a store')
+
+    def test_all_zero_file_longer_than_a_store_is_left_in_place(self):
+        self.original = make_file(self.store, b'\0' * BLOCK, cut=None,
+                                  extra=b'\0' * (BLOCK + 1))
+        self.refuse('bad magic')
+
+    def test_store_cut_inside_the_slot_table_is_left_in_place(self):
+        # Any cut before the end of the slot table, with any byte set.
+        for cut in (1, 64, TABLE_END - 1):
+            with self.subTest(cut=cut):
+                self.original = make_file(self.store, superblock(), cut=cut)
+                self.refuse('superblock too short')
+
+    def test_refusal_is_a_journal_warning_under_systemd(self):
+        self.original = make_file(self.store, superblock(), cut=100)
+        result = self.repair(JOURNAL_STREAM='8:1234')
+        lines = [l for l in result.stdout.splitlines() if 'in place' in l]
+        self.assertEqual(len(lines), 1)
+        self.assertTrue(lines[0].startswith('<4>aurora-sep-host-state-repair: '), lines[0])
+        # By hand, the line carries no priority prefix.
         result = self.repair()
+        self.assertTrue(all(l.startswith('aurora-sep-host-state-repair: ')
+                            for l in result.stdout.splitlines()), result.stdout)
+
+    def test_reset_moves_a_refused_store_aside(self):
+        self.original = make_file(self.store, superblock(), cut=100)
+        self.refuse('superblock too short')
+        result = self.repair('--reset')
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('longer than a store', result.stdout)
+        self.assertIn('creates a fresh store', result.stdout)
         self.assertFalse(self.store.exists())
         copies = self.backups()
         self.assertEqual(len(copies), 1)
-        self.assertEqual(copies[0].stat().st_size, STORE_SIZE + BLOCK)
         self.assertEqual(copies[0].read_bytes(), self.original)
+        self.assertEqual(copies[0].stat().st_mode & 0o777, 0o600)
 
-    def test_all_zero_file_longer_than_a_store_is_moved_aside(self):
-        self.original = make_file(self.store, b'\0' * BLOCK, cut=None,
-                                  extra=b'\0' * (BLOCK + 1))
-        result = self.repair()
+    def test_reset_preserves_store_and_older_copies_if_quarantine_sync_fails(self):
+        original = b'refused store'
+        self.store.write_bytes(original)
+        self.quarantine.mkdir()
+        older_copies = [
+            self.quarantine / f'host-state-managed-202512{day}-000000-100.bin'
+            for day in (10, 11)
+        ]
+        for path in older_copies:
+            path.write_bytes(b'older copy')
+
+        with patch.dict(os.environ, AURORA_SEP_HOST_STATE=str(self.store),
+                        AURORA_SEP_QUARANTINE=str(self.quarantine)):
+            reset = runpy.run_path(str(SCRIPT))['reset']
+        with patch.dict(reset.__globals__, {
+            'sync_directory': self.fail_directory_sync,
+        }):
+            self.assertEqual(reset(), 1)
+
+        self.assertEqual(self.store.read_bytes(), original)
+        for path in older_copies:
+            self.assertEqual(path.read_bytes(), b'older copy')
+
+    def fail_directory_sync(self, path):
+        self.assertEqual(Path(path), self.quarantine)
+        raise OSError('simulated directory sync failure')
+
+    def test_reset_leaves_a_whole_store_alone(self):
+        original = make_file(self.store, superblock())
+        result = self.repair('--reset')
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('full size', result.stdout)
+        self.assertEqual(self.store.read_bytes(), original)
+        self.assertEqual(self.backups(), [])
+
+    def test_reset_without_a_store(self):
+        result = self.repair('--reset')
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('bad magic', result.stdout)
-        self.assertFalse(self.store.exists())
-        self.assertEqual(len(self.backups()), 1)
+        self.assertIn('nothing to reset', result.stdout)
+        self.assertFalse(self.quarantine.exists())
+
+    def test_unknown_arguments_change_nothing(self):
+        self.original = make_file(self.store, superblock(), cut=100)
+        for args in (['--rest'], ['--reset', 'x'], ['-h']):
+            with self.subTest(args=args):
+                result = self.repair(*args)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn('usage', result.stderr)
+                self.assertEqual(self.store.read_bytes(), self.original)
+                self.assertFalse(self.quarantine.exists())
+
+    def repairable(self, tag):
+        sb = superblock(used=[(0, KIND, b'0' * 16, 0x100)], generation=tag)
+        return make_file(self.store, sb, slots=[(0, data(tag, 0x100))], cut=2 * BLOCK)
 
     def test_quarantine_permissions_and_unique_names(self):
-        sb = bytearray(superblock(used=[(0, KIND, b'0' * 16, 0x100)]))
-        sb[3] ^= 0xFF
-        for _ in range(2):
-            make_file(self.store, bytes(sb), cut=2 * BLOCK)
-            self.original = self.store.read_bytes()
+        for tag in range(2):
+            self.original = self.repairable(tag)
             result = self.repair()
             self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('zero-extended', result.stdout)
+            self.store.write_bytes(self.original)
         copies = self.backups()
         self.assertEqual(len(copies), 2)
         self.assertEqual(len({c.name for c in copies}), 2)
         self.assertEqual(self.quarantine.stat().st_mode & 0o777, 0o700)
         for copy in copies:
             self.assertEqual(copy.stat().st_mode & 0o777, 0o600)
+
+    def test_quarantine_keeps_the_newest_two_copies(self):
+        self.quarantine.mkdir(mode=0o700)
+        old = []
+        for age, name in ((300, 'host-state-managed-20260101-000000-100.bin'),
+                          (200, 'host-state-managed-20260102-000000-100.bin'),
+                          (100, 'host-state-managed-20260103-000000-100.bin')):
+            path = self.quarantine / name
+            path.write_bytes(name.encode())
+            stamp = time.time() - age
+            os.utime(path, (stamp, stamp))
+            old.append(path)
+        legacy = [self.quarantine / f'host-state-202512{day}-000000-100.bin'
+                  for day in (10, 11)]
+        for path in legacy:
+            path.write_bytes(path.name.encode())
+        # Another file and a link that matches the managed pattern.
+        other = self.quarantine / 'notes.txt'
+        other.write_text('kept')
+        outside = Path(self.tmp.name) / 'outside.bin'
+        outside.write_text('kept')
+        link = self.quarantine / 'host-state-managed-link.bin'
+        link.symlink_to(outside)
+        os.utime(link, (0, 0), follow_symlinks=False)
+
+        self.original = self.repairable(7)
+        result = self.repair()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('zero-extended', result.stdout)
+        copies = sorted(p for p in self.quarantine.iterdir()
+                        if p.is_file() and not p.is_symlink() and p.name.startswith('host-state-managed-'))
+        new = [p for p in copies if p not in old]
+        self.assertEqual(len(new), 1)
+        self.assertEqual(new[0].read_bytes(), self.original)
+        # The new copy and the newest older one; the two oldest are gone.
+        self.assertEqual(sorted(copies), sorted(new + [old[2]]))
+        self.assertFalse(old[0].exists())
+        self.assertFalse(old[1].exists())
+        for path in legacy:
+            self.assertEqual(path.read_bytes(), path.name.encode())
+        self.assertEqual(other.read_text(), 'kept')
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(outside.read_text(), 'kept')
 
 
 if __name__ == '__main__':

@@ -11,13 +11,17 @@ The store is a superblock followed by copy-on-write slot blocks.  A short
 file is normally a prefix of a valid store, cut off during a write (the
 superblock is rewritten first and is therefore intact).  If the superblock
 validates and every slot it names ends inside the file, zero-extending the
-file back to the full size preserves all state.  Anything else is moved
-aside, untouched, so the driver creates a fresh store.
+file back to the full size preserves all state.  Anything else is left in
+place, unchanged: the driver keeps refusing it (Touch ID stays off), and
+only an administrator decides to restore a copy or to reset the store with
+--reset.  A power cut does not produce such a file, so it is not removed
+on its own.
 
 This runs from aurora-sep-host-state-repair.service before the loader
-starts apple_sep; it never touches a file of the full size.
-AURORA_SEP_HOST_STATE and AURORA_SEP_QUARANTINE move the store and the
-backup directory, for tests and unusual installs.
+starts apple_sep; it never touches a file of the full size.  Before it
+changes a store it copies it to the quarantine directory, which keeps the
+newest KEEP_COPIES copies made under the current retention policy.  AURORA_SEP_HOST_STATE and AURORA_SEP_QUARANTINE
+move the store and the backup directory, for tests and unusual installs.
 """
 
 import os
@@ -53,9 +57,22 @@ SB_SLOT_TABLE_END = SB_SLOT_TABLE + SLOT_COUNT * SLOT_ENTRY_SIZE
 INTENT_NONE = 0
 INTENT_WRITE = 1
 
+# Quarantine copies kept: the one just made and the one before it.
+KEEP_COPIES = 2
+COPY_PREFIX = "host-state-managed-"
+COPY_SUFFIX = ".bin"
 
-def log(message):
-    print(f"aurora-sep-host-state-repair: {message}", flush=True)
+# Under systemd (JOURNAL_STREAM set), "<4>" makes the journal record the line
+# as a warning.
+WARNING = "<4>" if os.environ.get("JOURNAL_STREAM") else ""
+
+
+def log(message, prefix=""):
+    print(f"{prefix}aurora-sep-host-state-repair: {message}", flush=True)
+
+
+def warn(message):
+    log(message, WARNING)
 
 
 def le32(buf, off):
@@ -151,27 +168,109 @@ def validate_superblock(sb):
     return True, detail, highest_end
 
 
+def sync_directory(path):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def backup(path, size):
+    parent = os.path.dirname(os.path.abspath(QUARANTINE))
+    quarantine_parents = [parent]
+    while not os.path.isdir(parent):
+        parent = os.path.dirname(parent)
+        quarantine_parents.append(parent)
     os.makedirs(QUARANTINE, mode=0o700, exist_ok=True)
     os.chmod(QUARANTINE, 0o700)
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    base = os.path.join(QUARANTINE, f"host-state-{stamp}-{size}")
-    dest = f"{base}.bin"
+    base = os.path.join(QUARANTINE, f"{COPY_PREFIX}{stamp}-{size}")
+    dest = f"{base}{COPY_SUFFIX}"
     suffix = 1
     while True:
         try:
             dst = open(dest, "xb")
         except FileExistsError:
-            dest = f"{base}-{suffix}.bin"
+            dest = f"{base}-{suffix}{COPY_SUFFIX}"
             suffix += 1
             continue
         break
     with open(path, "rb") as src, dst:
         shutil.copyfileobj(src, dst)
         dst.flush()
+        os.fchmod(dst.fileno(), 0o600)
         os.fsync(dst.fileno())
-    os.chmod(dest, 0o600)
+    # The backup and its directory must survive a crash before we change
+    # the source or remove older copies.
+    sync_directory(QUARANTINE)
+    for parent in quarantine_parents:
+        sync_directory(parent)
+    prune(dest)
     return dest
+
+
+def prune(newest):
+    """Delete all but the newest KEEP_COPIES copies; newest is always kept.
+
+    Only regular files named under the current retention policy are
+    considered. Legacy copies can be the only copy of a refused store.
+    """
+    copies = []
+    with os.scandir(QUARANTINE) as entries:
+        for entry in entries:
+            if not (entry.name.startswith(COPY_PREFIX) and entry.name.endswith(COPY_SUFFIX)):
+                continue
+            if not entry.is_file(follow_symlinks=False):
+                continue
+            if os.path.join(QUARANTINE, entry.name) == newest:
+                continue
+            copies.append((entry.stat(follow_symlinks=False).st_mtime_ns, entry.name))
+    copies.sort(reverse=True)
+    for _, name in copies[KEEP_COPIES - 1:]:
+        try:
+            os.unlink(os.path.join(QUARANTINE, name))
+            log(f"removed the older copy {name} (keeping the newest {KEEP_COPIES})")
+        except OSError as e:
+            log(f"cannot remove the older copy {name}: {e}")
+
+
+def admin_command():
+    return f"{os.path.abspath(sys.argv[0])} --reset"
+
+
+def reset():
+    """--reset: an administrator's decision to drop a store the driver refuses.
+
+    Copies the store to the quarantine and removes it, so the driver creates
+    a fresh one the next time it loads.  A full-size store is left alone:
+    it is either valid or one this helper never judges.
+    """
+    try:
+        size = os.path.getsize(STORE)
+    except FileNotFoundError:
+        log(f"{STORE} does not exist; nothing to reset")
+        return 0
+    if size == STORE_SIZE:
+        log(f"{STORE} has the full size of a store; not resetting it")
+        return 1
+    try:
+        dest = backup(STORE, size)
+    except OSError as e:
+        log(f"cannot back up {STORE}: {e}")
+        return 1
+    try:
+        os.unlink(STORE)
+        sync_directory(os.path.dirname(os.path.abspath(STORE)))
+    except OSError as e:
+        log(f"cannot complete removal of {STORE}: {e}; backup is at {dest}")
+        return 1
+    log(
+        f"copied {STORE} ({size} bytes) to {dest} and removed it; the driver "
+        "creates a fresh store at the next boot. Touch ID enrolments and the "
+        "password re-arm record must be set up again."
+    )
+    return 0
 
 
 def main():
@@ -202,8 +301,8 @@ def main():
         f"superblock: {header}"
     )
 
-    # A file that is longer than a store is never cut down to size: the
-    # bytes past the store are moved aside with the rest, unread.
+    # Only a short prefix is extended. A file that is longer than a store is
+    # never cut down to size.
     if ok and size < STORE_SIZE and highest_end <= size:
         try:
             dest = backup(STORE, size)
@@ -223,29 +322,31 @@ def main():
         )
         return 0
 
-    try:
-        dest = backup(STORE, size)
-    except OSError as e:
-        log(f"cannot back up the damaged store: {e}")
-        return 1
-    os.unlink(STORE)
+    # Not a power-cut prefix: the superblock does not validate, a used slot
+    # ends past the cut, or the file is longer than a store. Leave it in
+    # place; the driver refuses it as before, and nothing is lost.
     if not ok:
-        log(
-            f"{detail}; moved the file to {dest}, "
-            "the driver will create a fresh store"
-        )
+        why = detail
     elif size > STORE_SIZE:
-        log(
-            f"{detail}: the file is longer than a store; moved it to {dest}, "
-            "the driver will create a fresh store"
-        )
+        why = f"{detail}: the file is longer than a store"
     else:
-        log(
-            f"{detail}: a used slot ends past the file; moved it to {dest}, "
-            "the driver will create a fresh store"
-        )
+        why = f"{detail}: a used slot ends past the file"
+    warn(
+        f"{why}; left {STORE} in place, unchanged. The SEP driver refuses it, "
+        "so Touch ID stays off. To start over with an empty host state, as "
+        f"root: {admin_command()}"
+    )
     return 0
 
 
+def usage():
+    print(f"usage: {sys.argv[0]} [--reset]", file=sys.stderr)
+    return 2
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    if sys.argv[1:] == []:
+        sys.exit(main())
+    if sys.argv[1:] == ["--reset"]:
+        sys.exit(reset())
+    sys.exit(usage())

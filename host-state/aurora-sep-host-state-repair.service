@@ -6,7 +6,9 @@ Documentation=file:///usr/share/doc/aurora-sep-host-state/README.md
 # driver refuses any size but the full one and does not reinitialise the
 # file, so Touch ID stays dead until someone recovers the file by hand. Run
 # before the loader starts apple_sep, and only when there is a store at
-# all; a whole store is left untouched and costs one stat.
+# all; a whole store is left untouched and costs one stat. Only a power-cut
+# prefix is repaired; any other store is left in place for an administrator
+# (README.md, "Resetting a refused store").
 ConditionPathExists=/var/lib/aurora-sep-host-state.bin
 RequiresMountsFor=/var/lib
 Before=aurora-sep.service
