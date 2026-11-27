@@ -20,7 +20,7 @@ on its own.
 This runs from aurora-sep-host-state-repair.service before the loader
 starts apple_sep; it never touches a file of the full size.  Before it
 changes a store it copies it to the quarantine directory, which keeps the
-newest KEEP_COPIES copies.  AURORA_SEP_HOST_STATE and AURORA_SEP_QUARANTINE
+newest KEEP_COPIES copies made under the current retention policy.  AURORA_SEP_HOST_STATE and AURORA_SEP_QUARANTINE
 move the store and the backup directory, for tests and unusual installs.
 """
 
@@ -59,7 +59,7 @@ INTENT_WRITE = 1
 
 # Quarantine copies kept: the one just made and the one before it.
 KEEP_COPIES = 2
-COPY_PREFIX = "host-state-"
+COPY_PREFIX = "host-state-managed-"
 COPY_SUFFIX = ".bin"
 
 # Under systemd (JOURNAL_STREAM set), "<4>" makes the journal record the line
@@ -172,14 +172,14 @@ def backup(path, size):
     os.makedirs(QUARANTINE, mode=0o700, exist_ok=True)
     os.chmod(QUARANTINE, 0o700)
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    base = os.path.join(QUARANTINE, f"host-state-{stamp}-{size}")
-    dest = f"{base}.bin"
+    base = os.path.join(QUARANTINE, f"{COPY_PREFIX}{stamp}-{size}")
+    dest = f"{base}{COPY_SUFFIX}"
     suffix = 1
     while True:
         try:
             dst = open(dest, "xb")
         except FileExistsError:
-            dest = f"{base}-{suffix}.bin"
+            dest = f"{base}-{suffix}{COPY_SUFFIX}"
             suffix += 1
             continue
         break
@@ -195,9 +195,8 @@ def backup(path, size):
 def prune(newest):
     """Delete all but the newest KEEP_COPIES copies; newest is always kept.
 
-    Old copies are old host states; they are not kept forever.  Only regular
-    files with the copy's name pattern are considered, never symlinks or
-    anything else in the directory.
+    Only regular files named under the current retention policy are
+    considered. Legacy copies can be the only copy of a refused store.
     """
     copies = []
     with os.scandir(QUARANTINE) as entries:

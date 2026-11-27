@@ -99,7 +99,7 @@ class Repair(unittest.TestCase):
     def backups(self):
         if not self.quarantine.exists():
             return []
-        return sorted(self.quarantine.glob('host-state-*.bin'))
+        return sorted(self.quarantine.glob('host-state-managed-*.bin'))
 
     def refuse(self, reason):
         """The store stays in place, unchanged, with no copy made, and the
@@ -389,20 +389,24 @@ class Repair(unittest.TestCase):
     def test_quarantine_keeps_the_newest_two_copies(self):
         self.quarantine.mkdir(mode=0o700)
         old = []
-        for age, name in ((300, 'host-state-20260101-000000-100.bin'),
-                          (200, 'host-state-20260102-000000-100.bin'),
-                          (100, 'host-state-20260103-000000-100.bin')):
+        for age, name in ((300, 'host-state-managed-20260101-000000-100.bin'),
+                          (200, 'host-state-managed-20260102-000000-100.bin'),
+                          (100, 'host-state-managed-20260103-000000-100.bin')):
             path = self.quarantine / name
             path.write_bytes(name.encode())
             stamp = time.time() - age
             os.utime(path, (stamp, stamp))
             old.append(path)
-        # Not copies: another file, and a link that matches the pattern.
+        legacy = [self.quarantine / f'host-state-202512{day}-000000-100.bin'
+                  for day in (10, 11)]
+        for path in legacy:
+            path.write_bytes(path.name.encode())
+        # Another file and a link that matches the managed pattern.
         other = self.quarantine / 'notes.txt'
         other.write_text('kept')
         outside = Path(self.tmp.name) / 'outside.bin'
         outside.write_text('kept')
-        link = self.quarantine / 'host-state-link.bin'
+        link = self.quarantine / 'host-state-managed-link.bin'
         link.symlink_to(outside)
         os.utime(link, (0, 0), follow_symlinks=False)
 
@@ -411,7 +415,7 @@ class Repair(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('zero-extended', result.stdout)
         copies = sorted(p for p in self.quarantine.iterdir()
-                        if p.is_file() and not p.is_symlink() and p.name.startswith('host-state-'))
+                        if p.is_file() and not p.is_symlink() and p.name.startswith('host-state-managed-'))
         new = [p for p in copies if p not in old]
         self.assertEqual(len(new), 1)
         self.assertEqual(new[0].read_bytes(), self.original)
@@ -419,6 +423,8 @@ class Repair(unittest.TestCase):
         self.assertEqual(sorted(copies), sorted(new + [old[2]]))
         self.assertFalse(old[0].exists())
         self.assertFalse(old[1].exists())
+        for path in legacy:
+            self.assertEqual(path.read_bytes(), path.name.encode())
         self.assertEqual(other.read_text(), 'kept')
         self.assertTrue(link.is_symlink())
         self.assertEqual(outside.read_text(), 'kept')

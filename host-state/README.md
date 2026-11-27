@@ -42,10 +42,10 @@ a warning, and an administrator decides.
 
 Before the store is changed (zero-extended, or reset by hand), a copy goes
 to `/var/lib/aurora-sep-quarantine` (mode 0700, file mode 0600, unique
-timestamped names), byte for byte. The directory keeps the newest two
-copies, the one just made and the one before it; older copies are old host
-states and are deleted. A copy can be restored by copying it back while the
-SEP driver is not loaded.
+timestamped `host-state-managed-*.bin` names), byte for byte. The helper
+keeps the newest two managed copies. Legacy `host-state-<stamp>-<size>*.bin`
+files stay in place for the administrator, since they may be the only copy
+of a refused store. Restore a copy while the SEP driver is unloaded.
 
 ## Resetting a refused store
 
@@ -84,7 +84,7 @@ builds synthetic stores — a repairable prefix, a slot cut off mid-value,
 every kind of refused superblock, a store cut inside its slot table, a file
 that is too long — and checks the repair's decision against the driver's
 format rules, that a refused store is left unchanged, `--reset`, and that
-the quarantine keeps only the newest two copies. The NixOS version of
+the quarantine keeps the newest two managed copies and preserves legacy copies. The NixOS version of
 this helper has also run on a real truncated store: an M1 whose store was
 cut to 98430 bytes by a power cut. The prefix was preserved in the
 quarantine, Touch ID worked again after the repair, and the enrolled
