@@ -25,10 +25,13 @@ int main(int argc, char **argv)
 	pam_handle_t *h = NULL;
 	int ret;
 
-	if (argc != 5)
+	/* An optional fifth argument is the remote host (PAM_RHOST). */
+	if (argc != 5 && argc != 6)
 		return 2;
 	c.appdata_ptr = argv[4];
 	if (pam_start_confdir(argv[2], argv[3], &c, argv[1], &h) != PAM_SUCCESS)
+		return 2;
+	if (argc == 6 && pam_set_item(h, PAM_RHOST, argv[5]) != PAM_SUCCESS)
 		return 2;
 	ret = pam_authenticate(h, 0);
 	printf("%d\n", ret);

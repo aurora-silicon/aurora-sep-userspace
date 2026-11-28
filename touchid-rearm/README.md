@@ -21,8 +21,9 @@ asks for the password, and the password ends the lockout. With the
    pending or the caller is root (sudo, gdm, polkit, login). Otherwise it
    answers at once and checks nothing, so a user's own programs get no
    password oracle here. When it goes on, it checks that the caller is root
-   or that user, that the user has enrolled prints, and that the password
-   verifies through its own PAM service (pam_unix alone). Only then does it
+   or that user, that the user has enrolled prints (not needed for the wait
+   after boot, see below), and that the password verifies through its own PAM
+   service (pam_unix alone). Only then does it
    pass that password in a `SEP_BIO_REARM` call on `/dev/sep-bio-rearm`;
    both userspace and the kernel wipe their temporary copies after the
    request. Without a lockout the call clears pending failed matches, as a
@@ -76,6 +77,37 @@ from then on. Until then pam_fprintd goes straight to the password. Any
 value other than `yes` or `no` counts as `yes`. A kernel without the ioctl
 keeps Touch ID working from the first login and says so in the journal. The
 setting applies from the next boot.
+
+The wait belongs to the machine, not to a finger, so the first password
+ends it even when no finger is enrolled yet, as on macOS: log in with the
+password, add a finger in Settings, lock the screen, and the finger unlocks
+it with no second password. For an account without enrolled prints this
+takes all of:
+
+- a login at this machine's screen or console: a root caller whose PAM
+  service is a display manager's password service (`gdm-password`, which
+  GNOME's lock screen uses too, `sddm`, `plasmalogin`) or `login`, with no
+  remote host (PAM_RHOST; GDM sets it for XDMCP and GNOME Remote Desktop's
+  remote login). pam_aurora_touchid sends the service and
+  whether a remote host was named (`service=`, `host=local|remote`); older
+  modules send neither, which counts as remote. `su`, `sudo` and polkit
+  prompts do not count: a user can start them from an ssh shell, and
+  nothing tells those apart from a local terminal. A lock screen that runs
+  PAM as the user, such as Plasma's, gets no password check for an account
+  without prints, so its programs get no password oracle. After an
+  automatic login (no password at all), the first password at the lock
+  screen after enrolling arms Touch ID, as it always did;
+- the wait and nothing else: the helper asks with
+  `SEP_BIO_REARM_FLAG_BOOT_WAIT_ONLY`, and the driver then ends only the wait
+  for the first password since boot, in that one request. A lockout, failed
+  matches, and a lockout restored from the driver's record
+  (`/var/lib/aurora-sep-touchid-lockout.bin`) after a restart stay as they
+  are and still need the password of an account with enrolled prints (the
+  helper answers `ok boot-wait-ended` then). A kernel without the flag refuses
+  it with `EINVAL`; the password then arms nothing, as before, and the journal
+  says why.
+
+An account with enrolled prints arms Touch ID from any caller, as before.
 
 `aurora-touchid-rearm --status` (root) prints what the driver reports:
 

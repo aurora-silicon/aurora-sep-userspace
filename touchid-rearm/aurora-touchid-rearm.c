@@ -16,7 +16,13 @@
  *    driver's password clock (Touch ID asks for the password again after 156
  *    hours without one), as a password does on macOS.
  *  - The caller must be root or the user named.
- *  - The user must have enrolled fingerprints with fprintd.
+ *  - The user must have enrolled fingerprints with fprintd, except while the
+ *    wait for the first password since boot is pending and a root caller
+ *    logs in at this machine's screen or console (display manager, lock
+ *    screen, login): that wait belongs to the machine, so the boot's first
+ *    password arms Touch ID for fingers enrolled later, as on macOS. Such a
+ *    password ends only that wait (SEP_BIO_REARM_FLAG_BOOT_WAIT_ONLY); a
+ *    lockout still needs the password of an account with prints.
  *  - The password must verify through the "aurora-touchid-rearm" PAM service,
  *    which is pam_unix alone.
  *
@@ -72,6 +78,9 @@ struct sep_bio_lockout {
 #ifndef SEP_BIO_LOCKOUT_FLAG_AFTER_BOOT
 #define SEP_BIO_LOCKOUT_FLAG_AFTER_BOOT 2
 #endif
+#ifndef SEP_BIO_LOCKOUT_FLAG_FAILED_ATTEMPTS
+#define SEP_BIO_LOCKOUT_FLAG_FAILED_ATTEMPTS 4
+#endif
 #ifndef SEP_BIO_REQUIRE_PASSWORD
 #define SEP_BIO_REQUIRE_PASSWORD _IO(0xB1, 0x10)
 #endif
@@ -80,9 +89,13 @@ struct sep_bio_lockout {
 #define SEP_BIO_REARM_SECRET_MAX 1024
 struct sep_bio_rearm {
 	__u32 secret_len;
-	__u32 reserved;
+	__u32 flags;     /* "reserved" in older headers; must be zero there */
 	__u8 secret[SEP_BIO_REARM_SECRET_MAX];
 };
+#endif
+
+#ifndef SEP_BIO_REARM_FLAG_BOOT_WAIT_ONLY
+#define SEP_BIO_REARM_FLAG_BOOT_WAIT_ONLY 1
 #endif
 
 #ifdef SEP_BIO_REARM
@@ -133,9 +146,15 @@ static enum lock_state lockout_state(unsigned *failures, unsigned *flags)
 		*failures = (unsigned)strtoul(buf + 9, &end, 10);
 		*flags = (unsigned)strtoul(end, NULL, 10);
 	}
-	/* "required": the driver waits for the first password since boot. */
+	/*
+	 * "required": the driver waits for the first password since boot;
+	 * "required-failed": and a lockout after failed matches is recorded
+	 * from before the restart.
+	 */
 	if (strncmp(buf, "required", 8) == 0) {
 		*flags = SEP_BIO_LOCKOUT_FLAG_EVERY_PASSWORD | SEP_BIO_LOCKOUT_FLAG_AFTER_BOOT;
+		if (strncmp(buf, "required-failed", 15) == 0)
+			*flags |= SEP_BIO_LOCKOUT_FLAG_FAILED_ATTEMPTS;
 		return LOCKED;
 	}
 	return strncmp(buf, "locked", 6) == 0 ? LOCKED : NOT_LOCKED;
@@ -189,6 +208,42 @@ static int rearm(const char *password)
 	return fclose(f);
 }
 
+/*
+ * The driver's SEP_BIO_REARM_FLAG_BOOT_WAIT_ONLY: ends the wait and nothing
+ * else. "required-old" stands in for a kernel without the flag (EINVAL);
+ * "required-failed", or "required" with $AURORA_REARM_TEST_LOCKOUT set (a
+ * lockout restored from the driver's record), keeps the lockout.
+ */
+static int rearm_boot_wait(const char *password)
+{
+	char buf[32] = "";
+	const char *path = test_env("AURORA_REARM_TEST_DEVICE", REARM_DEVICE);
+	FILE *f = fopen(path, "r");
+	const char *next;
+
+	(void)password;
+	if (!f)
+		return -1;
+	if (!fgets(buf, sizeof(buf), f))
+		buf[0] = '\0';
+	fclose(f);
+	if (strncmp(buf, "required-old", 12) == 0) {
+		errno = EINVAL;
+		return -1;
+	}
+	if (strncmp(buf, "required", 8) != 0)
+		return 0;
+	if (strncmp(buf, "required-failed", 15) == 0 || getenv("AURORA_REARM_TEST_LOCKOUT"))
+		next = "locked\n";
+	else
+		next = "boot-wait-ended\n";
+	f = fopen(path, "w");
+	if (!f)
+		return -1;
+	fputs(next, f);
+	return fclose(f);
+}
+
 static int pam_open(const char *user, const struct pam_conv *conv, pam_handle_t **h)
 {
 	return pam_start_confdir(SERVICE, user, conv,
@@ -219,7 +274,7 @@ static enum lock_state lockout_state(unsigned *failures, unsigned *flags)
 
 #define peer_uid(peer) (peer)
 
-static int rearm(const char *password)
+static int rearm_with(const char *password, __u32 flags)
 {
 	struct sep_bio_rearm request = { 0 };
 	size_t len = strlen(password);
@@ -231,6 +286,7 @@ static int rearm(const char *password)
 		return -1;
 	}
 	request.secret_len = (__u32)len;
+	request.flags = flags;
 	memcpy(request.secret, password, len);
 	fd = open(REARM_DEVICE, O_RDONLY | O_CLOEXEC);
 	if (fd < 0)
@@ -244,6 +300,9 @@ static int rearm(const char *password)
 	errno = saved;
 	return ret;
 }
+
+#define rearm(password) rearm_with(password, 0)
+#define rearm_boot_wait(password) rearm_with(password, SEP_BIO_REARM_FLAG_BOOT_WAIT_ONLY)
 
 static int pam_open(const char *user, const struct pam_conv *conv, pam_handle_t **h)
 {
@@ -318,6 +377,52 @@ static int has_prints(const char *user)
 	return found;
 }
 
+/*
+ * The PAM services of a login at this machine's own screen or console: the
+ * display managers' password services (GDM's also serves GNOME's lock
+ * screen) and login on a text console. A root caller chose the service, so
+ * the user cannot; with PAM_RHOST set ("host=remote") none of them counts.
+ * GDM sets PAM_RHOST for every display that is not local (XDMCP, GNOME
+ * Remote Desktop's remote login). LightDM is left out: its VNC and XDMCP
+ * logins were not checked for PAM_RHOST.
+ * su, sudo and polkit are left out on purpose: a user can start those from
+ * an ssh shell, inside cgroups and scopes the user names, with nothing the
+ * helper could trust to tell them from a local terminal.
+ */
+static const char *const login_services[] = {
+	"gdm-password", "sddm", "plasmalogin", "login", NULL,
+};
+
+/*
+ * Whether the request's fields (rearm-proto.h) name a login at this
+ * machine's screen or console. 'fields' runs to 'end', each NUL-terminated.
+ */
+static int local_login(const char *fields, const char *end)
+{
+	const char *service = NULL;
+	int local = 0;
+
+	while (fields < end) {
+		const char *nul = memchr(fields, '\0', (size_t)(end - fields));
+
+		if (!nul)
+			break;
+		if (strncmp(fields, AURORA_REARM_FIELD_SERVICE, strlen(AURORA_REARM_FIELD_SERVICE)) == 0)
+			service = fields + strlen(AURORA_REARM_FIELD_SERVICE);
+		else if (strcmp(fields, AURORA_REARM_FIELD_LOCAL) == 0)
+			local = 1;
+		else if (strcmp(fields, AURORA_REARM_FIELD_REMOTE) == 0)
+			return 0;
+		fields = nul + 1;
+	}
+	if (!local || !service)
+		return 0;
+	for (int i = 0; login_services[i]; i++)
+		if (strcmp(service, login_services[i]) == 0)
+			return 1;
+	return 0;
+}
+
 static int conv_password(int n, const struct pam_message **msg,
 			 struct pam_response **resp, void *data)
 {
@@ -374,7 +479,7 @@ static int serve(char *req, size_t len, uid_t peer)
 	char *password, *end;
 	struct passwd *pw;
 	unsigned failures, flags;
-	int locked = 0;
+	int locked = 0, boot_wait, prints, at_login;
 
 	if (len < magic || memcmp(req, AURORA_REARM_MAGIC, magic) != 0) {
 		answer("refused malformed request\n");
@@ -387,10 +492,13 @@ static int serve(char *req, size_t len, uid_t peer)
 		return 1;
 	}
 	password = end + 1;
-	if (!memchr(password, '\0', (size_t)(req + len - password))) {
+	end = memchr(password, '\0', (size_t)(req + len - password));
+	if (!end) {
 		answer("refused malformed request\n");
 		return 1;
 	}
+	/* Newer modules say which login this is; only a root caller's count. */
+	at_login = local_login(end + 1, req + len);
 
 	peer = peer_uid(peer);
 	switch (lockout_state(&failures, &flags)) {
@@ -427,9 +535,69 @@ static int serve(char *req, size_t len, uid_t peer)
 		answer("refused not the caller's account\n");
 		return 1;
 	}
-	if (!has_prints(user)) {
-		answer("refused no enrolled fingerprints\n");
-		return 1;
+	/*
+	 * The wait for the first password since boot is the machine's, not a
+	 * print's (the driver keeps it once for every account), so the boot's
+	 * first password ends it whether or not this account has enrolled a
+	 * finger yet, as on macOS, where the password at login enables Touch ID
+	 * for the fingers added later in that boot. Without this, a login
+	 * before the first enrolment spends the boot's password and Touch ID
+	 * stays off after enrolling until another password.
+	 *
+	 * For an account without prints only from a root caller logging in at
+	 * this machine's screen or console (login_services): a user's own
+	 * caller would get a password oracle, and an account reached from
+	 * elsewhere could not have enrolled a finger itself (fprintd allows
+	 * enrolment only in an active local session), so it must not arm one
+	 * either. And only through SEP_BIO_REARM_FLAG_BOOT_WAIT_ONLY, which ends
+	 * the wait and nothing else: a lockout or failed matches, now or
+	 * restored from the driver's record, still need the password of an
+	 * account with prints. The driver checks and changes the state in that
+	 * one request, so what was read here cannot go stale. A kernel without
+	 * the flag refuses it, and the password arms nothing, as before.
+	 */
+	boot_wait = locked && (flags & SEP_BIO_LOCKOUT_FLAG_AFTER_BOOT);
+	prints = has_prints(user);
+	if (!prints) {
+		if (!locked && peer == 0) {
+			/*
+			 * Nothing to arm. Pending failed matches stay for an
+			 * enrolled account's password, as before.
+			 */
+			answer("ok no-prints\n");
+			return 0;
+		}
+		if (!(boot_wait && peer == 0 && at_login)) {
+			answer("refused no enrolled fingerprints\n");
+			return 1;
+		}
+		if (!password_verifies(user, password)) {
+			syslog(LOG_WARNING, "refused to end the wait after boot for %s: the password did not verify",
+			       user);
+			answer("refused password\n");
+			return 1;
+		}
+		if (rearm_boot_wait(password) < 0) {
+			if (errno == EINVAL) {
+				syslog(LOG_NOTICE, "Touch ID still waits for a password after boot: %s has no fingerprints, and this kernel cannot end only that wait",
+				       user);
+				answer("refused no enrolled fingerprints\n");
+			} else {
+				syslog(LOG_ERR, "the driver did not end the wait after boot for %s: %m", user);
+				answer("error the driver did not re-arm\n");
+			}
+			return 1;
+		}
+		if (lockout_state(&failures, &flags) == NOT_LOCKED) {
+			syslog(LOG_NOTICE, "Touch ID armed by the first password since boot (%s, no fingerprints enrolled yet)",
+			       user);
+			answer("ok armed\n");
+		} else {
+			syslog(LOG_NOTICE, "the first password since boot (%s, no fingerprints) ended the wait after boot; Touch ID stays locked until the password of an account with fingerprints",
+			       user);
+			answer("ok boot-wait-ended\n");
+		}
+		return 0;
 	}
 	if (!password_verifies(user, password)) {
 		syslog(LOG_WARNING, "refused a re-arm for %s (uid %u asked): the password did not verify",
@@ -442,7 +610,7 @@ static int serve(char *req, size_t len, uid_t peer)
 		answer("error the driver did not re-arm\n");
 		return 1;
 	}
-	if (locked && (flags & SEP_BIO_LOCKOUT_FLAG_AFTER_BOOT) && failures == 0) {
+	if (boot_wait && !(flags & SEP_BIO_LOCKOUT_FLAG_FAILED_ATTEMPTS) && failures == 0) {
 		syslog(LOG_NOTICE, "Touch ID armed by the first password since boot (%s)", user);
 		answer("ok armed\n");
 	} else if (locked) {
