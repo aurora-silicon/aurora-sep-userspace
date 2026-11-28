@@ -18,6 +18,7 @@
  */
 #define _GNU_SOURCE
 #include <errno.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -48,8 +49,8 @@ static int send_all(int fd, const char *buf, size_t len)
 
 /* Returns the service's answer line, or NULL when there was none. */
 static const char *ask(pam_handle_t *pamh, const char *path, const char *user,
-		       const char *password, char *reply, size_t reply_len,
-		       int debug)
+		       const char *password, const char *about, size_t alen, char *reply,
+		       size_t reply_len, int debug)
 {
 	struct sockaddr_un addr = { .sun_family = AF_UNIX };
 	struct timeval tv = { .tv_sec = AURORA_REARM_TIMEOUT_S };
@@ -62,6 +63,9 @@ static const char *ask(pam_handle_t *pamh, const char *path, const char *user,
 	if (strlen(path) >= sizeof(addr.sun_path) ||
 	    magic + ulen + plen > sizeof(req))
 		return NULL;
+	/* Without room for them the service gets no fields: as an older module. */
+	if (magic + ulen + plen + alen > sizeof(req))
+		alen = 0;
 	memcpy(addr.sun_path, path, strlen(path) + 1);
 
 	fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
@@ -80,7 +84,8 @@ static const char *ask(pam_handle_t *pamh, const char *path, const char *user,
 	memcpy(req, AURORA_REARM_MAGIC, magic);
 	memcpy(req + magic, user, ulen);
 	memcpy(req + magic + ulen, password, plen);
-	if (send_all(fd, req, magic + ulen + plen) == 0 && shutdown(fd, SHUT_WR) == 0)
+	memcpy(req + magic + ulen + plen, about, alen);
+	if (send_all(fd, req, magic + ulen + plen + alen) == 0 && shutdown(fd, SHUT_WR) == 0)
 		ok = 1;
 	explicit_bzero(req, sizeof(req));
 
@@ -105,6 +110,9 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc,
 				   const char **argv)
 {
 	const char *path = AURORA_REARM_SOCKET;
+	const void *service = NULL, *rhost = NULL;
+	char about[160];
+	int alen;
 	const void *user = NULL, *tok = NULL;
 	char reply[AURORA_REARM_MAX_REPLY];
 	const char *answer;
@@ -131,7 +139,21 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc,
 		return PAM_IGNORE;
 	}
 
-	answer = ask(pamh, path, user, tok, reply, sizeof(reply), debug);
+	/*
+	 * Tell the service which PAM service this is and whether a remote host
+	 * was named; both are the application's, not the user's.
+	 */
+	if (pam_get_item(pamh, PAM_SERVICE, &service) != PAM_SUCCESS || !service)
+		service = "";
+	if (pam_get_item(pamh, PAM_RHOST, &rhost) != PAM_SUCCESS)
+		rhost = NULL;
+	alen = snprintf(about, sizeof(about), AURORA_REARM_FIELD_SERVICE "%s%c%s%c",
+			(const char *)service, '\0',
+			rhost && *(const char *)rhost ? AURORA_REARM_FIELD_REMOTE : AURORA_REARM_FIELD_LOCAL, '\0');
+	if (alen < 0 || alen >= (int)sizeof(about))
+		alen = 0;
+	answer = ask(pamh, path, user, tok, about, (size_t)alen, reply, sizeof(reply), debug);
+	explicit_bzero(about, sizeof(about));
 	if (!answer)
 		return PAM_IGNORE;
 	if (strcmp(answer, "ok rearmed") == 0)
