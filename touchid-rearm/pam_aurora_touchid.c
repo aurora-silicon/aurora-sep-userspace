@@ -145,11 +145,15 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc,
 	 */
 	if (pam_get_item(pamh, PAM_SERVICE, &service) != PAM_SUCCESS || !service)
 		service = "";
+	/* Without a readable PAM_RHOST, say nothing about the host: not local. */
 	if (pam_get_item(pamh, PAM_RHOST, &rhost) != PAM_SUCCESS)
-		rhost = NULL;
-	alen = snprintf(about, sizeof(about), AURORA_REARM_FIELD_SERVICE "%s%c%s%c",
-			(const char *)service, '\0',
-			rhost && *(const char *)rhost ? AURORA_REARM_FIELD_REMOTE : AURORA_REARM_FIELD_LOCAL, '\0');
+		alen = snprintf(about, sizeof(about), AURORA_REARM_FIELD_SERVICE "%s%c",
+				(const char *)service, '\0');
+	else
+		alen = snprintf(about, sizeof(about), AURORA_REARM_FIELD_SERVICE "%s%c%s%c",
+				(const char *)service, '\0',
+				rhost && *(const char *)rhost ? AURORA_REARM_FIELD_REMOTE
+							      : AURORA_REARM_FIELD_LOCAL, '\0');
 	if (alen < 0 || alen >= (int)sizeof(about))
 		alen = 0;
 	answer = ask(pamh, path, user, tok, about, (size_t)alen, reply, sizeof(reply), debug);

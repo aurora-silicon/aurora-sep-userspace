@@ -97,13 +97,15 @@ takes all of:
   without prints, so its programs get no password oracle. After an
   automatic login (no password at all), the first password at the lock
   screen after enrolling arms Touch ID, as it always did;
-- only the wait: no failed match pending, no lockout reported after failed
-  matches, and no lockout in the driver's record
-  (`/var/lib/aurora-sep-touchid-lockout.bin`). While the wait is pending the
-  driver reports every state as locked, and a lockout restored from that
-  record after a restart (a lapsed match credential, the 156 hour password
-  clock) has no failed matches, so the helper reads the record itself. Those
-  still need the password of an account with enrolled prints.
+- the wait and nothing else: the helper asks with
+  `SEP_BIO_REARM_FLAG_BOOT_WAIT_ONLY`, and the driver then ends only the wait
+  for the first password since boot, in that one request. A lockout, failed
+  matches, and a lockout restored from the driver's record
+  (`/var/lib/aurora-sep-touchid-lockout.bin`) after a restart stay as they
+  are and still need the password of an account with enrolled prints (the
+  helper answers `ok boot-wait-ended` then). A kernel without the flag refuses
+  it with `EINVAL`; the password then arms nothing, as before, and the journal
+  says why.
 
 An account with enrolled prints arms Touch ID from any caller, as before.
 

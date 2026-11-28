@@ -51,9 +51,7 @@ class Rig:
         self.server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.server.bind(self.sock)
         self.server.listen(4)
-        self.record = self.tmp / 'lockout.bin'
         self.env = dict(os.environ,
-                        AURORA_REARM_TEST_RECORD=str(self.record),
                         AURORA_REARM_TEST_DEVICE=str(self.device),
                         AURORA_REARM_TEST_FPRINT_DIR=str(self.fprint),
                         AURORA_REARM_TEST_CONFDIR=str(self.conf))
@@ -109,9 +107,6 @@ class Rig:
         out = subprocess.run([DRIVER, str(self.conf), name, USER, password] + ([rhost] if rhost else []), env=env,
                              capture_output=True, text=True, check=True, timeout=30)
         return int(out.stdout)
-
-    def record_lockout(self, locked, failures=0):
-        self.record.write_bytes(b'SEPLOCK1' + int(locked).to_bytes(4, 'little') + failures.to_bytes(4, 'little'))
 
     def direct(self, user, password, raw=None, fields=('service=gdm-password', 'host=local')):
         c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -223,7 +218,7 @@ class RearmTest(unittest.TestCase):
         for service in ('gdm-password', 'login'):
             self.rig.lock('required')
             self.assertEqual(self.rig.authenticate(service, 'right'), PAM_SUCCESS)
-            self.assertEqual(self.rig.state(), 'rearmed', service)
+            self.assertEqual(self.rig.state(), 'boot-wait-ended', service)
 
     def test_other_services_without_prints_keep_the_wait(self):
         # su, sudo and polkit can be started from an ssh shell; sshd and a
@@ -271,7 +266,7 @@ class RearmTest(unittest.TestCase):
         self.rig.lock('required')
         self.drop_prints()
         self.assertEqual(self.rig.direct(USER, 'right'), 'ok armed')
-        self.assertEqual(self.rig.state(), 'rearmed')
+        self.assertEqual(self.rig.state(), 'boot-wait-ended')
 
     def test_first_password_without_prints_is_still_checked(self):
         self.rig.env['AURORA_REARM_TEST_PEER'] = '0'
@@ -297,10 +292,26 @@ class RearmTest(unittest.TestCase):
         # matches still needs the password of an account with prints.
         self.rig.env['AURORA_REARM_TEST_PEER'] = '0'
         self.drop_prints()
-        for state in ('locked', 'required-failed'):
-            self.rig.lock(state)
-            self.assertEqual(self.rig.direct(USER, 'right'), 'refused no enrolled fingerprints')
-            self.assertEqual(self.rig.state(), state)
+        self.rig.lock('locked')
+        self.assertEqual(self.rig.direct(USER, 'right'), 'refused no enrolled fingerprints')
+        self.assertEqual(self.rig.state(), 'locked')
+        # Behind the wait: the driver ends the wait alone, the lockout stays.
+        self.rig.lock('required-failed')
+        self.assertEqual(self.rig.direct(USER, 'right'), 'ok boot-wait-ended')
+        self.assertEqual(self.rig.state(), 'locked')
+        self.assertEqual(self.rig.direct(USER, 'right'), 'refused no enrolled fingerprints')
+        self.assertEqual(self.rig.state(), 'locked')
+
+    def test_kernel_without_the_boot_wait_flag_keeps_the_wait(self):
+        # An older kernel refuses SEP_BIO_REARM_FLAG_BOOT_WAIT_ONLY: the
+        # password arms nothing for an account without prints, as before.
+        self.rig.env['AURORA_REARM_TEST_PEER'] = '0'
+        self.drop_prints()
+        self.rig.lock('required-old')
+        self.assertEqual(self.rig.direct(USER, 'right'), 'refused no enrolled fingerprints')
+        self.assertEqual(self.rig.state(), 'required-old')
+        self.assertEqual(self.rig.authenticate('gdm-password', 'right'), PAM_SUCCESS)
+        self.assertEqual(self.rig.state(), 'required-old')
 
     def test_lockout_and_boot_wait_rearm_with_prints(self):
         self.rig.env['AURORA_REARM_TEST_PEER'] = '0'
@@ -324,26 +335,21 @@ class RearmTest(unittest.TestCase):
         self.assertEqual(self.rig.state(), 'required')
 
     def test_recorded_lockout_behind_the_wait_needs_an_enrolled_account(self):
-        # After a restart the driver reports the wait for a lockout restored
-        # from its record (a lapsed credential: no failed matches), so only
-        # the record tells them apart.
+        # After a restart the driver reports the wait over a lockout restored
+        # from its record (a lapsed credential: no failed matches). The
+        # driver ends the wait alone; the lockout stays.
         self.rig.env['AURORA_REARM_TEST_PEER'] = '0'
         self.rig.lock('required')
         self.drop_prints()
-        self.rig.record_lockout(True)
-        self.assertEqual(self.rig.direct(USER, 'right'), 'refused no enrolled fingerprints')
-        self.assertEqual(self.rig.state(), 'required')
-        self.rig.record.write_bytes(b'garbage')
-        self.assertEqual(self.rig.direct(USER, 'right'), 'refused no enrolled fingerprints')
-        self.rig.record_lockout(False, 0)
-        self.assertEqual(self.rig.direct(USER, 'right'), 'ok armed')
-        self.assertEqual(self.rig.state(), 'rearmed')
+        self.rig.env['AURORA_REARM_TEST_LOCKOUT'] = '1'
+        self.assertEqual(self.rig.direct(USER, 'right'), 'ok boot-wait-ended')
+        self.assertEqual(self.rig.state(), 'locked')
 
     def test_recorded_lockout_behind_the_wait_rearms_with_prints(self):
         self.rig.env['AURORA_REARM_TEST_PEER'] = '0'
         self.rig.lock('required')
-        self.rig.record_lockout(True)
-        self.assertEqual(self.rig.direct(USER, 'right'), 'ok rearmed')
+        self.rig.env['AURORA_REARM_TEST_LOCKOUT'] = '1'
+        self.assertTrue(self.rig.direct(USER, 'right').startswith('ok '))
         self.assertEqual(self.rig.state(), 'rearmed')
 
     def test_users_own_caller_with_prints_still_arms_after_boot(self):

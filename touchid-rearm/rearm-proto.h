@@ -15,6 +15,9 @@
  *
  *   "ok rearmed\n"        Touch ID was locked; it is re-armed.
  *   "ok armed\n"          The first password since boot armed Touch ID.
+ *   "ok boot-wait-ended\n" The first password since boot, of an account
+ *                         without enrolled fingerprints, ended the wait after
+ *                         boot; a lockout still holds.
  *   "ok cleared\n"        The password cleared pending failed matches.
  *   "ok noted\n"          The password restarted the driver's password clock.
  *   "ok not-locked\n"     Touch ID was not locked; nothing was checked.
