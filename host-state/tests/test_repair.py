@@ -187,6 +187,30 @@ class Repair(unittest.TestCase):
         self.assertEqual(self.store.stat().st_size, STORE_SIZE)
         self.assertEqual(self.store.read_bytes()[:cut], self.original)
 
+    def test_slot_ends_at_file_end(self):
+        length = 0x2000
+        sb = superblock(used=[(1, KIND, b'1' * 16, length)])
+        cut = 2 * BLOCK + length
+        original = make_file(self.store, sb, slots=[(1, data(1, length))],
+                             cut=cut)
+        result = self.repair()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('zero-extended', result.stdout)
+        self.assertEqual(self.store.stat().st_size, STORE_SIZE)
+        repaired = self.store.read_bytes()
+        self.assertEqual(repaired[:cut], original)
+        self.assertEqual(repaired[cut:], b'\0' * (STORE_SIZE - cut))
+        copies = self.backups()
+        self.assertEqual(len(copies), 1)
+        self.assertEqual(copies[0].read_bytes(), original)
+
+    def test_slot_ends_one_byte_past_file_end(self):
+        length = 0x2000
+        sb = superblock(used=[(1, KIND, b'1' * 16, length)])
+        self.original = make_file(self.store, sb, slots=[(1, data(1, length))],
+                                  cut=2 * BLOCK + length - 1)
+        self.refuse('a used slot ends past the file')
+
     def test_slot_cut_off_mid_value(self):
         sb = superblock(used=[(1, KIND, b'1' * 16, 0x2000)])
         self.original = make_file(self.store, sb, slots=[(1, data(1, 0x2000))],
